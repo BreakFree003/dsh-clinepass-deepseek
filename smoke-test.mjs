@@ -319,14 +319,18 @@ if (key === undefined) {
 //
 // 网关不再执行 providerOptions.gateway.only（见 README「网关不再执行 only」一节），
 // 所以「钉住官方渠道」现在由插件在本地兑现：边流边读 routing，读出真正服务它的渠道，
-// 不在允许列表里就让这条流在收尾前**中断**。这一节用一个**故意错配**的允许列表来证明
-// 闸是活的：允许 alibaba，而网关的 routing 一定说 deepseek → 必须拒。
+// 不在允许列表里就让这条流在收尾前**中断**。这一节用一个**不可能存在**的渠道当允许
+// 列表来证明闸是活的：网关再怎么挑也挑不到它 → 必须拒。
+//
+// ⚠️ 2026-10-03 实测：拿一个**真渠道**当「必然错配」是错的 —— 网关自行挑渠道（routing 的
+// `fallbacksAvailable` 里就含 alibaba 等），有一次真的由 alibaba 服务，闸按契约放行、
+// 这一节却报红（`blocked=0`、流正常收尾）。所以改用 `__no_such_upstream__`，不留概率。
 console.log('\n── 3. the gate refuses a non-pinned response ─────────────')
 {
   const { createFetchPin: makeHook } = await import('./index.js')
   hook?.uninstall()
   const gate = makeHook(
-    { upstream: origin, statusFile: false, pin: ['alibaba'] },
+    { upstream: origin, statusFile: false, pin: ['__no_such_upstream__'] },
     {
       info: () => {},
       warn: () => {},
@@ -362,7 +366,7 @@ console.log('\n── 3. the gate refuses a non-pinned response ─────�
     state.lastViolation !== null && state.lastViolation.finalProvider === 'deepseek',
     JSON.stringify(state.lastViolation ?? null).slice(0, 160),
   )
-  check('the violation records why it was refused', /alibaba/.test(String(state.lastViolation?.reason)), String(state.lastViolation?.reason ?? ''))
+  check('the violation records why it was refused', /__no_such_upstream__/.test(String(state.lastViolation?.reason)), String(state.lastViolation?.reason ?? ''))
   gate.uninstall()
   hook?.install()
 }
