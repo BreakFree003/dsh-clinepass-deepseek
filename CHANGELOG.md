@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.9.1
+
+One compatibility fix, forced by dsh 0.2.1-alpha.2. The pin itself is unchanged;
+what changed is *when* the profile gets provisioned.
+
+- **Provisioning moved out of `apply()`.** `settings.mutate` now goes through
+  `dsh-config-editor`'s `edit()`: it takes the profile's `package.json` write
+  lock and then calls `reconcileProfilePatches()` — and *that* waits for the
+  loader to **settle**. Awaiting it from inside `apply()` is a self-lock: this
+  fiber stays `LOADING`, the tree never settles, `appReady` never commits, and
+  the Web client's `/api/remote.mux` upgrade route is never registered. The
+  visible damage is silent and comes in five parts: a page stuck on
+  "Reconnecting" (client console: `[connection] connection lost, retry #N`; the
+  upgrade gets an *empty reply*, not a 401), no `dsh web: …?token=` banner in
+  the log, a `package.json.lock` held forever by the server (so every
+  `dsh plugin` command dies with `atomic-write: timed out waiting for the
+  writer lock`), and **no** activation warning anywhere — `--dump-config`, the
+  boot graph and every smoke test stay green. Provisioning now runs after
+  `ctx.root.loader.await()`; a host with no loader service still gets the old
+  inline behavior. `test-fetch.mjs` §10 pins both halves: while the tree is
+  still loading `apply()` must have returned and written nothing, and once it
+  settles the card is written (the same test fails on 0.9.0).
+- Why it bit *here*: `settings.describe()` only lists entries whose fiber is
+  already active, so the early read looked like "the card is missing" and forced
+  a write on every start. After the tree settles the existing card is seen and
+  nothing is written (`provision: "present"`). Note also that `settings.get()`
+  no longer exists — it was removed in dsh 0.1.7 — so the `settings.get?.(ns)`
+  fallback in `readNamespace()` is dead code on any current host.
+
 ## 0.9.0
 
 Two changes to the diagnostics, both driven by one real question that the status

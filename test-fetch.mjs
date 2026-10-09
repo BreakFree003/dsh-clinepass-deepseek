@@ -44,13 +44,16 @@ function recorder() {
  * the double records the event names it was asked to listen for — that is how a
  * thrown-away ctx would otherwise hide a registration.
  */
-function ctxFor(logger, settings, effect = () => {}, { deferSettings = false } = {}) {
+function ctxFor(logger, settings, effect = () => {}, { deferSettings = false, loader } = {}) {
   const listeners = new Map()
   const pending = []
   const ctx = {
     logger,
     effect,
     listeners,
+    // 真实宿主里 `ctx.root.loader` 是根上下文上的 loader 服务；给双替身留一个口子，
+    // 用来断言「树还没 settle 时 apply() 必须已经返回」（见 §10 的延后供给回归）。
+    ...(loader === undefined ? {} : { root: { loader } }),
     on(event, listener, options) {
       listeners.set(event, { listener, options })
     },
@@ -833,6 +836,33 @@ console.log('\n── 10. apply() ───────────────�
   check('an unsupported stored effort is realigned to high', oddEffort.writes[1]?.ops[0]?.value === 'high', JSON.stringify(oddEffort.writes[1]?.ops[0]))
   oddDisposer()
   check('that hook is disposed again', globalThis.fetch === realFetch)
+
+  // 0.2.1-alpha.2 回归：`settings.mutate` 现在走 `configEditor.edit`，先拿 profile
+  // package.json 的写锁，再 `reconcileProfilePatches()` —— 那一步要等 loader **settle**。
+  // 在 apply() 里 await 它就成了自锁：本 fiber 停在 LOADING → 树永不 settle →
+  // `appReady` 不 commit → 客户端的 mux 升级路由根本不注册（页面永远 "Reconnecting"，
+  // 带 token 的启动横幅也不打），而同一时刻 `describe()` 只列已 ACTIVE 的条目，
+  // 还会把已有卡片误判成「缺失」而写盘。
+  // 断言两半：树没 settle 时 apply() 必须已经返回且**一次盘都没写**；放行之后才写。
+  {
+    const gated = makeSettings({ providers: {} })
+    let releaseGate
+    const gate = new Promise((resolve) => { releaseGate = resolve })
+    let gatedDisposer
+    const gatedApplied = apply(ctxFor(recorder(), gated, (register) => { gatedDisposer = register() }, { loader: { await: () => gate } }), {})
+    const raced = await Promise.race([
+      gatedApplied.then(() => 'returned'),
+      new Promise((resolve) => setTimeout(() => resolve('still waiting'), 50)),
+    ])
+    check('apply() returns while the tree is still loading', raced === 'returned', raced)
+    check('…and provisions nothing until the tree settles', gated.writes.length === 0, JSON.stringify(gated.writes))
+    releaseGate()
+    await gatedApplied
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    check('…then provisions once the tree settles', gated.writes.length === 1 && gated.writes[0].ops[0].value.baseURL === 'https://api.cline.bot/api/v1', JSON.stringify(gated.writes.map((write) => write.ns)))
+    gatedDisposer()
+    check('the deferred hook is disposed again', globalThis.fetch === realFetch)
+  }
 
   // A config still asking for the removed loopback transport must not open one.
   const legacySettings = makeSettings({ providers: {} })

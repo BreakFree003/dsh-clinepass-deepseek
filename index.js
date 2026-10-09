@@ -2206,17 +2206,45 @@ export async function apply(ctx, config) {
     }
     publishProvision()
   }
+  /**
+   * 把 provisioning 推到**树 settle 之后**再跑，绝不在 `apply()` 里 await 它。
+   *
+   * 0.2.1-alpha.2 起 `settings.mutate` 走 `configEditor.edit`：先拿 profile
+   * `package.json` 的写锁，再 `reconcileProfilePatches()` —— 那一步要等 loader
+   * **settle**。在 apply 里 await 它就成了自锁：本 fiber 停在 LOADING → 树永不
+   * settle → `appReady` 不 commit → Web 客户端的 `/api/remote.mux` 升级路由根本
+   * 不注册（页面永远 "Reconnecting"，而且 `dsh web:` 那行带 token 的启动横幅也
+   * 不打）。同一时刻 `describe()` 只列 fiber 已 ACTIVE 的条目 —— `llm-pi-ai` 还没
+   * 进去，读出来是「卡片缺失」，于是这次必然写盘，正好撞上那把锁。
+   * 推迟到 settle 之后：describe 完整（已有卡片 → 什么都不写），真要写也不是从
+   * apply 里写，锁能拿到、reconcile 能跑完。上游 `dsh-settings` 自己就是这么做的
+   * （构造器里 `ctx.root.loader.await().then(() => this.importLegacyDocument())`）。
+   * @param run - settle（或本宿主压根没有 loader 服务）之后执行的动作。
+   * @returns 没有 loader 时是 `run()` 的 promise（调用方仍旧 await，行为与旧版一致）；
+   *   有 loader 时是 `undefined` —— 调用方绝不能 await 它，那正是这次要避开的自锁。
+   */
+  const afterSettle = (run) => {
+    let loader
+    try {
+      loader = ctx.root?.loader ?? ctx.loader
+    } catch {
+      /* 未声明 inject / 服务缺席：cordis 会抛，这里正是要兜住的情况 */
+    }
+    if (loader?.await === undefined) return run()
+    Promise.resolve(loader.await()).then(() => run(), () => run())
+    return undefined
+  }
   if (!cfg.provision) {
     provision = 'off'
     publishProvision()
   } else {
     publishProvision()
     const settings = settingsService(ctx)
-    if (settings !== undefined) await provisionWith(settings)
+    if (settings !== undefined) await afterSettle(() => provisionWith(settings))
     else if (typeof ctx.inject === 'function') {
       logger.info?.('[clinepass] the settings service is not up yet; provisioning the "%s" profile when it registers', cfg.provider)
       ctx.inject(['settings'], (scoped) => {
-        void provisionWith(scoped.settings)
+        void afterSettle(() => provisionWith(scoped.settings))
       })
     } else {
       provision = 'unavailable'
