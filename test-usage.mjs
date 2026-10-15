@@ -525,6 +525,13 @@ console.log('\n── 8. client render ─────────────�
     let cursor = 0
     let pending = false
     let effects = []
+    /**
+     * Hook count of the previous completed render of this mount. React enforces
+     * the rules of hooks by comparing exactly this; the stand-in must too, or a
+     * component that changes its hook count mid-life passes silently here and
+     * crashes the real runtime (see `endRender`).
+     */
+    let renderedHooks = null
     /** Live effect cleanups by hook index — so an unmount can actually run them. */
     const cleanups = new Map()
     let cleanupsToRun = []
@@ -584,6 +591,26 @@ console.log('\n── 8. client render ─────────────�
         effects = []
         cleanupsToRun = []
         pending = false
+      },
+      /**
+       * The end of one component render: assert the rules of hooks.
+       *
+       * A component that calls a different number of hooks than its previous
+       * render is a hard error in React ("Rendered more hooks than during the
+       * previous render"), and the slot's error boundary then replaces that cell
+       * with `<div data-slot-error>` for the rest of the page's life. The 0.11.3
+       * dock pill did exactly that: it early-returned before its 12 later hooks
+       * while `modelSelection` was still `{lastUsed:null,next:null}` (a brand-new
+       * session), then called them once the first `request/header` landed — so
+       * the pill only ever appeared after a page refresh. Without this check the
+       * transition is invisible to the suite, because the stand-in has no
+       * bookkeeping: a 1-hook render followed by a 13-hook render just works.
+       */
+      endRender() {
+        if (renderedHooks !== null && renderedHooks !== cursor) {
+          throw new Error(`the rules of hooks were violated: this render called ${cursor} hook(s), the previous one called ${renderedHooks}`)
+        }
+        renderedHooks = cursor
       },
       /** The commit step: pending cleanups first, then the new effects. */
       takeCommit() {
@@ -746,6 +773,7 @@ console.log('\n── 8. client render ─────────────�
         tree = seat.component(props)
         // The bundle wraps UsageCard one level deep; resolve it.
         if (tree !== null && typeof tree.type === 'function') tree = tree.type(tree.props)
+        stub.endRender()
         const commit = stub.takeCommit()
         for (const cleanup of commit.cleanups) cleanup()
         for (const item of commit.effects) {
@@ -756,6 +784,22 @@ console.log('\n── 8. client render ─────────────�
         if (!stub.pending) break
       }
       return expand(tree)
+    }
+
+    /**
+     * `renderCard`, but a rules-of-hooks violation becomes a failed check instead
+     * of an uncaught throw. Used for the re-render sequences where the hook count
+     * legitimately changes between props (the dock pill's foreign → clinepass
+     * switch) — that is the transition React crashes on, so it must be asserted,
+     * not skipped.
+     */
+    async function renderChecked(seat, stub, props, label) {
+      try {
+        return await renderCard(seat, stub, props)
+      } catch (error) {
+        check(label, false, error instanceof Error ? error.message : String(error))
+        return undefined
+      }
     }
 
     // A foreign provider's card must render nothing at all.
@@ -954,23 +998,78 @@ console.log('\n── 8. client render ─────────────�
     check('…and unmounting clears it', globalThis.window.__TIMERS__.cleared === 1, JSON.stringify(globalThis.window.__TIMERS__))
 
     // ── 9. conversation.composer.dock: provider pill ──
+    //
+    // 这一节必须**同一个 mount 连续渲染两次**（先 foreign、再 cline-pass）：那正是
+    // 0.11.3 崩掉的转换 —— 真实会话里新会话的 modelSelection 先是
+    // `{lastUsed:null,next:null}`，胶囊渲染成 null；第一条请求落盘后同一个 fiber 才
+    // 开始调用后面的 hook。React 会抛 "Rendered more hooks than during the previous
+    // render"，slot 错误边界把这一格换成 <div data-slot-error>，胶囊整页消失、只有
+    // 刷新才回来。`renderChecked` + `endRender` 就是为此存在的。
     const dockMount = mount()
     globalThis.window.__ANSWER__ = { ok: true, provider: 'openai-compatible-private', anonymized: true }
+    const dockProps = (selection, extra = {}) => ({
+      useProjection: (key) => (key === 'modelSelection' ? selection : null),
+      useSession: (select) => select({ running: false }),
+      sessionId: 'sess-1',
+      ...extra,
+    })
 
     // Foreign model in session -> renders null
-    const foreignDock = await renderCard(dockMount.dockSeat, dockMount.stub, {
-      useProjection: (key) => (key === 'modelSelection' ? { next: { provider: 'deepseek', model: 'deepseek-chat' } } : null),
-      sessionId: 'sess-1',
-    })
+    const foreignDock = await renderChecked(
+      dockMount.dockSeat,
+      dockMount.stub,
+      dockProps({ next: { provider: 'deepseek', model: 'deepseek-chat' } }),
+      'the foreign-model dock render does not violate the rules of hooks',
+    )
     check('foreign model dock pill renders nothing', foreignDock === null)
+    check('…and fetches nothing at all', dockMount.calls.length === 0, JSON.stringify(dockMount.calls.map((c) => c.url)))
 
     // Clinepass model in session -> renders pill with provider
-    const clinepassDock = await renderCard(dockMount.dockSeat, dockMount.stub, {
-      useProjection: (key) => (key === 'modelSelection' ? { next: { provider: 'cline-pass', model: 'cline-pass/deepseek-v4.1-flash' } } : null),
-      sessionId: 'sess-2',
-    })
-    check('clinepass model dock pill renders', clinepassDock !== null && clinepassDock.props['data-composer-stat'] === 'clinepass-provider')
-    check('…queries the status route with status=1', dockMount.calls.some((c) => c.url.includes('status=1') && c.url.includes('sessionId=sess-2')), JSON.stringify(dockMount.calls.map((c) => c.url)))
+    const clinepassDock = await renderChecked(
+      dockMount.dockSeat,
+      dockMount.stub,
+      dockProps({ next: { provider: 'cline-pass', model: 'cline-pass/deepseek-v4.1-flash' } }),
+      'the cline-pass dock render keeps the hook count of the previous render',
+    )
+    check('clinepass model dock pill renders', clinepassDock != null && clinepassDock.props['data-composer-stat'] === 'clinepass-provider')
+    check('…queries the status route with status=1', dockMount.calls.some((c) => c.url.includes('status=1') && c.url.includes('sessionId=sess-1')), JSON.stringify(dockMount.calls.map((c) => c.url)))
+    check('…and shows the provider the host reported', textOf(clinepassDock).join(' ').includes('Provider: openai-compatible-private'), textOf(clinepassDock).join(' | '))
+    check('…credentialed like the usage card', dockMount.calls.every((c) => c.init?.credentials === 'same-origin'), JSON.stringify(dockMount.calls.map((c) => c.init)))
+
+    // 一个真实会话里的顺序：首次渲染时投影还是空的（新会话，没有任何 request/header）
+    // —— 胶囊返回 null，但 hook 数量必须与上一帧一致，否则就是 0.11.3 那个崩法。
+    const blankDock = await renderChecked(
+      dockMount.dockSeat,
+      dockMount.stub,
+      dockProps({ lastUsed: null, next: null }),
+      'a brand-new session (empty modelSelection) keeps the same hook count',
+    )
+    check('…renders nothing while the session has no model selection yet', blankDock === null, JSON.stringify(blankDock))
+
+    // warn 模式：状态查询说 warn=true 时，胶囊必须把它显示出来（⚠️ + 原因进 tooltip）。
+    globalThis.window.__ANSWER__ = { ok: true, provider: 'together', anonymized: false, warn: true, reason: 'finalProvider=together，允许的是 deepseek' }
+    const warnedDock = await renderChecked(
+      dockMount.dockSeat,
+      dockMount.stub,
+      dockProps({ lastUsed: { provider: 'cline-pass', model: 'cline-pass/deepseek-v4.1-flash' }, next: null }),
+      'the warn-mode re-render keeps the same hook count',
+    )
+    check('a warned provider is labelled with ⚠️', textOf(warnedDock).join(' ').includes('Provider: together ⚠️'), textOf(warnedDock).join(' | '))
+    check('…and the reason reaches the tooltip', warnedDock?.children?.[0]?.props?.title?.includes('finalProvider=together') === true, JSON.stringify(warnedDock?.children?.[0]?.props?.title ?? null))
+
+    // 轮询：running 为真时挂一个 2 秒的 ticker，running 落下后清掉（useSession 是
+    // 上一条用例唯一没覆盖的路径 —— 没传它时 running 恒为 false，ticker 永不出现）。
+    const runningMount = mount()
+    globalThis.window.__ANSWER__ = { ok: true, provider: 'deepseek', anonymized: false }
+    const runningDock = await renderChecked(
+      runningMount.dockSeat,
+      runningMount.stub,
+      { useProjection: (key) => (key === 'modelSelection' ? { next: { provider: 'cline-pass', model: 'cline-pass/deepseek-v4.1-flash' } } : null), useSession: (select) => select({ running: true }), sessionId: 'sess-3' },
+      'the running-session dock render keeps the same hook count',
+    )
+    check('a running session starts exactly one ticker', runningDock !== null && runningMount.stub.intervalCount() === 1, String(runningMount.stub.intervalCount()))
+    runningMount.stub.unmount()
+    check('…and unmounting clears it', globalThis.window.__TIMERS__.cleared >= 1, String(globalThis.window.__TIMERS__.cleared))
   } finally {
     if (realWindow === undefined) delete globalThis.window
     else globalThis.window = realWindow

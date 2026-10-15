@@ -229,14 +229,13 @@ const ENFORCEMENT_VALUES = ['strict', 'warn', 'off']
  * 网关给 VMC 回退网形状的**匿名渠道标签**（0.11.1）：2026-10-14 起 provider 元数据不再
  * 写出真名，`finalProvider` / `resolvedProvider` / 成功的 `providerAttempts` 一律是这个值
  * （实测与审计：`clinepass-deepseek-audit/`，权重同一性已验证 —— 正版 V4.1 Flash 的低噪声
- * 重部署，contributor 档）。把它写进渠道钉的允许列表即视为放行；会话首条消息的提示
- * （{@link pinnedBody} 的 `notice` → {@link withAnonymousNotice}）也以它为准。
+ * 重部署，contributor 档）。把它写进渠道钉的允许列表即视为放行。
+ *
+ * 0.11.1/0.11.2 曾据此在会话首条消息前垫一条合成提示帧（`withAnonymousNotice`）；
+ * 0.11.3 已删除 —— 合成帧会进模型上下文，代价大于收益。它不再影响任何行为。
  */
 const ANONYMIZED_CHANNEL = 'openai-compatible-private'
 
-/** 会话首条消息的匿名渠道提示文案。想改措辞改这里；想整个关掉就从允许列表里拿掉它。 */
-const ANONYMIZED_NOTICE =
-  '⚠️ clinepass：deepseek 渠道已被网关匿名化为 openai-compatible-private（contributor 档：数据可能用于训练，无 ZDR）。本提示只在会话第一条消息显示。'
 /**
  * 自动重试的默认次数（0.10.0）。语义是「校验失败后再补发几次」，总尝试数 = `retries + 1`。
  *
@@ -945,39 +944,6 @@ function bodyText(body) {
  *   no slug) gets `{ untouched: true, expect?, model? }` — the request is sent as-is,
  *   and its *response* is verified instead.
  */
-/**
- * 这是不是一个会话的首个模型请求（0.11.2 修正，「匿名渠道提示」的触发条件）。
- *
- * 0.11.1 判「非 system 消息恰 1 条」，2026-10-15 实测漏报：dsh 的上下文插件
- * （time-context 等）会把快照作为**额外的 user 消息**注进同一条请求 —— 真实首条
- * 请求的 wire 形状是 `[system, user(问候), user(time-context)]`，非 system 计数
- * 是 2，条件永不成立；手搓单 user 消息的测试体测不出这种偏差。会话标题生成
- * （session-title-first-prompt-llm）走同一路由、同样没有 assistant 历史，`stream`
- * 也是 true —— 但它的 `max_tokens` 是 4096（dsh-base 组合），主会话请求是 384000，
- * 差两个数量级。所以三个条件合取：流式、历史里没有任何 assistant 消息（turn-1
- * step-2 起工具回填必然引入，不会重复提示）、输出预算足够大（把标题请求挡在外面
- * —— 它的输出直接变成会话标题，垫不得）。
- *
- * 0.11.3：预算字段认两种拼写（`max_tokens` / `max_completion_tokens`，pi-ai 的
- * MAX_TOKENS_FIELDS 按 provider 配置二选一）—— 0.11.2 只认前者，真实请求若用另一
- * 拼写则守卫恒假、提示永不垫（2026-10-15 二次漏报，playground 复测仍无 ⚠️）。
- * 配套诊断：{@link pinnedBody} 把每次请求的形状记进状态文件 `lastRequestShape`
- * （「提示为什么没垫」这类问题从此不用再猜）。
- */
-function isConversationStart(body) {
-  if (body?.stream !== true) return false
-  const budget = Number(body.max_tokens ?? body.max_completion_tokens)
-  if (!(budget > 8192)) return false
-  const messages = Array.isArray(body?.messages) ? body.messages : null
-  if (messages === null) return false
-  for (const message of messages) {
-    if (isPlainObject(message) && message.role === 'assistant') return false
-  }
-  return true
-}
-
-/** 最近一次 chat 请求的判定相关形状（0.11.3 诊断；状态文件 `lastRequestShape`）。 */
-
 function pinnedBody(text, cfg) {
   let body
   try {
@@ -993,12 +959,9 @@ function pinnedBody(text, cfg) {
   // 0.11.0：provider 钉不再只守响应 —— wire 顶层 `provider.order`（显示名 slug 化）
   // 一并写上。deepseek 形状（回退网）对 order 无感（实测 routing 不变），两侧同配也安全。
   const wired = withProviderOrder(applied.body, expect)
-  // 0.11.1：允许列表里有匿名渠道且这是会话首条消息 → 响应前垫一条提示
-  // （见 {@link withAnonymousNotice}）。直通形状（only 为空）不提示 —— 它没有渠道匿名问题。
-  // 0.11.2：首条的判定改成 {@link isConversationStart}（流式 + 无 assistant 历史 +
-  // 大输出预算）—— 0.11.1 的「非 system 恰 1 条」在真实 dsh 会话里永不成立。
-  const notice = only.includes(ANONYMIZED_CHANNEL) && isConversationStart(body)
-  // 0.11.3 诊断：把判定相关的请求形状留给状态文件 —— 提示垫没垫、为什么，从此有据可查。
+  // 0.11.3 诊断：把请求形状留给状态文件 —— 「这条请求长什么样」从此有据可查。
+  // （0.11.1/0.11.2 的「会话首条消息垫提示帧」已在 0.11.3 删除：合成的 assistant
+  // 帧会进上下文，代价比收益大。诊断字段保留，它不依赖那个功能。）
   const shapeMessages = Array.isArray(body.messages) ? body.messages : null
   const shape = {
     at: new Date().toISOString(),
@@ -1007,12 +970,11 @@ function pinnedBody(text, cfg) {
     maxTokens: body.max_tokens ?? null,
     maxCompletionTokens: body.max_completion_tokens ?? null,
     roles: shapeMessages === null ? null : shapeMessages.map((m) => (isPlainObject(m) ? m.role : '?')).join(','),
-    notice,
   }
   if (applied.pinned || wired.order.length > 0) {
-    return { text: JSON.stringify(wired.body), only, expect, order: wired.order, model: body.model ?? null, notice, shape }
+    return { text: JSON.stringify(wired.body), only, expect, order: wired.order, model: body.model ?? null, shape }
   }
-  return expect.length > 0 ? { untouched: true, expect, model: body.model ?? null, notice, shape } : { untouched: true, notice, shape }
+  return expect.length > 0 ? { untouched: true, expect, model: body.model ?? null, shape } : { untouched: true, shape }
 }
 
 // ── 校验：网关到底把这次请求交给了谁 ────────────────────────────────────────
@@ -2073,7 +2035,14 @@ export function createFetchPin(config, logger = console) {
         reason: verdict.reason,
       }
       lastVerified = { ...warnEntry }
+      // 两个索引都要写 —— 与 {@link recordVerified} 逐字对齐。查询侧
+      // （{@link createUsageHandler} 的 `?status=1`）的优先级是 session → model →
+      // 全局，而 session 这一级在本机永远是空的（dsh 不对上游发会话头，见
+      // {@link extractSessionId}），于是 model 索引是唯一会命中的一级：漏写它，
+      // 这个模型上一次**通过**的记录就会盖住这次的新鲜告警，胶囊显示"正常"。
       if (sessionId) lastVerifiedBySession.set(String(sessionId), lastVerified)
+      if (model) lastVerifiedByModel.set(model, lastVerified)
+      if (isAnonymized) lastAnonymized = { at, url, provider: actualProv, model, sessionId }
       publish()
       logger.warn?.('[clinepass] ⚠ 响应由 %s 提供（配置允许 %s），已放行（仅告警）：%s', actualProv || '未知提供方', expected.join('/'), verdict.reason)
       return bufferedResponse(text, response)
@@ -2219,7 +2188,12 @@ export function createFetchPin(config, logger = console) {
           reason: verdict.reason,
         }
         lastVerified = { ...warnEntry }
+        // 同 {@link sendVerified} 的缓冲分支：model 索引必须一起写，否则这个模型
+        // 上一次通过的记录会盖住这次的新鲜告警（查询侧的优先级是 session → model
+        // → 全局，而 session 级永远是空的）。
         if (sessionId) lastVerifiedBySession.set(String(sessionId), lastVerified)
+        if (model) lastVerifiedByModel.set(model, lastVerified)
+        if (isAnonymized) lastAnonymized = { at, url, provider: actualProv, model, sessionId }
         publish()
         logger.warn?.('[clinepass] ⚠ 响应由 %s 提供（配置允许 %s），已放行（仅告警）：%s', actualProv || '未知提供方', expected.join('/'), verdict.reason)
         controller.close()
@@ -2340,85 +2314,6 @@ export function createFetchPin(config, logger = console) {
     // 校验发生在响应到达之后，而请求发起时的那次 publish() 早于它 —— 不补这一次，
     // 状态文件里的 lastVerified 会永远慢一拍。
     publish()
-  }
-
-  /**
-   * 给响应垫上「匿名渠道」提示（0.11.1）。
-   *
-   * 只处理 SSE（dsh 的 chat 全是流式）：把一条合成的 OpenAI chunk 帧垫在响应体**最前面**，
-   * 消费者看到的第一段文字就是提示。提示帧不含 routing / provider 字段 —— 校验层
-   * （`note()` / `routingsOfText()`）扫过它等于扫过普通内容帧，不影响钉选判定；终止帧
-   * 仍是网关自己的那一帧，收尾语义不变。
-   *
-   * 非 SSE、或构造中途出任何错：原样返回 —— 提示是增强，绝不是闸，坏了就当没有。
-   *
-   * 为什么垫在流前而不是流尾：请求侧在 `pinnedBody` 就知道这次走的是匿名渠道形状
-   * （允许列表里有它），不必等最后一帧的 routing 证据 —— 那时内容早已流完，垫前已经晚了。
-   *
-   * @param response - 上游 2xx 响应（body 未读过）。
-   * @param model - 请求体里的 model id（提示帧回显用）。
-   * @returns 垫了提示的响应，或原响应。
-   */
-  function withAnonymousNotice(response, model) {
-    if (!isEventStream(response) || response.body === null) return response
-    try {
-      const chunk = {
-        id: 'clinepass-anonymized-notice',
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: typeof model === 'string' ? model : 'cline-pass/deepseek-v4.1-flash',
-        choices: [{ index: 0, delta: { role: 'assistant', content: ANONYMIZED_NOTICE }, finish_reason: null }],
-      }
-      const head = new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`)
-      const source = response.body
-      const headers = new Headers(response.headers)
-      // 与 bufferedResponse / streamedVerification 同一条铁律：body 已解码，这两个头必须删。
-      headers.delete('content-encoding')
-      headers.delete('content-length')
-      // 消费者随时可能取消（streamedVerification 读到终止帧就收尾并 cancel 上游 ——
-      // 实测 2026-10-15：真网关把 [DONE] 塞在中途 chunk 里时必然发生）。取消后泵的在途
-      // read 仍会回来，对已死的 controller 调 enqueue/close/error 会抛 ERR_INVALID_STATE
-      // 且成为未处理拒绝 —— 用标志位静默，别让提示的善后砸掉进程。
-      let cancelled = false
-      const body = new ReadableStream({
-        start(controller) {
-          controller.enqueue(head)
-          const reader = source.getReader()
-          const pump = () =>
-            reader.read().then(
-              ({ done, value }) => {
-                if (cancelled) return
-                try {
-                  if (done) return controller.close()
-                  controller.enqueue(value)
-                } catch {
-                  // cancel 与在途 read 的竞态窗口：控制器已死，静默收摊。
-                  cancelled = true
-                  return
-                }
-                return pump()
-              },
-              (error) => {
-                if (cancelled) return
-                try {
-                  controller.error(error)
-                } catch {
-                  /* 控制器已死：消费者先取消了，什么都不用交付 */
-                }
-              },
-            )
-          pump()
-        },
-        cancel(reason) {
-          cancelled = true
-          // 取消要向上游传播：连接已经没用了（终止帧都发过了），不掐会挂着等超时。
-          source.cancel(reason).catch(() => {})
-        },
-      })
-      return new Response(body, { status: response.status, statusText: response.statusText, headers })
-    } catch {
-      return response
-    }
   }
 
   const wrapper = function pinnedFetch(input, init) {

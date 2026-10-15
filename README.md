@@ -161,10 +161,13 @@ temp=0 完全确定；prefix cache 记账为 token 精确）：结论是**正版
 `clinepass-deepseek-audit/`。
 
 0.11.1 据此：渠道钉默认改为 `[deepseek, openai-compatible-private]`（保留真名 —— 网关哪天
-改回来校验自动恢复）；会话**首条消息**经匿名渠道服务时在回复前垫一条提示帧
-（`withAnonymousNotice`），后续消息不垫；状态文件新增 `counters.anonymized` 与
-`lastAnonymized`。其余闸门语义（resolvedProvider / 成功 attempts / 缺证据 fail closed）
-逐字不变，不在允许列表的渠道照旧拒。
+改回来校验自动恢复）；状态文件新增 `counters.anonymized` 与 `lastAnonymized`。其余闸门语义
+（resolvedProvider / 成功 attempts / 缺证据 fail closed）逐字不变，不在允许列表的渠道照旧拒。
+
+0.11.1/0.11.2 曾在会话**首条消息**的回复前垫一条匿名渠道提示帧（`withAnonymousNotice`）；
+**0.11.3 已删除**：那条合成 assistant 帧会进模型上下文（正是这个插件要避免的东西），代价
+大于收益。现在响应体逐字就是网关的，匿名渠道只在 `counters.anonymized` / `lastAnonymized`
+和底部胶囊的图标上体现。
 
 ### provider 级钉选（0.10.0）：直通模型的第二证据面
 

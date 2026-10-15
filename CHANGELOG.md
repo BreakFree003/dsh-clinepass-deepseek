@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.11.4
+
+Strict review of 0.11.3 found that two of its three headline claims did not hold in
+production, and that the dock pill was invisible for the whole life of a page. No
+behaviour change beyond these fixes.
+
+- **Fixed: the Provider pill only appeared after a page refresh.** The dock pill
+  early-returned (`if (!isClinepass) return null`) **before** its twelve later hooks,
+  while a brand-new session's `modelSelection` projection is still
+  `{lastUsed:null,next:null}` — so the first render called one hook and the render
+  after the first `request/header` called thirteen. React throws `Rendered more hooks
+  than during the previous render`, the slot's error boundary replaces that cell with
+  `<div data-slot-error>` for the rest of the page's life, and the pill only came back
+  on refresh (when the projection replays from the durable log and the first render is
+  already consistent). All hooks are now called unconditionally, exactly as `UsageCard`
+  next to it always did; the three effects no-op for a foreign model, and the
+  `return null` moved below every hook. The polling timers also moved to `window.*`
+  (matching `useNow`/`UsageCard`) so the test stand-in can intercept them, and a
+  `running → false` re-read is now followed by one delayed re-read so the conclusion
+  does not depend on the order between the stream's terminator and `recordVerified`.
+- **Fixed: a warn-mode violation was shadowed by the model's previous pass.** Both
+  warn branches wrote `lastVerifiedBySession` but not `lastVerifiedByModel`, while
+  `?status=1` resolves `session → model → global`. `sessionId` is always `null` (dsh
+  sends no session header upstream — see the next bullet), so the model index is the
+  only level that can match, and a stale pass entry for that model won: the pill showed
+  "normal" for every violation after the first one per model per process. Both branches
+  now mirror `recordVerified` (model index + `lastAnonymized`).
+- **Removed: the 0.11.1/0.11.2 anonymized-channel notice.** `6e0acdc` deleted the call
+  site but left `withAnonymousNotice` (61 lines), `ANONYMIZED_NOTICE`, the `notice`
+  field `pinnedBody` still computed and returned, and `isConversationStart` feeding it.
+  All removed. `lastRequestShape` diagnostics stay (they do not depend on the notice).
+- **Corrected claims in the 0.11.3 entry below** (kept verbatim as the historical
+  record): "recorded in session state (`lastVerifiedBySession` with `warn: true`)"
+  never happened — `sessionId` is always `null`, because dsh's upstream LLM requests
+  carry only `user-agent` (`attributionHeaders()` in `dsh-llm`); the per-session index,
+  `verifiedBySession`, and the pill's `sessionId` query parameter are therefore dead
+  weight on this machine. "anonymized channels display a warning badge (⚠️)" — the ⚠️
+  suffix is only appended when `warn` is true, and an anonymized channel that is on the
+  allow list reports `warn: false`, so the badge never showed for the case it names.
+  "updating dynamically as API responses complete" — see the first bullet.
+- **Docs:** README, the bundle patch and the profile patch no longer promise the
+  notice; `smoke-test.mjs` asserted that notice was present (a live-network test that
+  `npm test` does not run) and now asserts the opposite — pure gateway content.
+- **Tests:** the client stand-in now enforces the rules of hooks (`endRender` compares
+  the hook count against the previous render), which is what let this ship; the dock
+  case renders foreign → cline-pass on one mount (the crashing transition) and now
+  passes `useSession`, so the polling path is covered; `test-fetch.mjs` §18 is a
+  regression test for the warn shadowing (red before the fix, green after).
+
 ## 0.11.3
 
 Dynamic Provider display in bottom composer dock and non-blocking Provider warnings:

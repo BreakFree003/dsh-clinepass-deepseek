@@ -692,6 +692,16 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
       /**
        * 底部状态栏（conversation.composer.dock）的 Provider 胶囊。
        * 随 API 响应动态更新，仅对 Clinepass 的模型生效显示。
+       *
+       * **每一个 hook 都必须在早退之前无条件调用**（和下面的 {@link UsageCard} 一样）。
+       * 这不是风格问题：`isClinepass` 会在会话中途由 false 变 true —— 新会话在第一次
+       * `request/header` 之前，`modelSelection` 投影是 `{lastUsed:null,next:null}`
+       * （init 见 dsh-api-session-controller 的 model-selection-projection），此时
+       * `sel` 为 null、`isClinepass` 为 false；请求一落盘，同一个 fiber 就要开始调用
+       * 下面那 12 个 hook。把 `return null` 放在 hook 前面 = hook 数量从 1 跳到 13，
+       * React 抛 "Rendered more hooks than during the previous render"，slot 错误边界
+       * 把这一格永久换成 `<div data-slot-error>` —— 胶囊整页消失，只有刷新页面
+       * （投影从持久化日志回放，第一帧就一致）才回来。这个坑真踩过一次（0.11.3）。
        */
       function ClinepassProviderPill(props) {
         var useProjection = props.useProjection
@@ -704,10 +714,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         var isClinepass = false
         if (sel) {
           if (sel.provider === PROVIDER) isClinepass = true
-          if (typeof sel.model === 'string' && (sel.model === PROVIDER || sel.model.indexOf(PROVIDER + '/') === 0)) isClinepass = true
+          if (typeof sel.model === 'string' && sel.model.indexOf(PROVIDER + '/') === 0) isClinepass = true
         }
-
-        if (!isClinepass) return null
 
         var currentModel = sel && typeof sel.model === 'string' ? sel.model : ''
         var lang = useLanguage(ctx)
@@ -724,7 +732,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           var url = statusUrl(sessionId, currentModel)
           var fetchFn = window.fetch ? window.fetch.bind(window) : globalThis.fetch
           if (!fetchFn) return
-          fetchFn(url, { headers: { accept: 'application/json' } })
+          fetchFn(url, { headers: { accept: 'application/json' }, credentials: 'same-origin' })
             .then(function (res) {
               if (!res.ok) return null
               return res.json()
@@ -745,24 +753,35 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
             .catch(function () {})
         }, [sessionId, currentModel])
 
+        // 三个 effect 都对非 clinepass 模型空转 —— hook 照调，活不干。
         React.useEffect(function () {
+          if (!isClinepass) return
           refresh()
-        }, [sessionId, currentModel, refresh])
+        }, [isClinepass, sessionId, currentModel, refresh])
 
         React.useEffect(function () {
-          if (prevRunningRef.current && !running) {
-            refresh()
-          }
+          var wasRunning = prevRunningRef.current
           prevRunningRef.current = running
-        }, [running, refresh])
+          if (!isClinepass || !wasRunning || running) return undefined
+          refresh()
+          // 服务端在放行终止帧之前就写完 lastVerified，所以上面这一次通常已经拿到
+          // 新结论；补一次延迟重读是为了不依赖那个顺序（流式收尾与 recordVerified
+          // 的先后是实现的巧合，不是契约）。
+          // 计时器一律走 `window.` —— 与 useNow / UsageCard 同一套，测试的替身才拦得住
+          // （裸 setInterval 在 Node 里是真计时器，会挂在测试进程上）。
+          var settle = window.setTimeout(refresh, 1200)
+          return function () {
+            window.clearTimeout(settle)
+          }
+        }, [isClinepass, running, refresh])
 
         React.useEffect(function () {
-          if (!running) return
-          var timer = setInterval(refresh, 2000)
+          if (!isClinepass || !running) return
+          var timer = window.setInterval(refresh, 2000)
           return function () {
-            clearInterval(timer)
+            window.clearInterval(timer)
           }
-        }, [running, refresh])
+        }, [isClinepass, running, refresh])
 
         var isWarning = status.anonymized || status.warn
         var providerName = status.provider
@@ -776,6 +795,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         var hoverPair = React.useState(false)
         var hovered = hoverPair[0]
         var setHovered = hoverPair[1]
+
+        // 全部 hook 到此为止；下面才是「非本路由的卡片原样放过」。
+        if (!isClinepass) return null
 
         var icon = isWarning
           ? React.createElement(AnonymizedIcon, null)

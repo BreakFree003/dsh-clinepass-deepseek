@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { createFetchPin, installPromptDisplay, isGatewayChat, isTerminatorFrame, judgeProviders, nextFrameEnd, providerPinFor, providerSlug, providersOfText, provisionProfile, routingOfText, statusFileFor, withDefaults, withProviderOrder } from './index.js'
+import { createFetchPin, createUsageHandler, installPromptDisplay, isGatewayChat, isTerminatorFrame, judgeProviders, nextFrameEnd, providerPinFor, providerSlug, providersOfText, provisionProfile, routingOfText, statusFileFor, withDefaults, withProviderOrder } from './index.js'
 
 // The hook publishes a status file by default; keep every run's out of the
 // user's real DSH_HOME (and let the default resolution be what is exercised).
@@ -2082,6 +2082,77 @@ console.log('\n── 17. the anonymized channel ──────────�
     hook.uninstall()
     stub.restore()
   }
+}
+
+// ── 18. warn 模式的告警必须活过状态查询（0.11.4 回归）──────────────────────
+//
+// `enforcement: warn` 下唯一的用户可见信号是底部胶囊，而胶囊读 `?status=1`。
+// 查询侧的优先级是 session → **model** → 全局，而 session 级在本机永远是空的
+// （dsh 的上游请求只带 user-agent，见下面那条"记录现状"断言）。于是 warn 分支
+// 只写 session 索引、漏写 model 索引时，这个模型**上一次通过**的记录会盖住新鲜
+// 的告警 —— 胶囊显示"正常"，告警静默。
+//
+// 这个用例的形状就是那个顺序：先让模型 M 通过一次（把 model 索引填上），再让同一个
+// M 走一条违规响应（warn 分支），然后问状态查询要结论。修复前它读到的是旧的通过
+// 记录（warn=false / provider=deepseek），因此**先红后绿**。
+console.log('\n── 18. warn mode survives the status query ───────────────')
+{
+  const enc = (text) => new TextEncoder().encode(text)
+  const delta = (text) => `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`
+  const routingFrame = (provider) => `data: ${gatewayBody(provider)}\n\n`
+  const frames = (...parts) => new Response(new ReadableStream({
+    start(controller) {
+      for (const part of parts) controller.enqueue(enc(part))
+      controller.close()
+    },
+  }), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  const drain = async (response) => {
+    const reader = response.body.getReader()
+    for (;;) {
+      const { done } = await reader.read()
+      if (done) return
+    }
+  }
+
+  const MODEL = CHAT_BODY.model
+  const cfg = withDefaults({ pin: ['deepseek'], enforcement: 'warn' })
+  const hook = createFetchPin(cfg, recorder())
+  const handler = createUsageHandler({}, cfg, recorder(), { hook })
+  const status = async () =>
+    (await handler(new Request(`http://127.0.0.1:3080/api/clinepass.usage?status=1&model=${encodeURIComponent(MODEL)}`))).json()
+
+  // 同一个模型先通过、再违规 —— 渠道由这个变量切换，stub 与 hook 的安装顺序不动。
+  let provider = 'deepseek'
+  const stub = stubFetch(() => frames(delta('ok'), routingFrame(provider), 'data: [DONE]\n\n'))
+  hook.install()
+
+  await drain(await globalThis.fetch(CHAT, jsonInit()))
+  const passed = await status()
+  check('warn mode: a passing response is what the status query reports', passed.warn === false && passed.provider === 'deepseek', JSON.stringify(passed))
+
+  provider = 'together'
+  await drain(await globalThis.fetch(CHAT, jsonInit()))
+  const warned = await status()
+  check(
+    'warn mode: the fresh warn entry is not shadowed by the earlier pass',
+    warned.warn === true && warned.provider === 'together',
+    JSON.stringify(warned),
+  )
+  check('warn mode: the per-model index carries the warn entry too', hook.verifiedByModel(MODEL)?.warn === true, JSON.stringify(hook.verifiedByModel(MODEL) ?? null))
+  check('warn mode: a non-anonymized violation leaves lastAnonymized alone', hook.state().lastAnonymized === null, JSON.stringify(hook.state().lastAnonymized ?? null))
+
+  // 记录现状（不是验证正确）：dsh 给上游的请求只带 `user-agent`（dsh-llm 的
+  // attributionHeaders() 只设它），没有任何会话头 —— 所以 session 索引在本机永远
+  // 是空的，`?status=1` 实际只能靠 model 索引或全局兜底。§17 里那条 `x-session-id`
+  // 断言测的是**提取逻辑本身**，不代表线上会走到那条分支。
+  check(
+    'recorded reality: dsh sends no session header, so the session index stays empty',
+    hook.state().lastVerified?.sessionId === null && hook.verifiedBySession('sess-test-42') === undefined,
+    JSON.stringify({ sessionId: hook.state().lastVerified?.sessionId ?? null, lookup: hook.verifiedBySession('sess-test-42') ?? null }),
+  )
+
+  hook.uninstall()
+  stub.restore()
 }
 
 console.log(`\nRESULT: ${failures.length === 0 ? 'FETCH OK' : `FAILED (${failures.join(' | ')})`}`)

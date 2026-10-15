@@ -394,16 +394,18 @@ if (key === undefined) {
         gateSawIt !== null && channelPinList.includes(gateSawIt.provider),
         JSON.stringify(gateSawIt ?? null).slice(0, 140),
       )
-      // 0.11.2：这份请求是会话首条消息（流式 + 无 assistant 历史 + max_tokens > 8192）
-      // —— 允许列表里有匿名渠道时，回复开头应该垫着提示帧。
-      if (channelPinList.includes('openai-compatible-private')) {
-        check(
-          'the first message opens with the anonymized-channel notice',
-          content.startsWith('⚠️') && content.includes('openai-compatible-private'),
-          JSON.stringify(content.slice(0, 60)),
-        )
-        console.log(`       (提示帧之后的内容: ${JSON.stringify(content.slice(content.indexOf('⚠️') === 0 ? content.indexOf('\n') : 0, 80))})`)
-      }
+      // 0.11.3：0.11.1/0.11.2 曾在会话首条消息的回复前垫一条匿名渠道提示帧，现在删了
+      // —— 合成帧会进模型上下文。这条断言因此**反过来**：内容必须逐字来自网关。
+      // （和 test-fetch.mjs §13 的「without synthetic notice」是同一个契约。）
+      // 判据是那条提示本身的形状（以 ⚠️ 开头 + 点名被匿名化的渠道名）。不用
+      // `!content.includes('⚠️')`：那是活体测试（真问模型），模型自己在正文里打出
+      // ⚠️ 不该判失败。原来的 `'clinepass-anonymized-notice'` 是合成帧的 id、不在
+      // content 里，那一半恒真，是死条款。
+      check(
+        'the first message carries no synthetic notice frame',
+        !(content.startsWith('⚠️') && content.includes('openai-compatible-private')),
+        JSON.stringify(content.slice(0, 60)),
+      )
       if (routing?.planningReasoning !== undefined) console.log(`       planningReasoning: ${String(routing.planningReasoning).slice(0, 110)}`)
     }
   }
