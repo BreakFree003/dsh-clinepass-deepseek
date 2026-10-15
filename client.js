@@ -105,6 +105,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           five_hour: '5 小时',
           weekly: '每周',
           monthly: '每月',
+          providerTitle: 'ClinePass 提供方',
+          providerAwaiting: '等待 API 返回…',
+          providerAnonymizedTooltip: 'deepseek 渠道已被网关匿名化为 openai-compatible-private（contributor 档：数据可能用于训练，无 ZDR）',
         },
         en: {
           title: 'ClinePass remaining usage',
@@ -130,6 +133,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           five_hour: '5-hour',
           weekly: 'Weekly',
           monthly: 'Monthly',
+          providerTitle: 'ClinePass Provider',
+          providerAwaiting: 'Awaiting API response…',
+          providerAnonymizedTooltip: 'deepseek channel anonymized by gateway as openai-compatible-private (contributor tier: data may be used for training, no ZDR)',
         },
       }
 
@@ -624,6 +630,201 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         )
       }
 
+      // ═══════════════════════════ 状态栏提供方胶囊 ═══════════════════════════
+
+      /** 状态查询路径：复用 usageRoute 的 ?status=1 查询。 */
+      function statusUrl(sessionId, model) {
+        var base = usageRoute()
+        try {
+          var origin = (typeof window !== 'undefined' && window.location && (window.location.origin || window.location.href)) || 'http://127.0.0.1:3080'
+          var u = new URL(base, origin)
+          u.searchParams.set('status', '1')
+          if (sessionId) u.searchParams.set('sessionId', sessionId)
+          if (model) u.searchParams.set('model', model)
+          return u.pathname + u.search
+        } catch {
+          return base + '?status=1'
+        }
+      }
+
+      function ServerIcon() {
+        return React.createElement('svg', {
+          viewBox: '0 0 16 16',
+          width: 14,
+          height: 14,
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: '1.4',
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+          'aria-hidden': true,
+          style: { flex: 'none' },
+        }, [
+          React.createElement('rect', { key: 'r1', x: 2, y: 3, width: 12, height: 4, rx: 1 }),
+          React.createElement('rect', { key: 'r2', x: 2, y: 9, width: 12, height: 4, rx: 1 }),
+          React.createElement('circle', { key: 'c1', cx: 4.5, cy: 5, r: 0.5, fill: 'currentColor' }),
+          React.createElement('circle', { key: 'c2', cx: 4.5, cy: 11, r: 0.5, fill: 'currentColor' }),
+        ])
+      }
+
+      function AnonymizedIcon() {
+        return React.createElement('svg', {
+          viewBox: '0 0 16 16',
+          width: 14,
+          height: 14,
+          fill: 'none',
+          stroke: WARN,
+          strokeWidth: '1.4',
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+          'aria-hidden': true,
+          style: { flex: 'none' },
+        }, [
+          React.createElement('path', {
+            key: 'p1',
+            d: 'M8 2.5L14 13.5H2L8 2.5Z',
+          }),
+          React.createElement('line', { key: 'l1', x1: 8, y1: 6.5, x2: 8, y2: 9.5 }),
+          React.createElement('circle', { key: 'c1', cx: 8, cy: 11.5, r: 0.5, fill: 'currentColor' }),
+        ])
+      }
+
+      /**
+       * 底部状态栏（conversation.composer.dock）的 Provider 胶囊。
+       * 随 API 响应动态更新，仅对 Clinepass 的模型生效显示。
+       */
+      function ClinepassProviderPill(props) {
+        var useProjection = props.useProjection
+        var sessionId = props.sessionId
+        var useSession = props.useSession
+        var ctx = props.ctx
+
+        var modelSelection = useProjection ? useProjection('modelSelection') : null
+        var sel = modelSelection ? (modelSelection.lastUsed || modelSelection.next) : null
+        var isClinepass = false
+        if (sel) {
+          if (sel.provider === PROVIDER) isClinepass = true
+          if (typeof sel.model === 'string' && (sel.model === PROVIDER || sel.model.indexOf(PROVIDER + '/') === 0)) isClinepass = true
+        }
+
+        if (!isClinepass) return null
+
+        var currentModel = sel && typeof sel.model === 'string' ? sel.model : ''
+        var lang = useLanguage(ctx)
+        var t = TEXT[lang] || TEXT.zh
+
+        var statePair = React.useState({ provider: null, anonymized: false, loading: false })
+        var status = statePair[0]
+        var setStatus = statePair[1]
+
+        var running = useSession ? useSession(function (s) { return s.running }) : false
+        var prevRunningRef = React.useRef(running)
+
+        var refresh = React.useCallback(function () {
+          var url = statusUrl(sessionId, currentModel)
+          var fetchFn = window.fetch ? window.fetch.bind(window) : globalThis.fetch
+          if (!fetchFn) return
+          fetchFn(url, { headers: { accept: 'application/json' } })
+            .then(function (res) {
+              if (!res.ok) return null
+              return res.json()
+            })
+            .then(function (data) {
+              if (data && data.ok) {
+                setStatus({
+                  provider: data.provider,
+                  anonymized: data.anonymized === true,
+                  model: data.model,
+                  at: data.at,
+                  loading: false,
+                })
+              }
+            })
+            .catch(function () {})
+        }, [sessionId, currentModel])
+
+        React.useEffect(function () {
+          refresh()
+        }, [sessionId, currentModel, refresh])
+
+        React.useEffect(function () {
+          if (prevRunningRef.current && !running) {
+            refresh()
+          }
+          prevRunningRef.current = running
+        }, [running, refresh])
+
+        React.useEffect(function () {
+          if (!running) return
+          var timer = setInterval(refresh, 2000)
+          return function () {
+            clearInterval(timer)
+          }
+        }, [running, refresh])
+
+        var providerName = status.provider
+        var displayText = providerName ? ('Provider: ' + providerName) : 'Provider: --'
+        var tooltip = status.anonymized
+          ? (providerName + ' — ' + t.providerAnonymizedTooltip)
+          : (providerName ? ('网关返回提供方: ' + providerName) : t.providerAwaiting)
+
+        var hoverPair = React.useState(false)
+        var hovered = hoverPair[0]
+        var setHovered = hoverPair[1]
+
+        var icon = status.anonymized
+          ? React.createElement(AnonymizedIcon, null)
+          : React.createElement(ServerIcon, null)
+
+        return React.createElement('span', {
+          className: 'bOPqQW_anchor',
+          'data-composer-stat': 'clinepass-provider',
+          style: {
+            minWidth: 0,
+            fontSize: 'calc(var(--dsh-content-font-size-secondary, 13px) - 1px)',
+            lineHeight: 'calc(20px + var(--dsh-content-font-delta-secondary, 0px))',
+            display: 'inline-flex',
+            alignItems: 'center',
+          },
+        }, React.createElement('button', {
+          type: 'button',
+          className: 'bOPqQW_pill',
+          title: tooltip,
+          onClick: refresh,
+          onMouseEnter: function () { setHovered(true) },
+          onMouseLeave: function () { setHovered(false) },
+          style: {
+            boxSizing: 'border-box',
+            maxWidth: '100%',
+            color: hovered ? LABEL_PRIMARY : (status.anonymized ? WARN : LABEL_TERTIARY),
+            font: 'inherit',
+            fontVariantNumeric: 'tabular-nums',
+            lineHeight: 'inherit',
+            whiteSpace: 'nowrap',
+            background: hovered ? 'var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.05))' : 'transparent',
+            border: 'none',
+            borderRadius: '999px',
+            alignItems: 'center',
+            gap: '6px',
+            padding: '1px 8px',
+            display: 'inline-flex',
+            cursor: 'pointer',
+            transition: 'background-color 0.15s, color 0.15s',
+          },
+        }, [
+          icon,
+          React.createElement('span', {
+            key: 'label',
+            className: 'bOPqQW_label',
+            style: {
+              textOverflow: 'ellipsis',
+              minWidth: 0,
+              overflow: 'hidden',
+            },
+          }, displayText),
+        ]))
+      }
+
       // ═══════════════════════════ 插件本体 ═══════════════════════════
 
       /**
@@ -640,11 +841,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
       var inject = ['slots', 'locale']
 
       /**
-       * 注册卡片扩展。
-       *
-       * `slots.inject(name, cb)` 会等到 `settings.models.provider-card` 这个
-       * slot 的声明进了账本再注册，所以本插件与 Models 设置页的加载顺序无关。
-       * key 用 settings 命名空间（`llm-pi-ai`），派发时的 entryKey 也是它。
+       * 注册卡片扩展与底部状态栏胶囊。
        *
        * @param ctx - 客户端根上下文。
        */
@@ -657,6 +854,19 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
             },
             function Card(props) {
               return React.createElement(UsageCard, Object.assign({ ctx: ctx }, props))
+            },
+          )
+        })
+
+        ctx.slots.inject('conversation.composer.dock', function () {
+          return ctx.slots.register(
+            {
+              name: 'conversation.composer.dock',
+              id: 'clinepass-provider',
+              order: 2,
+            },
+            function ProviderDockPill(props) {
+              return React.createElement(ClinepassProviderPill, Object.assign({ ctx: ctx }, props))
             },
           )
         })

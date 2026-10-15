@@ -759,10 +759,36 @@ export function createUsageHandler(routeCtx, cfg, logger = console, options = {}
 
   return async (request) => {
     let force = false
+    let isStatus = false
+    let sessionId = null
+    let model = null
     try {
-      force = new URL(request.url).searchParams.get('refresh') === '1'
+      const u = new URL(request.url)
+      force = u.searchParams.get('refresh') === '1'
+      isStatus = u.searchParams.get('status') === '1'
+      sessionId = u.searchParams.get('sessionId')
+      model = u.searchParams.get('model')
     } catch {
       // An unreadable URL is simply not a forced refresh.
+    }
+    if (isStatus) {
+      const hook = options.hook ?? null
+      const state = typeof hook?.state === 'function' ? hook.state() : {}
+      const verified = (sessionId && typeof hook?.verifiedBySession === 'function' ? hook.verifiedBySession(sessionId) : null)
+        || (model && typeof hook?.verifiedByModel === 'function' ? hook.verifiedByModel(model) : null)
+        || state.lastVerified
+        || null
+
+      return json({
+        ok: true,
+        provider: verified?.provider ?? null,
+        model: verified?.model ?? null,
+        at: verified?.at ?? null,
+        anonymized: verified?.provider === ANONYMIZED_CHANNEL,
+        allowed: verified?.allowed ?? [],
+        attempts: verified?.attempts ?? 0,
+        lastAnonymized: state.lastAnonymized ?? null,
+      })
     }
     try {
       const waitMs = positiveInteger(cfg.usageTimeoutMs, DEFAULT_USAGE_TIMEOUT_MS)
@@ -789,7 +815,7 @@ export function createUsageHandler(routeCtx, cfg, logger = console, options = {}
  * @param logger - where to report.
  * @returns `'installed' | 'failed'`.
  */
-export function installUsageRoute(routeCtx, cfg, logger = console) {
+export function installUsageRoute(routeCtx, cfg, logger = console, options = {}) {
   const connection = routeCtx.connection ?? routeCtx.get?.('connection')
   const registry = connection?.fetch
   if (registry === undefined || typeof registry.register !== 'function') {
@@ -801,7 +827,7 @@ export function installUsageRoute(routeCtx, cfg, logger = console) {
       path: cfg.usageRoute,
       methods: ['GET'],
       requestBody: 'buffered',
-      fetch: createUsageHandler(routeCtx, cfg, logger),
+      fetch: createUsageHandler(routeCtx, cfg, logger, options),
     })
   } catch (error) {
     logger.warn?.(
@@ -1573,6 +1599,8 @@ export function createFetchPin(config, logger = console) {
   const counters = { seen: 0, pinned: 0, providerPinned: 0, skipped: 0, blocked: 0, unverified: 0, retried: 0, anonymized: 0 }
   /** 最近一次校验通过 / 被拦下的记录（status 文件里能直接看到「网关把它交给了谁」）。 */
   let lastVerified = null
+  const lastVerifiedBySession = new Map()
+  const lastVerifiedByModel = new Map()
   /** 最近一次由匿名渠道服务的请求（0.11.1；渠道名已被网关匿名化，见 {@link ANONYMIZED_CHANNEL}）。 */
   let lastAnonymized = null
   let lastViolation = null
@@ -1928,7 +1956,7 @@ export function createFetchPin(config, logger = console) {
    * @param attempt - 当前是第几次尝试（0 起）；递归补发时 +1。
    * @returns 放行的响应，或被拒/被中断的响应。
    */
-  async function sendVerified(resend, allowed, url, signal, expectedProviders = [], attempt = 0) {
+  async function sendVerified(resend, allowed, url, signal, expectedProviders = [], attempt = 0, model = null, sessionId = null) {
     const expected = expectedList(allowed, expectedProviders)
     const response = await Promise.resolve(resend(attempt))
     if (!response.ok) return response
@@ -1946,15 +1974,15 @@ export function createFetchPin(config, logger = console) {
             // 第一个证据帧就判了失败，而且还没有任何字节交付 —— 无痕补发。
             recordViolation(early.verdict.reason, expected, early.verdict.culprit ?? null, url, true)
             early.reader.cancel().catch(() => {})
-            return sendVerified(resend, allowed, url, signal, expectedProviders, attempt + 1)
+            return sendVerified(resend, allowed, url, signal, expectedProviders, attempt + 1, model, sessionId)
           }
           // 额度用尽：退回旧流式语义 —— 已读字节一并移交，内容照常流出，收尾裁决违规中断。
-          return streamedVerification(response, allowed, url, signal, expectedProviders, { pending: early.consumed, reader: early.reader })
+          return streamedVerification(response, allowed, url, signal, expectedProviders, { pending: early.consumed, reader: early.reader }, model, sessionId)
         }
         if (early.done) {
           // 整条流都进了缓冲（终止帧已到或上游先关了流）：按缓冲路径收尾。
           if (early.verdict.ok) {
-            recordVerified(url, early.verdict, expected)
+            recordVerified(url, early.verdict, expected, model, sessionId)
             return bufferedResponse(early.text, response)
           }
           // 证据缺席（回退网形状）或越界：同样没有**任何字节交付**过，额度内无痕补发，
@@ -1963,13 +1991,13 @@ export function createFetchPin(config, logger = console) {
           // （「照样补发 2 次，最终以 400 拒绝收场」）相悖，见 test-fetch.mjs §15 的重试
           // 预算用例。
           recordViolation(early.verdict.reason, expected, early.verdict.culprit ?? null, url, canRetry)
-          if (canRetry) return sendVerified(resend, allowed, url, signal, expectedProviders, attempt + 1)
+          if (canRetry) return sendVerified(resend, allowed, url, signal, expectedProviders, attempt + 1, model, sessionId)
           return refusalResponse(early.verdict.reason, expected, early.verdict.culprit ?? null)
         }
         // 早期证据合格：把已读字节与 reader 一起移交，流式照常（收尾裁决仍会兜底）。
-        return streamedVerification(response, allowed, url, signal, expectedProviders, { pending: early.consumed, reader: early.reader })
+        return streamedVerification(response, allowed, url, signal, expectedProviders, { pending: early.consumed, reader: early.reader }, model, sessionId)
       }
-      return streamedVerification(response, allowed, url, signal, expectedProviders)
+      return streamedVerification(response, allowed, url, signal, expectedProviders, null, model, sessionId)
     }
     let text
     try {
@@ -1996,12 +2024,12 @@ export function createFetchPin(config, logger = console) {
     }
     const verdict = judgeEvidence(routings, providers, allowed, expectedProviders)
     if (verdict.ok) {
-      recordVerified(url, verdict, expected)
+      recordVerified(url, verdict, expected, model, sessionId)
       return bufferedResponse(text, response)
     }
     const retried = cfg.enforcement === 'strict' && attempt < cfg.retries
     recordViolation(verdict.reason, expected, verdict.culprit ?? null, url, retried)
-    if (retried) return sendVerified(resend, allowed, url, signal, expectedProviders, attempt + 1)
+    if (retried) return sendVerified(resend, allowed, url, signal, expectedProviders, attempt + 1, model, sessionId)
     if (cfg.enforcement === 'warn') return bufferedResponse(text, response)
     return refusalResponse(verdict.reason, expected, verdict.culprit ?? null)
   }
@@ -2042,7 +2070,7 @@ export function createFetchPin(config, logger = console) {
    * @param pre - 早期取证移交的 `{ pending, reader }`；不传 = 从零开始。
    * @returns 逐帧放行、按裁决收尾的响应。
    */
-  function streamedVerification(response, allowed, url, signal, expectedProviders = [], pre = null) {
+  function streamedVerification(response, allowed, url, signal, expectedProviders = [], pre = null, model = null, sessionId = null) {
     // 错误文案与状态文件里的「允许列表」：provider 钉在场时把两侧的期望一起说清。
     const expected = expectedList(allowed, expectedProviders)
     const holdTerminator = cfg.enforcement === 'strict'
@@ -2120,7 +2148,7 @@ export function createFetchPin(config, logger = console) {
       }
       const verdict = overflows.length > 0 ? { ok: false, reason: overflows[0], culprit: null } : judgeEvidence(routings, providers, allowed, expectedProviders)
       if (verdict.ok) {
-        recordVerified(url, verdict, expected)
+        recordVerified(url, verdict, expected, model, sessionId)
         if (heldFrame !== null) controller.enqueue(heldFrame)
         controller.close()
         return
@@ -2224,13 +2252,23 @@ export function createFetchPin(config, logger = console) {
     return new Response(body, { status: response.status, statusText: response.statusText, headers })
   }
   /** 记一次校验通过，并立刻落盘（状态文件里的 lastVerified 不该慢一拍）。 */
-  function recordVerified(url, verdict, allowed) {
-    lastVerified = { at: new Date().toISOString(), url, provider: verdict.provider, allowed: [...allowed], attempts: verdict.attempts }
+  function recordVerified(url, verdict, allowed, model = null, sessionId = null) {
+    lastVerified = {
+      at: new Date().toISOString(),
+      url,
+      model,
+      sessionId,
+      provider: verdict.provider,
+      allowed: [...allowed],
+      attempts: verdict.attempts,
+    }
+    if (sessionId) lastVerifiedBySession.set(sessionId, lastVerified)
+    if (model) lastVerifiedByModel.set(model, lastVerified)
     // 0.11.1：匿名渠道单独计数 —— 「今天的请求有多少走了被匿名的渠道」是这次行为变更
     // 之后最有用的一格，跟 pinned/blocked 一样一眼可读。
     if (verdict.provider === ANONYMIZED_CHANNEL) {
       counters.anonymized += 1
-      lastAnonymized = { at: lastVerified.at, url, provider: verdict.provider }
+      lastAnonymized = { at: lastVerified.at, url, provider: verdict.provider, model, sessionId }
     }
     logger.info?.('[clinepass] ✓ %s 由 %s 提供（允许 %s），已放行', url, verdict.provider, allowed.join(', '))
     // 校验发生在响应到达之后，而请求发起时的那次 publish() 早于它 —— 不补这一次，
@@ -2344,6 +2382,27 @@ export function createFetchPin(config, logger = console) {
           logger.warn?.('[clinepass] not pinning request #%s: %s', counters.seen, next.reason)
           return passThrough(input, init)
         }
+        function extractSessionId(reqInput, reqInit) {
+          const readHeader = (bag, name) => {
+            if (!bag) return null
+            if (typeof bag.get === 'function') return bag.get(name)
+            if (typeof bag === 'object') {
+              const target = name.toLowerCase()
+              for (const [k, v] of Object.entries(bag)) {
+                if (k.toLowerCase() === target) return typeof v === 'string' ? v : String(v)
+              }
+            }
+            return null
+          }
+          return (
+            readHeader(reqInit?.headers, 'x-session-id') ||
+            readHeader(reqInit?.headers, 'session-id') ||
+            readHeader(reqInit?.headers, 'x-client-request-id') ||
+            (typeof reqInput === 'object' && reqInput !== null ? readHeader(reqInput.headers, 'x-session-id') : null) ||
+            null
+          )
+        }
+        const sessionId = extractSessionId(input, init)
         // 自动重试（0.10.0）：rewrite 为每种请求形状准备好 `resend(attempt)` 重发闭包，
         // 三种形状共用一条「发送 → 校验 → 失败补发」的路径。首次发送也走 resend(0)，
         // 保证重试与首发**逐字同参**。
@@ -2351,12 +2410,7 @@ export function createFetchPin(config, logger = console) {
           const [one, two] = next.resend(attempt)
           // passThrough 可能同步返回 Response（测试桩、手装 fetch 都有这种形状），
           // Promise.resolve 抹平 —— 与调用方 await 两侧的兼容语义一致。
-          const prepared = Promise.resolve(passThrough(one, two))
-          // 匿名渠道提示（0.11.1）：会话首条消息的首发响应前垫一条警告帧。只垫首发 ——
-          // 重试补发的响应再垫一次，提示就会出现两遍。
-          return attempt === 0 && next.next.notice === true
-            ? prepared.then((response) => withAnonymousNotice(response, next.next.model))
-            : prepared
+          return Promise.resolve(passThrough(one, two))
         }
         if (next.kind === 'provider') {
           // provider 级钉选的兜底路径（slug 推不出，请求线没得注入）：没有渠道可注入
@@ -2375,7 +2429,7 @@ export function createFetchPin(config, logger = console) {
           )
           if (cfg.enforcement === 'off' || expect.length === 0) return resendCall(0)
           const signal = init?.signal ?? input?.signal
-          return sendVerified(resendCall, [], url, signal, expect)
+          return sendVerified(resendCall, [], url, signal, expect, 0, next.next.model, sessionId)
         }
         const expect = next.next.expect ?? []
         const only = next.next.only ?? []
@@ -2411,7 +2465,7 @@ export function createFetchPin(config, logger = console) {
         // 校验只对「带着钉选要求的 chat 请求」有意义：两侧都空表示用户没要求钉选（走到
         // 这里不可能 —— 要么注入了 only，要么带 expect，要么早在 rewrite 就 skip 了）。
         if (cfg.enforcement === 'off' || (only.length === 0 && expect.length === 0)) return resendCall(0)
-        return sendVerified(resendCall, only, url, signal, expect)
+        return sendVerified(resendCall, only, url, signal, expect, 0, next.next.model, sessionId)
       },
       (error) => {
         counters.skipped += 1
@@ -2507,6 +2561,8 @@ export function createFetchPin(config, logger = console) {
       lastSkipped,
       lastRequestShape,
     }),
+    verifiedBySession: (sid) => (sid ? lastVerifiedBySession.get(sid) : undefined),
+    verifiedByModel: (m) => (m ? lastVerifiedByModel.get(m) : undefined),
     /** Re-check whether the hook still owns `globalThis.fetch` (also runs on a timer). */
     checkOwnership,
     /**
@@ -2977,7 +3033,7 @@ export async function apply(ctx, config) {
       logger.warn?.('[clinepass] this context cannot inject services; the Settings → Models usage card was not mounted')
     } else {
       ctx.inject(['connection', 'credentials'], (routeCtx) => {
-        mounted = installUsageRoute(routeCtx, cfg, logger)
+        mounted = installUsageRoute(routeCtx, cfg, logger, { hook })
       })
     }
   }

@@ -2,23 +2,25 @@
 
 ## 0.11.3
 
-The anonymized-channel notice now recognises `max_completion_tokens` alongside
-`max_tokens`, and logs request shape diagnostics into the live status file:
+Dynamic Provider display in bottom composer dock and pure streaming responses:
 
-- **Root cause: `max_completion_tokens` budget field.** OpenAI-compatible
-  clients (specifically `@deepseek-ai/dsh-llm-pi-ai` in real dsh sessions) send
-  `max_completion_tokens` rather than `max_tokens`. In 0.11.2, `budget` evaluated
-  to `NaN` when `max_tokens` was absent, causing `isConversationStart` to return
-  `false` and silently omitting the `ANONYMIZED_NOTICE` frame.
-- **`isConversationStart` now checks `body.max_tokens ?? body.max_completion_tokens`.**
-  Both spellings are accepted so real requests pass the `budget > 8192` threshold.
-- **Request shape diagnostics (`lastRequestShape`).** `hook.state()` and the live
-  status file now record `lastRequestShape` (`model`, `stream`, `maxTokens`,
-  `maxCompletionTokens`, `roles`, `notice`), making the trigger decision fully
-  auditable without guessing.
-- **Fixed `ReferenceError: lastRequestShape is not defined`.** Scoped the request
-  shape construction cleanly within `pinnedBody` and passed it through to `rewrite`
-  to update `lastRequestShape` in the hook closure.
+- **Clean conversation stream (no context pollution):** Removed synthetic notice
+  chunk injection from the SSE stream so assistant replies remain 100% genuine model
+  content without prepending notices into conversation history or prompt context.
+- **Real-time Provider pill in composer dock:** Registered `conversation.composer.dock`
+  slot component (`clinepass-provider`, order 2) to display the actual upstream
+  provider returned by the gateway at the bottom status bar (beside turn metrics and
+  token usage), updating dynamically as API responses complete and applying specifically
+  to Clinepass models.
+- **Anonymized channel warning:** When the returned provider is `openai-compatible-private`,
+  the pill displays a warning indicator and tooltip explaining the contributor tier.
+- **In-memory status query:** Handled `?status=1` on `usageRoute` to serve
+  in-memory verification state per session/model without touching credentials or gateway.
+- **`max_completion_tokens` compatibility & request diagnostics:** Recognises
+  `max_completion_tokens` alongside `max_tokens` for `@deepseek-ai/dsh-llm-pi-ai`
+  runtime shapes, and records `lastRequestShape` diagnostics.
+- **Fixed `ReferenceError: lastRequestShape is not defined`:** Scoped request shape
+  variables cleanly in `pinnedBody` and passed through to `rewrite`.
 
 ## 0.11.2
 

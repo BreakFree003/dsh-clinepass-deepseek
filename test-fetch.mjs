@@ -1960,28 +1960,29 @@ console.log('\n── 17. the anonymized channel ──────────�
       }),
     })
 
-  // 放行 + 首条提示 + 计数/状态文件
+  // 放行 + 纯净流（不塞伪造 chunk 污染上下文）+ 计数/状态文件
   {
     const stub = stubFetch(() => frames(delta('你好'), routing, 'data: [DONE]\n\n'))
     const hook = createFetchPin(ALLOWED, recorder())
     hook.install()
-    const text = await drain(await globalThis.fetch(CHAT, firstTurnInit()))
-    const notice = firstDelta(text)
+    const text = await drain(await globalThis.fetch(CHAT, {
+      ...firstTurnInit(),
+      headers: { ...firstTurnInit().headers, 'x-session-id': 'sess-test-42' },
+    }))
     check('a private-channel response is verified, not refused', hook.state().lastVerified?.provider === 'openai-compatible-private', JSON.stringify(hook.state().lastVerified))
     check('counters.anonymized counts it', hook.state().counters.anonymized === 1, String(hook.state().counters.anonymized))
-    check('the first message opens with the notice', typeof notice === 'string' && notice.startsWith('⚠️') && notice.includes('openai-compatible-private'), String(notice?.slice(0, 40)))
-    check('the notice precedes the gateway content', text.indexOf('⚠️') !== -1 && text.indexOf('⚠️') < text.indexOf('你好'), 'frame order')
+    check('stream passes through pure gateway content without synthetic notice', !text.includes('⚠️') && firstDelta(text) === '你好', firstDelta(text) ?? '(none)')
     check('status file records lastAnonymized', JSON.parse(fs.readFileSync(STATUS, 'utf8')).lastAnonymized?.provider === 'openai-compatible-private', 'lastAnonymized')
-    // 第二条消息（历史里已有 assistant）：不再提示
+    check('verifiedBySession records session provider', hook.verifiedBySession('sess-test-42')?.provider === 'openai-compatible-private', String(hook.verifiedBySession('sess-test-42')?.provider))
+    // 第二条消息（历史里已有 assistant）：内容同样纯净放行
     const laterInit = jsonInit({ body: JSON.stringify({ ...CHAT_BODY, messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }, { role: 'user', content: 'c' }] }) })
     const later = await drain(await globalThis.fetch(CHAT, laterInit))
-    check('a later message carries no notice', !later.includes('⚠️') && firstDelta(later) === '你好', firstDelta(later) ?? '(none)')
+    check('a later message carries pure gateway content', !later.includes('⚠️') && firstDelta(later) === '你好', firstDelta(later) ?? '(none)')
     hook.uninstall()
     stub.restore()
   }
   // 0.11.3 回归：真实 wire 形状走 max_completion_tokens: 384000，且完全不带 max_tokens
-  // （@deepseek-ai/dsh-llm-pi-ai 运行时特征）。0.11.2 只认 max_tokens 导致 budget 为 NaN，
-  // 漏垫提示。同时断言 lastRequestShape 诊断字段在 hook.state() 与 status 文件中同步落盘。
+  // （@deepseek-ai/dsh-llm-pi-ai 运行时特征）。lastRequestShape 诊断字段在 hook.state() 与 status 文件中同步落盘。
   {
     const stub = stubFetch(() => frames(delta('你好'), routing, 'data: [DONE]\n\n'))
     const hook = createFetchPin(ALLOWED, recorder())
@@ -1997,25 +1998,23 @@ console.log('\n── 17. the anonymized channel ──────────�
       ],
     }
     const text = await drain(await globalThis.fetch(CHAT, jsonInit({ body: JSON.stringify(piAiBody) })))
-    const notice = firstDelta(text)
-    check('0.11.3: max_completion_tokens triggers the anonymized notice', typeof notice === 'string' && notice.startsWith('⚠️') && notice.includes('openai-compatible-private'), String(notice?.slice(0, 40)))
+    check('0.11.3: max_completion_tokens passes gateway stream cleanly', !text.includes('⚠️') && firstDelta(text) === '你好', firstDelta(text) ?? '(none)')
     const shape = hook.state().lastRequestShape
-    check('0.11.3: lastRequestShape is recorded in hook.state()', shape !== null && shape?.stream === true && shape?.maxTokens === null && shape?.maxCompletionTokens === 384000 && shape?.notice === true, JSON.stringify(shape))
+    check('0.11.3: lastRequestShape is recorded in hook.state()', shape !== null && shape?.stream === true && shape?.maxTokens === null && shape?.maxCompletionTokens === 384000, JSON.stringify(shape))
     check('0.11.3: lastRequestShape records roles sequence', shape?.roles === 'system,user,user', shape?.roles)
     const disk = JSON.parse(fs.readFileSync(STATUS, 'utf8'))
-    check('0.11.3: status file records lastRequestShape', disk.lastRequestShape?.maxCompletionTokens === 384000 && disk.lastRequestShape?.notice === true, JSON.stringify(disk.lastRequestShape))
+    check('0.11.3: status file records lastRequestShape', disk.lastRequestShape?.maxCompletionTokens === 384000, JSON.stringify(disk.lastRequestShape))
     hook.uninstall()
     stub.restore()
   }
-  // 标题请求形状（dsh-base 组合 maxOutputTokens: 4096；流式、无 assistant 历史）：它的
-  // 输出直接变成会话标题，垫不得 —— 预算守卫（max_tokens / max_completion_tokens > 8192）必须挡住它。
+  // 标题请求形状（dsh-base 组合 maxOutputTokens: 4096；流式、无 assistant 历史）
   {
     const stub = stubFetch(() => frames(delta('Greeting'), routing, 'data: [DONE]\n\n'))
     const hook = createFetchPin(ALLOWED, recorder())
     hook.install()
     const text = await drain(await globalThis.fetch(CHAT, firstTurnInit({ max_tokens: 4096, messages: [{ role: 'system', content: 'Create a concise title for an AI coding-assistant session.' }, { role: 'user', content: 'hi' }] })))
     check('a title-shaped request (4096 budget) carries no notice', !text.includes('⚠️') && firstDelta(text) === 'Greeting', firstDelta(text) ?? '(none)')
-    // 0.11.3: 同样验证用 max_completion_tokens: 4096 的标题形状也被挡住
+    // 0.11.3: 同样验证用 max_completion_tokens: 4096 的标题形状
     const { max_tokens: _dropped, ...bodyWithoutMaxTokens } = CHAT_BODY
     const titleBody = {
       ...bodyWithoutMaxTokens,
@@ -2024,7 +2023,7 @@ console.log('\n── 17. the anonymized channel ──────────�
     }
     const titleText = await drain(await globalThis.fetch(CHAT, jsonInit({ body: JSON.stringify(titleBody) })))
     check('0.11.3: title request with max_completion_tokens: 4096 carries no notice', !titleText.includes('⚠️') && firstDelta(titleText) === 'Greeting', firstDelta(titleText) ?? '(none)')
-    check('0.11.3: title request lastRequestShape has notice === false', hook.state().lastRequestShape?.notice === false && hook.state().lastRequestShape?.maxCompletionTokens === 4096, JSON.stringify(hook.state().lastRequestShape))
+    check('0.11.3: title request lastRequestShape has maxCompletionTokens: 4096', hook.state().lastRequestShape?.maxCompletionTokens === 4096, JSON.stringify(hook.state().lastRequestShape))
     hook.uninstall()
     stub.restore()
   }
@@ -2074,7 +2073,7 @@ console.log('\n── 17. the anonymized channel ──────────�
     const hook = createFetchPin(ALLOWED, recorder())
     hook.install()
     const text = await drain(await globalThis.fetch(CHAT, firstTurnInit()))
-    check('cancel race: the drain still completes cleanly', text.includes('[DONE]') && text.startsWith('data: ') && text.includes('⚠️'), `len=${text.length}`)
+    check('cancel race: the drain still completes cleanly', text.includes('[DONE]') && text.startsWith('data: '), `len=${text.length}`)
     check('cancel race: verified before the cancel', hook.state().lastVerified?.provider === 'openai-compatible-private' && hook.state().counters.anonymized === 1, JSON.stringify(hook.state().lastVerified ?? null))
     hook.uninstall()
     stub.restore()

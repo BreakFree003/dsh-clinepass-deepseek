@@ -283,6 +283,16 @@ console.log('\n── 3. createUsageHandler ────────────
   const crashBody = await crashResponse.json()
   check('an unexpected throw answers 500 rather than rejecting', crashResponse.status === 500 && crashBody.reason === 'internal', JSON.stringify(crashBody))
   check('…and is reported to the log', log.lines.warn.length === 1, JSON.stringify(log.lines.warn))
+
+  // ?status=1 queries hook status without hitting gateway or exploding credentials
+  const mockHook = {
+    state: () => ({ lastVerified: { provider: 'openai-compatible-private', model: 'cline-pass/deepseek-v4.1-flash' } }),
+    verifiedBySession: (sid) => (sid === 'sess-abc' ? { provider: 'z.ai', model: 'cline-pass/glm-5.3-flash' } : null),
+  }
+  const statusHandler = createUsageHandler(exploding, cfg, log, { hook: mockHook })
+  const statusRes = await statusHandler(new Request('http://127.0.0.1:3080/api/clinepass.usage?status=1&sessionId=sess-abc'))
+  const statusJson = await statusRes.json()
+  check('?status=1 answers hook status matching session', statusJson.ok === true && statusJson.provider === 'z.ai', JSON.stringify(statusJson))
 }
 
 // ── 4. route registration ───────────────────────────────────────────────────
@@ -704,15 +714,16 @@ console.log('\n── 8. client render ─────────────�
         },
         locale,
       })
-      return { stub, bundle, registered, calls, seat: registered[0].seat }
+      return { stub, bundle, registered, calls, seat: registered.find((r) => r.name === 'settings.models.provider-card')?.seat, dockSeat: registered.find((r) => r.name === 'conversation.composer.dock')?.seat }
     }
 
     const probe = mount()
     check('the bundle exports inject and apply', typeof probe.bundle.apply === 'function' && Array.isArray(probe.bundle.inject), JSON.stringify(probe.bundle.inject))
     check('…and asks for the slots and locale services', probe.bundle.inject.join(',') === 'slots,locale', JSON.stringify(probe.bundle.inject))
-    check('apply injects into the Models provider-card seat', probe.registered.length === 1 && probe.registered[0].name === 'settings.models.provider-card', JSON.stringify(probe.registered.map((r) => r.name)))
+    check('apply injects into both seats', probe.registered.length === 2 && probe.registered.some((r) => r.name === 'settings.models.provider-card') && probe.registered.some((r) => r.name === 'conversation.composer.dock'), JSON.stringify(probe.registered.map((r) => r.name)))
     check('…keyed by the llm-pi-ai settings namespace', probe.seat.options.key === 'llm-pi-ai', JSON.stringify(probe.seat.options))
     check('…registering the same slot name', probe.seat.options.name === 'settings.models.provider-card', String(probe.seat.options.name))
+    check('…dock seat registered with id clinepass-provider', probe.dockSeat?.options?.id === 'clinepass-provider' && probe.dockSeat?.options?.order === 2, JSON.stringify(probe.dockSeat?.options))
 
     const cardProps = (provider, extra = {}) => ({
       provider: { provider, displayName: 'x', settingsNs: 'llm-pi-ai', settingsPath: ['providers', provider], active: true },
@@ -941,6 +952,25 @@ console.log('\n── 8. client render ─────────────�
     check('our card starts exactly one ticker', ownTimer.stub.intervalCount() === 1, String(ownTimer.stub.intervalCount()))
     ownTimer.stub.unmount()
     check('…and unmounting clears it', globalThis.window.__TIMERS__.cleared === 1, JSON.stringify(globalThis.window.__TIMERS__))
+
+    // ── 9. conversation.composer.dock: provider pill ──
+    const dockMount = mount()
+    globalThis.window.__ANSWER__ = { ok: true, provider: 'openai-compatible-private', anonymized: true }
+
+    // Foreign model in session -> renders null
+    const foreignDock = await renderCard(dockMount.dockSeat, dockMount.stub, {
+      useProjection: (key) => (key === 'modelSelection' ? { next: { provider: 'deepseek', model: 'deepseek-chat' } } : null),
+      sessionId: 'sess-1',
+    })
+    check('foreign model dock pill renders nothing', foreignDock === null)
+
+    // Clinepass model in session -> renders pill with provider
+    const clinepassDock = await renderCard(dockMount.dockSeat, dockMount.stub, {
+      useProjection: (key) => (key === 'modelSelection' ? { next: { provider: 'cline-pass', model: 'cline-pass/deepseek-v4.1-flash' } } : null),
+      sessionId: 'sess-2',
+    })
+    check('clinepass model dock pill renders', clinepassDock !== null && clinepassDock.props['data-composer-stat'] === 'clinepass-provider')
+    check('…queries the status route with status=1', dockMount.calls.some((c) => c.url.includes('status=1') && c.url.includes('sessionId=sess-2')), JSON.stringify(dockMount.calls.map((c) => c.url)))
   } finally {
     if (realWindow === undefined) delete globalThis.window
     else globalThis.window = realWindow
