@@ -2,20 +2,17 @@
 
 ## 0.11.3
 
-Dynamic Provider display in bottom composer dock and pure streaming responses:
+Dynamic Provider display in bottom composer dock and non-blocking Provider warnings:
 
+- **Non-blocking Provider validation (allow all Providers, warn-only):**
+  When configured with `enforcement: warn` (or when gateway routes to rotated providers like Together/InferenceNet), responses are never blocked or aborted. All providers are allowed through. The actual wire provider is captured, recorded in session state (`lastVerifiedBySession` with `warn: true`), and reported in `logger.warn` without throwing errors.
+- **Real-time Provider pill & warning indicator in composer dock:**
+  Registered `conversation.composer.dock` slot component (`clinepass-provider`, order 2) to display the actual upstream provider returned by the gateway at the bottom status bar, updating dynamically as API responses complete. Unexpected/foreign providers and anonymized channels display a warning badge (`⚠️`) with explanatory tooltips.
 - **Clean conversation stream (no context pollution):** Removed synthetic notice
   chunk injection from the SSE stream so assistant replies remain 100% genuine model
   content without prepending notices into conversation history or prompt context.
-- **Real-time Provider pill in composer dock:** Registered `conversation.composer.dock`
-  slot component (`clinepass-provider`, order 2) to display the actual upstream
-  provider returned by the gateway at the bottom status bar (beside turn metrics and
-  token usage), updating dynamically as API responses complete and applying specifically
-  to Clinepass models.
-- **Anonymized channel warning:** When the returned provider is `openai-compatible-private`,
-  the pill displays a warning indicator and tooltip explaining the contributor tier.
 - **In-memory status query:** Handled `?status=1` on `usageRoute` to serve
-  in-memory verification state per session/model without touching credentials or gateway.
+  in-memory verification state per session/model (including `warn` and `reason`) without touching credentials or gateway.
 - **`max_completion_tokens` compatibility & request diagnostics:** Recognises
   `max_completion_tokens` alongside `max_tokens` for `@deepseek-ai/dsh-llm-pi-ai`
   runtime shapes, and records `lastRequestShape` diagnostics.

@@ -713,7 +713,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         var lang = useLanguage(ctx)
         var t = TEXT[lang] || TEXT.zh
 
-        var statePair = React.useState({ provider: null, anonymized: false, loading: false })
+        var statePair = React.useState({ provider: null, anonymized: false, warn: false, reason: null, loading: false })
         var status = statePair[0]
         var setStatus = statePair[1]
 
@@ -734,6 +734,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                 setStatus({
                   provider: data.provider,
                   anonymized: data.anonymized === true,
+                  warn: data.warn === true,
+                  reason: data.reason || null,
                   model: data.model,
                   at: data.at,
                   loading: false,
@@ -762,17 +764,20 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           }
         }, [running, refresh])
 
+        var isWarning = status.anonymized || status.warn
         var providerName = status.provider
-        var displayText = providerName ? ('Provider: ' + providerName) : 'Provider: --'
-        var tooltip = status.anonymized
-          ? (providerName + ' — ' + t.providerAnonymizedTooltip)
-          : (providerName ? ('网关返回提供方: ' + providerName) : t.providerAwaiting)
+        var displayText = providerName ? ('Provider: ' + providerName + (status.warn ? ' ⚠️' : '')) : 'Provider: --'
+        var tooltip = status.warn
+          ? (providerName + ' — ' + (status.reason ? status.reason : '非预期提供方（已放行）'))
+          : (status.anonymized
+            ? (providerName + ' — ' + t.providerAnonymizedTooltip)
+            : (providerName ? ('网关返回提供方: ' + providerName) : t.providerAwaiting))
 
         var hoverPair = React.useState(false)
         var hovered = hoverPair[0]
         var setHovered = hoverPair[1]
 
-        var icon = status.anonymized
+        var icon = isWarning
           ? React.createElement(AnonymizedIcon, null)
           : React.createElement(ServerIcon, null)
 
@@ -796,7 +801,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           style: {
             boxSizing: 'border-box',
             maxWidth: '100%',
-            color: hovered ? LABEL_PRIMARY : (status.anonymized ? WARN : LABEL_TERTIARY),
+            color: hovered ? LABEL_PRIMARY : (isWarning ? WARN : LABEL_TERTIARY),
             font: 'inherit',
             fontVariantNumeric: 'tabular-nums',
             lineHeight: 'inherit',

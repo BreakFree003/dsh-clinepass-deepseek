@@ -785,6 +785,8 @@ export function createUsageHandler(routeCtx, cfg, logger = console, options = {}
         model: verified?.model ?? null,
         at: verified?.at ?? null,
         anonymized: verified?.provider === ANONYMIZED_CHANNEL,
+        warn: verified?.warn === true,
+        reason: verified?.reason ?? null,
         allowed: verified?.allowed ?? [],
         attempts: verified?.attempts ?? 0,
         lastAnonymized: state.lastAnonymized ?? null,
@@ -1294,6 +1296,29 @@ export function judgeProviders(providers, expected, routings = []) {
 }
 
 /**
+ * 从响应提取出的实际 provider（顶层 provider 字段、routing finalProvider 或 culprit）。
+ *
+ * @param providers - {@link providersOfText} 的返回值。
+ * @param routings - {@link routingsOfText} 的返回值。
+ * @param culprit - 判定失败时的 culprit 对象。
+ * @returns 归一化后的小写 provider 字符串，无法确定时返回 null。
+ */
+export function detectedProviderOf(providers = [], routings = [], culprit = null) {
+  if (typeof culprit?.finalProvider === 'string' && culprit.finalProvider.length > 0) {
+    return culprit.finalProvider.trim().toLowerCase()
+  }
+  if (Array.isArray(providers) && providers.length > 0 && typeof providers[0] === 'string' && providers[0].length > 0) {
+    return providers[0].trim().toLowerCase()
+  }
+  if (Array.isArray(routings) && routings.length > 0) {
+    const last = routings[routings.length - 1]
+    const p = last?.finalProvider ?? last?.resolvedProvider
+    if (typeof p === 'string' && p.length > 0) return p.trim().toLowerCase()
+  }
+  return null
+}
+
+/**
  * 两种证据的合并判定：渠道钉看 routing 元数据，provider 钉看顶层 provider 字段；同一
  * 模型两侧都配置了就必须**都**过关（语义取严）。失败时先到的被告先出场（provider 在
  * 前 —— 它是「这次由谁直接服务」的直接说法）。成功结论合并：`provider` 取 provider
@@ -1310,8 +1335,9 @@ function judgeEvidence(routings, providers, channels, expectedProviders) {
   const routingVerdict = channels.length > 0 ? judgeRoutings(routings, channels) : null
   if (providerVerdict !== null && !providerVerdict.ok) return providerVerdict
   if (routingVerdict !== null && !routingVerdict.ok) return routingVerdict
-  if (providerVerdict !== null && routingVerdict !== null) return { ok: true, provider: providerVerdict.provider, attempts: routingVerdict.attempts ?? 0 }
-  return providerVerdict ?? routingVerdict ?? { ok: true, provider: null, attempts: 0 }
+  const detected = detectedProviderOf(providers, routings)
+  if (providerVerdict !== null && routingVerdict !== null) return { ok: true, provider: providerVerdict.provider ?? detected, attempts: routingVerdict.attempts ?? 0 }
+  return providerVerdict ?? routingVerdict ?? { ok: true, provider: detected, attempts: 0 }
 }
 
 /**
@@ -2030,7 +2056,28 @@ export function createFetchPin(config, logger = console) {
     const retried = cfg.enforcement === 'strict' && attempt < cfg.retries
     recordViolation(verdict.reason, expected, verdict.culprit ?? null, url, retried)
     if (retried) return sendVerified(resend, allowed, url, signal, expectedProviders, attempt + 1, model, sessionId)
-    if (cfg.enforcement === 'warn') return bufferedResponse(text, response)
+    if (cfg.enforcement === 'warn') {
+      const actualProv = detectedProviderOf(providers, routings, verdict.culprit)
+      const isAnonymized = actualProv === ANONYMIZED_CHANNEL
+      if (isAnonymized) counters.anonymized += 1
+      const at = new Date().toISOString()
+      const warnEntry = {
+        at,
+        url,
+        model,
+        sessionId,
+        provider: actualProv,
+        allowed: [...expected],
+        attempts: 1,
+        warn: true,
+        reason: verdict.reason,
+      }
+      lastVerified = { ...warnEntry }
+      if (sessionId) lastVerifiedBySession.set(String(sessionId), lastVerified)
+      publish()
+      logger.warn?.('[clinepass] ⚠ 响应由 %s 提供（配置允许 %s），已放行（仅告警）：%s', actualProv || '未知提供方', expected.join('/'), verdict.reason)
+      return bufferedResponse(text, response)
+    }
     return refusalResponse(verdict.reason, expected, verdict.culprit ?? null)
   }
 
@@ -2156,6 +2203,25 @@ export function createFetchPin(config, logger = console) {
       recordViolation(verdict.reason, expected, verdict.culprit ?? null, url)
       if (!holdTerminator) {
         // warn：终止帧早就放行了，这里只需要收尾。
+        const actualProv = detectedProviderOf(providers, routings, verdict.culprit)
+        const isAnonymized = actualProv === ANONYMIZED_CHANNEL
+        if (isAnonymized) counters.anonymized += 1
+        const at = new Date().toISOString()
+        const warnEntry = {
+          at,
+          url,
+          model,
+          sessionId,
+          provider: actualProv,
+          allowed: [...expected],
+          attempts: 1,
+          warn: true,
+          reason: verdict.reason,
+        }
+        lastVerified = { ...warnEntry }
+        if (sessionId) lastVerifiedBySession.set(String(sessionId), lastVerified)
+        publish()
+        logger.warn?.('[clinepass] ⚠ 响应由 %s 提供（配置允许 %s），已放行（仅告警）：%s', actualProv || '未知提供方', expected.join('/'), verdict.reason)
         controller.close()
         return
       }
@@ -2396,9 +2462,11 @@ export function createFetchPin(config, logger = console) {
           }
           return (
             readHeader(reqInit?.headers, 'x-session-id') ||
+            readHeader(reqInit?.headers, 'x-dsh-session-id') ||
             readHeader(reqInit?.headers, 'session-id') ||
             readHeader(reqInit?.headers, 'x-client-request-id') ||
             (typeof reqInput === 'object' && reqInput !== null ? readHeader(reqInput.headers, 'x-session-id') : null) ||
+            (typeof reqInput === 'object' && reqInput !== null ? readHeader(reqInput.headers, 'x-dsh-session-id') : null) ||
             null
           )
         }

@@ -287,12 +287,12 @@ console.log('\n── 3. createUsageHandler ────────────
   // ?status=1 queries hook status without hitting gateway or exploding credentials
   const mockHook = {
     state: () => ({ lastVerified: { provider: 'openai-compatible-private', model: 'cline-pass/deepseek-v4.1-flash' } }),
-    verifiedBySession: (sid) => (sid === 'sess-abc' ? { provider: 'z.ai', model: 'cline-pass/glm-5.3-flash' } : null),
+    verifiedBySession: (sid) => (sid === 'sess-abc' ? { provider: 'together', model: 'cline-pass/glm-5.3-flash', warn: true, reason: 'provider=Together，允许的是 z.ai' } : null),
   }
   const statusHandler = createUsageHandler(exploding, cfg, log, { hook: mockHook })
   const statusRes = await statusHandler(new Request('http://127.0.0.1:3080/api/clinepass.usage?status=1&sessionId=sess-abc'))
   const statusJson = await statusRes.json()
-  check('?status=1 answers hook status matching session', statusJson.ok === true && statusJson.provider === 'z.ai', JSON.stringify(statusJson))
+  check('?status=1 answers hook status matching session', statusJson.ok === true && statusJson.provider === 'together' && statusJson.warn === true && statusJson.reason.includes('Together'), JSON.stringify(statusJson))
 }
 
 // ── 4. route registration ───────────────────────────────────────────────────

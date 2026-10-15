@@ -1825,9 +1825,13 @@ console.log('\n── 15. the provider pin ────────────�
     const stub = stubFetch(() => frames(providerFrame('Together'), 'data: [DONE]\n\n'))
     const hook = createFetchPin({ ...CONFIG, enforcement: 'warn' }, recorder())
     hook.install()
-    const { text, error } = await drain(await globalThis.fetch(CHAT, glmInit()))
+    const req = glmInit()
+    req.headers['x-dsh-session-id'] = 'sess-warn-prov-test'
+    const { text, error } = await drain(await globalThis.fetch(CHAT, req))
     check('warn streams a foreign provider to the end', error === null && text.includes('tok') && text.includes('[DONE]'), JSON.stringify(text))
     check('warn still counts and records it', hook.counters.blocked === 1 && hook.state().lastViolation?.finalProvider === 'Together', JSON.stringify(hook.state().lastViolation ?? null))
+    check('warn records foreign provider in lastVerified with warn: true', hook.state().lastVerified?.provider === 'together' && hook.state().lastVerified?.warn === true, JSON.stringify(hook.state().lastVerified))
+    check('warn records foreign provider in verifiedBySession with warn: true', hook.verifiedBySession('sess-warn-prov-test')?.provider === 'together' && hook.verifiedBySession('sess-warn-prov-test')?.warn === true, JSON.stringify(hook.verifiedBySession('sess-warn-prov-test')))
     hook.uninstall()
     stub.restore()
   }
