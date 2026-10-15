@@ -12,7 +12,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { createFetchPin, installPromptDisplay, isGatewayChat, isTerminatorFrame, nextFrameEnd, provisionProfile, routingOfText, statusFileFor, withDefaults } from './index.js'
+import { createFetchPin, installPromptDisplay, isGatewayChat, isTerminatorFrame, judgeProviders, nextFrameEnd, providerPinFor, providerSlug, providersOfText, provisionProfile, routingOfText, statusFileFor, withDefaults, withProviderOrder } from './index.js'
 
 // The hook publishes a status file by default; keep every run's out of the
 // user's real DSH_HOME (and let the default resolution be what is exercised).
@@ -386,8 +386,11 @@ console.log('\n── 4b. the local gate ─────────────
 // ── 5. per-model pins and an empty pin ──────────────────────────────────────
 console.log('\n── 5. per-model pins, empty pin ──────────────────────────')
 {
+  // retries: 0 —— 本节断言 stub.calls 的**下标**；本节形状的响应（deepseek 渠道）在默认
+  // 配置下都会验证通过，不会触发重试，这里显式关掉只是把「重试是 §16 的事」说清楚，
+  // 免得将来 stub 换成不可验证的响应时下标悄悄平移。
   const stub = stubFetch(() => new Response(GATEWAY_BODY))
-  const hook = createFetchPin({ pin: ['deepseek'], pins: { 'cline-pass/other': ['anthropic'] } }, recorder())
+  const hook = createFetchPin({ pin: ['deepseek'], pins: { 'cline-pass/other': ['anthropic'] }, retries: 0 }, recorder())
   hook.install()
 
   await globalThis.fetch(CHAT, jsonInit())
@@ -412,9 +415,11 @@ console.log('\n── 5. per-model pins, empty pin ─────────�
 // ── 6. body shapes ──────────────────────────────────────────────────────────
 console.log('\n── 6. body shapes ────────────────────────────────────────')
 {
+  // retries: 0 —— stub 的 '{}' 不可验证，默认配置下每个钉选请求会补发 2 次、把本节依赖的
+  // stub.calls 下标平移掉（重试行为是 §16 的事，本节只管 body 形状）。
   const stub = stubFetch(() => new Response('{}'))
   const logger = recorder()
-  const hook = createFetchPin({}, logger)
+  const hook = createFetchPin({ retries: 0 }, logger)
   hook.install()
   const encoded = JSON.stringify(CHAT_BODY)
 
@@ -1577,6 +1582,500 @@ console.log('\n── 14. the streamed gate, attacked ────────�
       bounded.length > 0 && bounded[bounded.length - 1].at === hook.state().lastViolation.at,
       JSON.stringify(bounded[bounded.length - 1] ?? null).slice(0, 120),
     )
+    hook.uninstall()
+    stub.restore()
+  }
+}
+
+// ── 15. the provider pin ────────────────────────────────────────────────────
+//
+// 2026-10-14 实测（api.cline.bot，模型回显恒为 z-ai/glm-5.3-flash）：网关对 glm-5.3-flash
+// 在 Z.AI / InferenceNet / Together 之间轮转（一小时内实测到三家），且请求侧 gateway.only
+// 被无视（带 only:["z-ai"] 的 3/9 样本仍由 Together 服务）。直通形状的**每帧**都带顶层
+// `provider` 字段；回退网形状（model 回显 vmc/…-contributor-fallbacks）没有该字段、只有
+// routing 元数据。于是对 `pins: []` 的直通模型提供第二种钉选（providerPins）：响应必须用
+// 顶层 provider 字段自证，证据缺失与越界同样 fail closed，处理方式与渠道钉那套完全一致
+// （记录 + strict 拒绝/流中断，warn 只记录放行）。
+//
+// 0.11.0 追加（同日第三次实测，各 5 发）：网关**执行** OpenRouter 协议的顶层
+// `provider.order`（带 ["z-ai"] 5/5 = Z.AI，不带 2/5；显示名拼法 "z.ai" 会让网关摈断
+// 连接 —— 请求线只认 slug）。于是 provider 钉也上请求线：显示名经 providerSlug 换成
+// slug 写进顶层 provider.order；响应侧闸门照旧（轮转被钉死后，它只剩兑底价值）。
+console.log('\n── 15. the provider pin ──────────────────────────────────')
+{
+  const enc = (text) => new TextEncoder().encode(text)
+  const sse = (body) => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  const frames = (...parts) => sse(new ReadableStream({
+    start(controller) {
+      for (const part of parts) controller.enqueue(enc(part))
+      controller.close()
+    },
+  }))
+  const providerFrame = (provider) => `data: ${JSON.stringify({ provider, choices: [{ delta: { content: 'tok' } }] })}\n\n`
+  /** 一份同时带顶层 provider 与 routing 元数据的响应体（两种钉选并存的形状）。 */
+  const bothBody = (routingProvider, wireProvider) => JSON.stringify({ provider: wireProvider, ...JSON.parse(gatewayBody(routingProvider)) })
+  const CONFIG = { pin: [], providerPins: { 'cline-pass/glm-5.3-flash': ['z.ai'] } }
+  const BOTH = { pin: ['deepseek'], pins: { 'cline-pass/deepseek-v4.1-flash': ['deepseek'] }, providerPins: { 'cline-pass/deepseek-v4.1-flash': ['z.ai'] } }
+  const glmInit = () => {
+    const init = jsonInit()
+    init.body = JSON.stringify({ ...CHAT_BODY, model: 'cline-pass/glm-5.3-flash' })
+    return init
+  }
+  /** 逐块读完一个响应体；出错时把错误一起带回来（流式中断是正常结局之一）。 */
+  async function drain(response) {
+    const parts = []
+    const reader = response.body.getReader()
+    for (;;) {
+      try {
+        const { done, value } = await reader.read()
+        if (done) return { text: parts.join(''), error: null }
+        parts.push(new TextDecoder().decode(value))
+      } catch (error) {
+        return { text: parts.join(''), error }
+      }
+    }
+  }
+
+  // 单元层：providerPins 的解析与两个提取/判定函数。
+  {
+    const hook = createFetchPin({ pin: [], providerPins: { m: ['Z.AI', ' z.ai ', 42, '', null] } }, recorder())
+    check('providerPins entries are lower-cased, trimmed, deduped and filtered to strings', JSON.stringify(hook.config.providerPins) === '{"m":["z.ai"]}', JSON.stringify(hook.config.providerPins))
+    const none = createFetchPin({ pin: ['deepseek'] }, recorder())
+    check('an absent providerPins is an empty map', JSON.stringify(none.config.providerPins) === '{}', JSON.stringify(none.config.providerPins))
+    check('providerPinFor is empty for unlisted models', JSON.stringify(providerPinFor(none.config, 'any/model')) === '[]')
+
+    check('providersOfText reads a plain JSON document', JSON.stringify(providersOfText('{"provider":"Z.AI"}')) === '["Z.AI"]', JSON.stringify(providersOfText('{"provider":"Z.AI"}')))
+    check('providersOfText reads SSE frames and skips [DONE]', JSON.stringify(providersOfText(`data: {"provider":"Z.AI"}\n\ndata: [DONE]\n\n`)) === '["Z.AI"]')
+    // 只认**顶层**字段：routing 元数据与嵌套的 provider 键不是证据，否则回退网形状里的
+    // attempt 名字会被当成直通证据。
+    const nested = JSON.stringify({ provider: 'Z.AI', routing: { finalProvider: 'x', providerAttempts: [{ provider: 'y', success: true }] }, choices: [{ delta: { provider: 'nested' } }] })
+    check('providersOfText ignores nested provider keys', JSON.stringify(providersOfText(nested)) === '["Z.AI"]', JSON.stringify(providersOfText(nested)))
+    check('providersOfText assembles a JSON split across two data lines', JSON.stringify(providersOfText('data: {"provider":\ndata: "Z.AI"}\n\n')) === '["Z.AI"]')
+    check('providersOfText falls back to whole-text JSON for non-SSE', JSON.stringify(providersOfText('{"provider":"Together"}')) === '["Together"]')
+
+    const pass = judgeProviders(['Z.AI'], ['z.ai'])
+    check('judgeProviders passes the expected provider case-insensitively', pass.ok === true && pass.provider === 'z.ai', JSON.stringify(pass))
+    const fail = judgeProviders(['Together'], ['z.ai'])
+    check('judgeProviders rejects a foreign provider keeping the wire spelling', fail.ok === false && /provider=Together/.test(fail.reason) && fail.culprit?.finalProvider === 'Together', JSON.stringify(fail))
+    const missing = judgeProviders([], ['z.ai'], [JSON.parse(gatewayBody('openai-compatible-private')).choices[0].message.provider_metadata.gateway.routing])
+    check('judgeProviders fails closed on no evidence and names the routing channel', missing.ok === false && /没有顶层 provider 字段/.test(missing.reason) && missing.culprit?.finalProvider === 'openai-compatible-private', JSON.stringify(missing))
+    check('judgeProviders fails closed on no evidence with no routing either', judgeProviders([], ['z.ai']).culprit === null)
+
+    // 0.11.0：请求线钉法（显示名 → slug）。
+    check('providerSlug renders the display name as the wire slug', providerSlug('Z.AI') === 'z-ai' && providerSlug(' z.ai ') === 'z-ai', providerSlug('z.ai'))
+    check('providerSlug keeps hyphenated names intact', providerSlug('openai-compatible-private') === 'openai-compatible-private', providerSlug('openai-compatible-private'))
+    check('providerSlug collapses punctuation runs and trims edges', providerSlug('--a..b--') === 'a-b', providerSlug('--a..b--'))
+    check('providerSlug is empty for punctuation-only names', providerSlug('!!!') === '', JSON.stringify(providerSlug('!!!')))
+    const bare = withProviderOrder({ model: 'm' }, ['z.ai'])
+    check('withProviderOrder writes the slug and kills fallbacks on a bare body', JSON.stringify(bare.body.provider) === '{"order":["z-ai"],"allow_fallbacks":false}' && bare.order.join() === 'z-ai', JSON.stringify(bare))
+    const kept = withProviderOrder({ model: 'm', provider: { order: ['x'] } }, ['z.ai'])
+    check('withProviderOrder respects an existing order', kept.body.provider.order.join() === 'x' && kept.order.length === 0, JSON.stringify(kept))
+    const merged = withProviderOrder({ model: 'm', provider: { quantize: 'fp8' } }, ['z.ai'])
+    check('withProviderOrder merges into an existing provider object', merged.body.provider.quantize === 'fp8' && JSON.stringify(merged.body.provider.order) === '["z-ai"]' && merged.body.provider.allow_fallbacks === false && merged.order.join() === 'z-ai', JSON.stringify(merged))
+    const slugless = withProviderOrder({ model: 'm' }, ['!!!'])
+    check('withProviderOrder no-ops on names that render no slug', slugless.order.length === 0 && slugless.body.provider === undefined, JSON.stringify(slugless))
+    const emptyList = withProviderOrder({ model: 'm' }, [])
+    check('withProviderOrder no-ops on an empty allow list', emptyList.order.length === 0 && emptyList.body.provider === undefined, JSON.stringify(emptyList))
+  }
+
+  // 请求侧：0.11.0 起连请求线一起钉（顶层 provider.order，slug 化）、单列计数、状态文件可读。
+  {
+    const stub = stubFetch(() => new Response(JSON.stringify({ provider: 'Z.AI', choices: [] })))
+    const hook = createFetchPin(CONFIG, recorder())
+    hook.install()
+    const init = glmInit()
+    await globalThis.fetch(CHAT, init)
+    const sent = bodyOf(stub.calls[0])
+    check('a provider-pinned request now carries the wire order', JSON.stringify(sent.provider?.order) === '["z-ai"]' && sent.provider?.allow_fallbacks === false, JSON.stringify(sent.provider ?? null))
+    check('…leaving the rest of the body untouched', sent.model === 'cline-pass/glm-5.3-flash' && sent.providerOptions === undefined && Array.isArray(sent.tools), JSON.stringify(sent))
+    check('…without mutating the original init', JSON.parse(init.body).provider === undefined, String(init.body).slice(0, 120))
+    check('…counted as provider-pinned, not pinned or skipped', hook.counters.providerPinned === 1 && hook.counters.pinned === 0 && hook.counters.skipped === 0, JSON.stringify(hook.counters))
+    check('…and lastProviderPin carries model, expectation and the wire order', hook.state().lastProviderPin?.model === 'cline-pass/glm-5.3-flash' && hook.state().lastProviderPin?.expect?.[0] === 'z.ai' && JSON.stringify(hook.state().lastProviderPin?.order) === '["z-ai"]', JSON.stringify(hook.state().lastProviderPin ?? null))
+    const disk = JSON.parse(fs.readFileSync(STATUS, 'utf8'))
+    check('…and the status file shows the counter and the config', disk.counters?.providerPinned === 1 && disk.providerPins?.['cline-pass/glm-5.3-flash']?.[0] === 'z.ai', JSON.stringify(disk.counters ?? null))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 兕底：providerPins 配了但 slug 推不出 → 请求线没得注入，退回 0.10.0 的纯响应闸。
+  {
+    const stub = stubFetch(() => new Response(JSON.stringify({ provider: 'Together', choices: [] })))
+    const hook = createFetchPin({ pin: [], providerPins: { 'cline-pass/glm-5.3-flash': ['!!!'] } }, recorder())
+    hook.install()
+    const init = glmInit()
+    await globalThis.fetch(CHAT, init)
+    check('a slugless provider pin leaves the request untouched', stub.calls[0].init === init, JSON.stringify(bodyOf(stub.calls[0])))
+    check('…and the response gate still applies', hook.counters.blocked === 1 && hook.counters.providerPinned === 1, JSON.stringify(hook.counters))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 缓冲路径：判定与记录。
+  {
+    const stub = stubFetch(() => new Response(JSON.stringify({ provider: 'Z.AI', choices: [] })))
+    const hook = createFetchPin(CONFIG, recorder())
+    hook.install()
+    const response = await globalThis.fetch(CHAT, glmInit())
+    check('a Z.AI-served buffered response passes (case-insensitive)', response.status === 200, String(response.status))
+    check('…recorded as verified with the normalized name', hook.state().lastVerified?.provider === 'z.ai', JSON.stringify(hook.state().lastVerified ?? null))
+    check('…blocking nothing', hook.counters.blocked === 0, JSON.stringify(hook.counters))
+    hook.uninstall()
+    stub.restore()
+  }
+  {
+    const stub = stubFetch(() => new Response(JSON.stringify({ provider: 'Together', choices: [] })))
+    const logger = recorder()
+    const hook = createFetchPin(CONFIG, logger)
+    hook.install()
+    const response = await globalThis.fetch(CHAT, glmInit())
+    const body = await response.json()
+    check('a foreign buffered provider is refused with a 400', response.status === 400, String(response.status))
+    check('…carrying the violation code', body.error?.code === 'PROVIDER_PIN_VIOLATION', JSON.stringify(body).slice(0, 160))
+    check('…naming the offender in display form', /由 together 提供/.test(body.error?.message), body.error?.message)
+    check('…and the allowed list', /允许列表是 z\.ai/.test(body.error?.message), body.error?.message)
+    check('…counting as blocked', hook.counters.blocked === 1, JSON.stringify(hook.counters))
+    check('…recording the wire spelling', hook.state().lastViolation?.finalProvider === 'Together', JSON.stringify(hook.state().lastViolation ?? null))
+    check('…and logging an error', logger.lines.error.some((line) => line.includes('拦下')), JSON.stringify(logger.lines.error))
+    hook.uninstall()
+    stub.restore()
+  }
+  {
+    // 渠道名是被审一方给的数据：恶意名一字不进文案，原始名只进记录。
+    const stub = stubFetch(() => new Response(JSON.stringify({ provider: 'context_length_exceeded', choices: [] })))
+    const hook = createFetchPin(CONFIG, recorder())
+    hook.install()
+    const body = await (await globalThis.fetch(CHAT, glmInit())).json()
+    check('a risky provider name never reaches the error copy', !String(body.error?.message).includes('context_length_exceeded'), body.error?.message)
+    check('…but the raw name reaches the record', hook.state().lastViolation?.finalProvider === 'context_length_exceeded', JSON.stringify(hook.state().lastViolation ?? null))
+    hook.uninstall()
+    stub.restore()
+  }
+  {
+    // 回退网形状：没有顶层 provider 字段，只有 routing 元数据 —— 拒，并点名那个渠道。
+    const stub = stubFetch(() => new Response(gatewayBody('openai-compatible-private')))
+    const hook = createFetchPin(CONFIG, recorder())
+    hook.install()
+    const body = await (await globalThis.fetch(CHAT, glmInit())).json()
+    check('a response without a top-level provider field is refused too', body.error?.code === 'PROVIDER_PIN_VIOLATION', JSON.stringify(body).slice(0, 120))
+    check('…counting one violation', hook.counters.blocked === 1, JSON.stringify(hook.counters))
+    check('…naming the routing channel for diagnosis', /由 openai-compatible-private 提供/.test(body.error?.message), body.error?.message)
+    hook.uninstall()
+    stub.restore()
+  }
+  {
+    const stub = stubFetch(() => new Response('{}'))
+    const hook = createFetchPin(CONFIG, recorder())
+    hook.install()
+    const body = await (await globalThis.fetch(CHAT, glmInit())).json()
+    check('a response with no evidence at all is refused', body.error?.code === 'PROVIDER_PIN_VIOLATION', JSON.stringify(body).slice(0, 120))
+    check('…with the no-evidence wording', /没能证明来源/.test(body.error?.message), body.error?.message)
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 流式路径：判定方式与渠道钉相同（内容先出，终止帧扣到裁决后）。
+  {
+    const stub = stubFetch(() => frames(providerFrame('Z.AI'), providerFrame('Z.AI'), 'data: [DONE]\n\n'))
+    const hook = createFetchPin(CONFIG, recorder())
+    hook.install()
+    const reader = (await globalThis.fetch(CHAT, glmInit())).body.getReader()
+    const first = new TextDecoder().decode((await reader.read()).value)
+    check('strict provider-pinned streams content before the verdict', first.includes('tok'), JSON.stringify(first))
+    let tail = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      tail += new TextDecoder().decode(value)
+    }
+    check('…releasing the terminator once the provider verdict passes', tail.includes('[DONE]'), JSON.stringify(tail))
+    check('…recording the normalized provider', hook.state().lastVerified?.provider === 'z.ai', JSON.stringify(hook.state().lastVerified ?? null))
+    hook.uninstall()
+    stub.restore()
+  }
+  {
+    const stub = stubFetch(() => frames(providerFrame('InferenceNet'), providerFrame('Together'), 'data: [DONE]\n\n'))
+    const hook = createFetchPin(CONFIG, recorder())
+    hook.install()
+    const { text, error } = await drain(await globalThis.fetch(CHAT, glmInit()))
+    check('a foreign streamed provider still delivers content frames', text.includes('tok'), JSON.stringify(text))
+    check('…but never the terminator', !text.includes('[DONE]'), JSON.stringify(text))
+    check('…and the body fails instead of completing', error !== null && /渠道校验未通过/.test(error.message), String(error?.message))
+    check('…counting one violation naming the first foreign provider', hook.counters.blocked === 1 && hook.state().lastViolation?.finalProvider === 'InferenceNet', JSON.stringify(hook.state().lastViolation ?? null))
+    hook.uninstall()
+    stub.restore()
+  }
+  {
+    const routingOnly = `data: ${gatewayBody('openai-compatible-private')}\n\n`
+    const stub = stubFetch(() => frames(routingOnly, 'data: [DONE]\n\n'))
+    const hook = createFetchPin(CONFIG, recorder())
+    hook.install()
+    const response = await globalThis.fetch(CHAT, glmInit())
+    const { text, error } = await drain(response)
+    // 0.10.0 自动重试：回退形状没有 provider 字段，早期裁决始终悬而未决，取证会一路读到
+    // 终止帧 —— 但没有任何字节交付过，所以照样补发 2 次，最终以 400 拒绝收场（不再走
+    // 「流中断」：中断只在内容已经流出时才有意义，这里内容从未流出）。
+    check('a streamed response without provider fields fails closed', response.status === 400 && error === null && /openai-compatible-private/.test(text), `HTTP ${response.status}: ${text.slice(0, 140)}`)
+    check('…after exhausting the retry budget', hook.counters.retried === 2 && hook.counters.blocked === 1, JSON.stringify(hook.counters))
+    check('…naming the routing channel as the culprit', hook.state().lastViolation?.finalProvider === 'openai-compatible-private', JSON.stringify(hook.state().lastViolation ?? null))
+    check('…and the terminator is withheld too', !text.includes('[DONE]'), JSON.stringify(text))
+    hook.uninstall()
+    stub.restore()
+  }
+  {
+    const stub = stubFetch(() => frames(providerFrame('Together'), 'data: [DONE]\n\n'))
+    const hook = createFetchPin({ ...CONFIG, enforcement: 'warn' }, recorder())
+    hook.install()
+    const { text, error } = await drain(await globalThis.fetch(CHAT, glmInit()))
+    check('warn streams a foreign provider to the end', error === null && text.includes('tok') && text.includes('[DONE]'), JSON.stringify(text))
+    check('warn still counts and records it', hook.counters.blocked === 1 && hook.state().lastViolation?.finalProvider === 'Together', JSON.stringify(hook.state().lastViolation ?? null))
+    hook.uninstall()
+    stub.restore()
+  }
+  {
+    const stub = stubFetch(() => new Response(JSON.stringify({ provider: 'Together', choices: [] })))
+    const hook = createFetchPin({ ...CONFIG, enforcement: 'off' }, recorder())
+    hook.install()
+    const response = await globalThis.fetch(CHAT, glmInit())
+    check('enforcement off passes a foreign provider through unverified', response.status === 200 && hook.counters.blocked === 0 && hook.counters.providerPinned === 1, `status=${response.status}, ${JSON.stringify(hook.counters)}`)
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 未列入 providerPins 的模型在 pin: [] 下仍是普通透传（skipped + NOTHING_TO_PIN）。
+  {
+    const stub = stubFetch(() => new Response('{}'))
+    const logger = recorder()
+    const hook = createFetchPin(CONFIG, logger)
+    hook.install()
+    await globalThis.fetch(CHAT, jsonInit())
+    check('a model without providerPins under an empty pin is still a plain skip', hook.counters.skipped === 1 && hook.counters.providerPinned === 0 && hook.counters.blocked === 0, JSON.stringify(hook.counters))
+    check('…with the pass-through wording', logger.lines.warn.some((line) => line.includes('nothing to pin')), JSON.stringify(logger.lines.warn))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // provider 模式的证据只有 provider 字段：routing 溢出与 routing 内容都不参与判决。
+  {
+    const many = Array.from({ length: 70 }, (_, index) => `data: ${JSON.stringify({ provider: 'Z.AI', routing: { finalProvider: `foreign-${index}` } })}\n\n`).join('')
+    const stub = stubFetch(() => frames(many, 'data: [DONE]\n\n'))
+    const hook = createFetchPin(CONFIG, recorder())
+    hook.install()
+    const response = await globalThis.fetch(CHAT, glmInit())
+    check('routing overflow is irrelevant to the provider verdict', response.status === 200 && hook.counters.blocked === 0, `status=${response.status}, ${JSON.stringify(hook.counters)}`)
+    hook.uninstall()
+    stub.restore()
+  }
+  {
+    const many = Array.from({ length: 70 }, (_, index) => providerFrame(`prov-${index}`)).join('')
+    const stub = stubFetch(() => frames(many, 'data: [DONE]\n\n'))
+    const hook = createFetchPin(CONFIG, recorder())
+    hook.install()
+    const { error } = await drain(await globalThis.fetch(CHAT, glmInit()))
+    check('a provider-field overflow fails closed', error !== null && /超过 64 个各不相同的顶层 provider 字段/.test(String(error?.detail ?? error?.message)), String(error?.message))
+    check('…and counts one violation', hook.counters.blocked === 1, JSON.stringify(hook.counters))
+    hook.uninstall()
+    stub.restore()
+  }
+
+  // 两种钉选并存：请求注入渠道钉，响应必须**两侧**都过关。
+  {
+    const stub = stubFetch(() => new Response(bothBody('deepseek', 'Z.AI')))
+    const hook = createFetchPin(BOTH, recorder())
+    hook.install()
+    const response = await globalThis.fetch(CHAT, jsonInit())
+    check('a model with both lists injects the channel pin', JSON.stringify(only(stub.calls[0])) === '["deepseek"]', JSON.stringify(only(stub.calls[0])))
+    check('…and the provider order rides along on the wire', JSON.stringify(bodyOf(stub.calls[0]).provider?.order) === '["z-ai"]', JSON.stringify(bodyOf(stub.calls[0]).provider ?? null))
+    check('…and counts as pinned, not provider-pinned', hook.counters.pinned === 1 && hook.counters.providerPinned === 0, JSON.stringify(hook.counters))
+    check('…and passes when both evidences agree', response.status === 200 && hook.state().lastVerified?.provider === 'z.ai', `status=${response.status}, ${JSON.stringify(hook.state().lastVerified ?? null)}`)
+    hook.uninstall()
+    stub.restore()
+  }
+  {
+    const stub = stubFetch(() => new Response(bothBody('deepseek', 'Together')))
+    const hook = createFetchPin(BOTH, recorder())
+    hook.install()
+    const refused = await globalThis.fetch(CHAT, jsonInit())
+    check('a foreign wire provider is refused even when routing agrees', refused.status === 400 && /together/.test((await refused.json()).error?.message), String(refused.status))
+    hook.uninstall()
+    stub.restore()
+  }
+  {
+    const stub = stubFetch(() => new Response(bothBody('alibaba', 'Z.AI')))
+    const hook = createFetchPin(BOTH, recorder())
+    hook.install()
+    const refused = await globalThis.fetch(CHAT, jsonInit())
+    check('a foreign routing is refused even when the wire provider agrees', refused.status === 400 && hook.state().lastViolation?.finalProvider === 'alibaba', String(refused.status))
+    hook.uninstall()
+    stub.restore()
+  }
+}
+
+// ── 17. the anonymized channel (0.11.1) ─────────────────────────────────────
+//
+// 2026-10-14 起网关把 VMC 回退网形状的 provider 元数据匿名化为
+// `openai-compatible-private`：渠道钉把它写进允许列表即放行（其余字段照常校验），
+// 并在**会话首条消息**的响应最前面垫一条提示帧。桩网关回放真实形状（routing 全
+// private），断言：放行、首条提示、后续消息不再提示、标题形状不提示、不在允许
+// 列表时照旧拒。
+console.log('\n── 17. the anonymized channel ────────────────────────────')
+{
+  const enc = (text) => new TextEncoder().encode(text)
+  const delta = (text) => `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`
+  const routing = `data: ${gatewayBody('openai-compatible-private')}\n\n`
+  const frames = (...parts) => new Response(new ReadableStream({
+    start(controller) {
+      for (const part of parts) controller.enqueue(enc(part))
+      controller.close()
+    },
+  }), { status: 200, headers: { 'content-type': 'text/event-stream' } })
+
+  async function drain(response) {
+    const parts = []
+    const reader = response.body.getReader()
+    for (;;) {
+      const { done: ended, value } = await reader.read()
+      if (ended) return parts.join('')
+      parts.push(new TextDecoder().decode(value))
+    }
+  }
+  const firstDelta = (text) => {
+    const frame = text.split('\n\n').find((line) => line.startsWith('data: ') && line !== 'data: [DONE]')
+    try { return JSON.parse(frame.slice(6)).choices?.[0]?.delta?.content ?? null } catch { return null }
+  }
+  const ALLOWED = { pin: ['deepseek', 'openai-compatible-private'] }
+  // dsh 真实首条请求的 wire 形状（2026-10-15 playground 实测）：上下文插件（time-context）
+  // 会把快照作为**额外的 user 消息**注进同一条请求 —— 0.11.1 数「非 system 恰 1 条」在它
+  // 面前漏报（真实计数是 2）。提示只在流式 + 无 assistant 历史 + max_tokens > 8192 时垫。
+  const firstTurnInit = (overrides = {}) =>
+    jsonInit({
+      body: JSON.stringify({
+        ...CHAT_BODY,
+        max_tokens: 384000,
+        messages: [
+          { role: 'system', content: 'sys' },
+          { role: 'user', content: 'hi' },
+          { role: 'user', content: 'Time sampled while preparing turn 1, step 1: …' },
+        ],
+        ...overrides,
+      }),
+    })
+
+  // 放行 + 首条提示 + 计数/状态文件
+  {
+    const stub = stubFetch(() => frames(delta('你好'), routing, 'data: [DONE]\n\n'))
+    const hook = createFetchPin(ALLOWED, recorder())
+    hook.install()
+    const text = await drain(await globalThis.fetch(CHAT, firstTurnInit()))
+    const notice = firstDelta(text)
+    check('a private-channel response is verified, not refused', hook.state().lastVerified?.provider === 'openai-compatible-private', JSON.stringify(hook.state().lastVerified))
+    check('counters.anonymized counts it', hook.state().counters.anonymized === 1, String(hook.state().counters.anonymized))
+    check('the first message opens with the notice', typeof notice === 'string' && notice.startsWith('⚠️') && notice.includes('openai-compatible-private'), String(notice?.slice(0, 40)))
+    check('the notice precedes the gateway content', text.indexOf('⚠️') !== -1 && text.indexOf('⚠️') < text.indexOf('你好'), 'frame order')
+    check('status file records lastAnonymized', JSON.parse(fs.readFileSync(STATUS, 'utf8')).lastAnonymized?.provider === 'openai-compatible-private', 'lastAnonymized')
+    // 第二条消息（历史里已有 assistant）：不再提示
+    const laterInit = jsonInit({ body: JSON.stringify({ ...CHAT_BODY, messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }, { role: 'user', content: 'c' }] }) })
+    const later = await drain(await globalThis.fetch(CHAT, laterInit))
+    check('a later message carries no notice', !later.includes('⚠️') && firstDelta(later) === '你好', firstDelta(later) ?? '(none)')
+    hook.uninstall()
+    stub.restore()
+  }
+  // 0.11.3 回归：真实 wire 形状走 max_completion_tokens: 384000，且完全不带 max_tokens
+  // （@deepseek-ai/dsh-llm-pi-ai 运行时特征）。0.11.2 只认 max_tokens 导致 budget 为 NaN，
+  // 漏垫提示。同时断言 lastRequestShape 诊断字段在 hook.state() 与 status 文件中同步落盘。
+  {
+    const stub = stubFetch(() => frames(delta('你好'), routing, 'data: [DONE]\n\n'))
+    const hook = createFetchPin(ALLOWED, recorder())
+    hook.install()
+    const { max_tokens: _dropped, ...bodyWithoutMaxTokens } = CHAT_BODY
+    const piAiBody = {
+      ...bodyWithoutMaxTokens,
+      max_completion_tokens: 384000,
+      messages: [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: 'hi' },
+        { role: 'user', content: 'Time sampled while preparing turn 1, step 1: …' },
+      ],
+    }
+    const text = await drain(await globalThis.fetch(CHAT, jsonInit({ body: JSON.stringify(piAiBody) })))
+    const notice = firstDelta(text)
+    check('0.11.3: max_completion_tokens triggers the anonymized notice', typeof notice === 'string' && notice.startsWith('⚠️') && notice.includes('openai-compatible-private'), String(notice?.slice(0, 40)))
+    const shape = hook.state().lastRequestShape
+    check('0.11.3: lastRequestShape is recorded in hook.state()', shape !== null && shape?.stream === true && shape?.maxTokens === null && shape?.maxCompletionTokens === 384000 && shape?.notice === true, JSON.stringify(shape))
+    check('0.11.3: lastRequestShape records roles sequence', shape?.roles === 'system,user,user', shape?.roles)
+    const disk = JSON.parse(fs.readFileSync(STATUS, 'utf8'))
+    check('0.11.3: status file records lastRequestShape', disk.lastRequestShape?.maxCompletionTokens === 384000 && disk.lastRequestShape?.notice === true, JSON.stringify(disk.lastRequestShape))
+    hook.uninstall()
+    stub.restore()
+  }
+  // 标题请求形状（dsh-base 组合 maxOutputTokens: 4096；流式、无 assistant 历史）：它的
+  // 输出直接变成会话标题，垫不得 —— 预算守卫（max_tokens / max_completion_tokens > 8192）必须挡住它。
+  {
+    const stub = stubFetch(() => frames(delta('Greeting'), routing, 'data: [DONE]\n\n'))
+    const hook = createFetchPin(ALLOWED, recorder())
+    hook.install()
+    const text = await drain(await globalThis.fetch(CHAT, firstTurnInit({ max_tokens: 4096, messages: [{ role: 'system', content: 'Create a concise title for an AI coding-assistant session.' }, { role: 'user', content: 'hi' }] })))
+    check('a title-shaped request (4096 budget) carries no notice', !text.includes('⚠️') && firstDelta(text) === 'Greeting', firstDelta(text) ?? '(none)')
+    // 0.11.3: 同样验证用 max_completion_tokens: 4096 的标题形状也被挡住
+    const { max_tokens: _dropped, ...bodyWithoutMaxTokens } = CHAT_BODY
+    const titleBody = {
+      ...bodyWithoutMaxTokens,
+      max_completion_tokens: 4096,
+      messages: [{ role: 'system', content: 'Create a concise title for an AI coding-assistant session.' }, { role: 'user', content: 'hi' }],
+    }
+    const titleText = await drain(await globalThis.fetch(CHAT, jsonInit({ body: JSON.stringify(titleBody) })))
+    check('0.11.3: title request with max_completion_tokens: 4096 carries no notice', !titleText.includes('⚠️') && firstDelta(titleText) === 'Greeting', firstDelta(titleText) ?? '(none)')
+    check('0.11.3: title request lastRequestShape has notice === false', hook.state().lastRequestShape?.notice === false && hook.state().lastRequestShape?.maxCompletionTokens === 4096, JSON.stringify(hook.state().lastRequestShape))
+    hook.uninstall()
+    stub.restore()
+  }
+  // 不在允许列表 → 照旧 fail closed（护栏：放行只属于配置显式的允许）。流式路径的
+  // 拒绝形状是**流中断**（HTTP 仍是 200，终止帧被扣），400 只属于缓冲路径 —— 断言错误面。
+  {
+    const stub = stubFetch(() => frames(delta('x'), routing, 'data: [DONE]\n\n'))
+    const hook = createFetchPin({}, recorder())
+    hook.install()
+    const parts = []
+    const reader = (await globalThis.fetch(CHAT, jsonInit())).body.getReader()
+    let streamError = null
+    for (;;) {
+      try {
+        const { done, value } = await reader.read()
+        if (done) break
+        parts.push(new TextDecoder().decode(value))
+      } catch (error) {
+        streamError = error
+        break
+      }
+    }
+    const text = parts.join('')
+    check(
+      'private stays refused when not allowlisted',
+      streamError !== null && !text.includes('[DONE]') && /openai-compatible-private/.test(String(streamError.message ?? streamError)),
+      `error=${String(streamError?.message ?? streamError).slice(0, 80)} delivered=${JSON.stringify(text.slice(0, 40))}`,
+    )
+    hook.uninstall()
+    stub.restore()
+  }
+  // 取消竞态（0.11.1 回归）：消费者（streamedVerification）读到终止帧就收尾并 **cancel**
+  // 提示流，而真网关的连接此时往往还开着 —— 泵的在途 read 回来后不得对已死的 controller
+  // 调 enqueue/close（实测：未处理拒绝能把宿主进程带走）。stub 复刻真网关形状：
+  // [DONE] 在中途 chunk 里到达，之后流**保持打开**一段时间再结束。
+  {
+    const stub = stubFetch(() => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(enc(delta('你好')))
+        controller.enqueue(enc(`${routing}data: [DONE]\n\n`))
+        setTimeout(() => {
+          controller.enqueue(enc(delta('迟到帧')))
+          controller.close()
+        }, 200)
+      },
+    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+    const hook = createFetchPin(ALLOWED, recorder())
+    hook.install()
+    const text = await drain(await globalThis.fetch(CHAT, firstTurnInit()))
+    check('cancel race: the drain still completes cleanly', text.includes('[DONE]') && text.startsWith('data: ') && text.includes('⚠️'), `len=${text.length}`)
+    check('cancel race: verified before the cancel', hook.state().lastVerified?.provider === 'openai-compatible-private' && hook.state().counters.anonymized === 1, JSON.stringify(hook.state().lastVerified ?? null))
     hook.uninstall()
     stub.restore()
   }

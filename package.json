@@ -1,6 +1,6 @@
 {
   "name": "dsh-clinepass",
-  "version": "0.9.1",
+  "version": "0.11.3",
   "description": "Cline Pass for DeepSeek Harness: an OpenAI-compatible provider route whose requests are pinned to the DeepSeek upstream channel, with the API key entered on Settings → Models.",
   "type": "module",
   "main": "index.js",
@@ -31,7 +31,7 @@
   ],
   "scripts": {
     "test": "node test-package.mjs && node test-fetch.mjs && node test-settings.mjs && node test-usage.mjs && node test-install.mjs",
-  "test:installed": "node test-fetch.mjs && node test-settings.mjs && node test-usage.mjs",
+    "test:installed": "node test-fetch.mjs && node test-settings.mjs && node test-usage.mjs",
     "test:package": "node test-package.mjs",
     "test:fetch": "node test-fetch.mjs",
     "test:settings": "node test-settings.mjs",

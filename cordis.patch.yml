@@ -35,8 +35,14 @@
       name: dsh-clinepass
       config:
         upstream: https://api.cline.bot
+        # 0.11.1：`openai-compatible-private` 是网关给 VMC 回退网形状的**匿名渠道标签**
+        # （2026-10-14 起 provider 元数据不再写真名；权重同一性已按 N=200 分布指纹 +
+        # 置换检验验证为正版 V4.1 Flash 重部署，审计见 clinepass-deepseek-audit/）。
+        # 放行它并保留 deepseek（网关哪天改回真名就自动恢复校验）。会话首条消息的
+        # 回复会垫一条提示帧（withAnonymousNotice），想关掉就从列表里拿掉它。
         pin:
           - deepseek
+          - openai-compatible-private
 
 # ── provider 卡片：静态声明，装上就有 ────────────────────────────────────────
 #

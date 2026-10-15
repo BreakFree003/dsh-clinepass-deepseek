@@ -97,8 +97,13 @@ const FETCH_BLOCK = `# ── dsh-clinepass ────────────
       name: './plugins/${name}/index.js'
       config:
         upstream: https://api.cline.bot
+        # 0.11.1: the second entry is the gateway's anonymized label for the
+        # fallback-net shape (real channel names are no longer written into the
+        # routing metadata since 2026-10-14). Keeping deepseek listed means
+        # verification resumes automatically if the gateway un-anonymizes.
         pin:
           - deepseek
+          - openai-compatible-private
 `
 
 const BLOCK = FETCH_BLOCK

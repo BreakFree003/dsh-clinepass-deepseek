@@ -1,5 +1,188 @@
 # Changelog
 
+## 0.11.3
+
+The anonymized-channel notice now recognises `max_completion_tokens` alongside
+`max_tokens`, and logs request shape diagnostics into the live status file:
+
+- **Root cause: `max_completion_tokens` budget field.** OpenAI-compatible
+  clients (specifically `@deepseek-ai/dsh-llm-pi-ai` in real dsh sessions) send
+  `max_completion_tokens` rather than `max_tokens`. In 0.11.2, `budget` evaluated
+  to `NaN` when `max_tokens` was absent, causing `isConversationStart` to return
+  `false` and silently omitting the `ANONYMIZED_NOTICE` frame.
+- **`isConversationStart` now checks `body.max_tokens ?? body.max_completion_tokens`.**
+  Both spellings are accepted so real requests pass the `budget > 8192` threshold.
+- **Request shape diagnostics (`lastRequestShape`).** `hook.state()` and the live
+  status file now record `lastRequestShape` (`model`, `stream`, `maxTokens`,
+  `maxCompletionTokens`, `roles`, `notice`), making the trigger decision fully
+  auditable without guessing.
+- **Fixed `ReferenceError: lastRequestShape is not defined`.** Scoped the request
+  shape construction cleanly within `pinnedBody` and passed it through to `rewrite`
+  to update `lastRequestShape` in the hook closure.
+
+## 0.11.2
+
+The anonymized-channel notice never fired in a real conversation. Diagnosed
+from the live status file the morning after 0.11.1 shipped:
+
+- **`counters.anonymized` incremented; no notice appeared.** The first real
+  dsh conversation (Playground, 08:38) verified private-channel responses and
+  the reply carried no `⚠️` frame. Root cause: the 0.11.1 trigger counted
+  "exactly one non-system message", but dsh's context plugins (time-context)
+  inject snapshots as *extra user messages* into the same request — the real
+  first wire shape is `[system, user, user(time-context)]`, count 2, so the
+  condition never held. The 0.11.1 live check passed because it hand-built a
+  single-user-message body: the blind spot was the request shape, not the
+  injection.
+- **The trigger is now three conjunctive checks** (`isConversationStart`):
+  `stream === true`, no `assistant` message in the history (turn-1 step-2
+  onwards necessarily has one, so the notice cannot repeat), and
+  `max_tokens > 8192`. The budget guard keeps the session-title call out —
+  it streams from the same route with no assistant history, and its output
+  *becomes* the title, where a notice frame would be fatal. dsh-base
+  configures the title call at 4096; agent requests run at 384000 (two
+  orders of magnitude apart).
+- **Tests**: §17 gains the real first-turn wire shape as a regression case
+  and a title-shaped negative; the smoke test's notice request now carries
+  the agent budget.
+
+## 0.11.1
+
+The gateway anonymizes the channel; the pin learns the anonymity label. Same
+night as 0.11.0, after the response-side gate started refusing every
+`cline-pass/deepseek-v4.1-flash` request:
+
+- **What changed upstream.** The `routing` metadata of the fallback-net shape
+  (`vmc/deepseek-v4p1-flash-contributor-fallbacks`) no longer names the real
+  channel: `finalProvider` / `resolvedProvider` / successful
+  `providerAttempts` all read `openai-compatible-private`, and
+  `fallbacksAvailable` is empty. With the pin at `[deepseek]` every request was
+  therefore a strict-mode refusal — fail closed on the letter of the contract.
+- **A weight-identity audit before trusting the label.** Rather than blindly
+  allowing the new name, the serving channel was audited against the official
+  API: single-token distribution fingerprint at N=200 with permutation tests
+  (JSD 0.017, p=0.557 — indistinguishable; a GLM impostor cleanly separates at
+  p=0.002), near-tie tie-breaker probes (the divergence resolves to the
+  official API's own production noise floor — sub is *sharper*, the opposite
+  of the quantization signature), temp-0 determinism, and a prefix-cache
+  accounting comparison (token-exact vs 64-block). Verdict: a low-noise
+  redeployment of genuine DeepSeek V4.1 Flash weights, contributor data tier,
+  no ZDR. Full evidence: `clinepass-deepseek-audit/` in the dsh workspace.
+- **`ANONYMIZED_CHANNEL` (new) and the allowlist.** The channel pin default is
+  now `[deepseek, openai-compatible-private]` — the real name stays listed so
+  verification resumes automatically if the gateway ever un-anonymizes;
+  everything else about the gate (resolvedProvider, successful provider
+  attempts, fail-closed on missing evidence) is unchanged. A channel not in
+  the list is still refused.
+- **`withAnonymousNotice` (new): one warning per conversation.** On the first
+  message of a conversation (`messages` minus `system` — exactly one) served
+  via the anonymized channel, a synthetic OpenAI chunk frame carrying a short
+  warning is prepended to the response stream: the channel is anonymized,
+  contributor-tier (data may train future models), no ZDR. Later messages are
+  untouched; the notice frame carries no routing/provider fields, so the gate
+  scans it like any content frame. Status file gains `counters.anonymized`
+  and `lastAnonymized`.
+- **Why prepend rather than append:** the request side already knows the shape
+  (`pinnedBody` sees the allowlist); the routing evidence only arrives in the
+  last frame, when the content has long been delivered.
+- **The smoke test follows the wire.** §2 now asserts "served by an allowed
+  channel" (the pin list) instead of naming `deepseek`, and expects the notice
+  on its first-message request; §4 drops the `fallbacksAvailable > 1` check —
+  the anonymized shape offers an empty list.
+
+## 0.11.0
+
+The provider pin moves onto the wire. Third measurement round on
+`api.cline.bot` the same day the rotation was diagnosed, 5 requests per
+variant, on the direct shape (`cline-pass/glm-5.3-flash`, top-level `provider`
+field on every frame, no routing metadata):
+
+- **The gateway honors the OpenRouter top-level `provider` field.** With
+  `provider: { order: ["z-ai"], allow_fallbacks: false }` the response came
+  back 5/5 `Z.AI`; `only: ["z-ai"]` also 5/5; with no `provider` field at all
+  2/5 `Z.AI` (3/5 `Friendli`). The Vercel-style `providerOptions.gateway.only`
+  remains ignored for this shape too (morning measurement: 3/9 landed on
+  `Together` while carrying it) — the two routing dialects are not treated
+  alike, and only the OpenRouter one works.
+- **The display name is not a wire slug.** `provider: { only: ["z.ai"] }` —
+  the exact spelling `providerPins` configures — gets the connection dropped
+  or returns frames without a provider field. The request line speaks slugs:
+  `z-ai`.
+- **`providerSlug` / `withProviderOrder` (new).** A provider pin now rewrites
+  the request body as well: display names are slug-rendered (lower-case,
+  punctuation runs folded to `-`, edges trimmed) and written into top-level
+  `provider.order` with `allow_fallbacks: false` — unless the request already
+  carries a non-empty `order`, which is respected, matching the pi-side guard.
+  The channel pin (deepseek, fallback-net shape) is unaffected: the extra
+  field provably changes nothing there (measured, routing byte-identical), so
+  a model with both lists gets both fields.
+- **The response gate stays.** Rotation should now be pinned away at the
+  request, but every response is still verified — a stale slug fails closed
+  (whole round fails), it can never let a foreign provider through.
+- **Auto-retry fix (0.10.0 follow-up).** The retry budget never engaged for
+  streams that carry no evidence until the terminator — the exact fallback-net
+  shape: the peek condition included `attempt < retries`, so the last attempt
+  fell through to the old stream-interrupt path and `retried` stayed 0, while
+  test-fetch §15 documented "retry twice, then a 400". `sendVerified` now
+  always peeks under strict + provider pin; an exhausted budget ends in a
+  buffered 400 for the no-evidence shape (nothing was ever delivered) and
+  hands off to streaming for the early-verdict shape (content flows, verdict
+  interrupts at the end) — the exact semantics §15 already asserted.
+- `lastProviderPin` gains `order` (the slugs actually written); `counters`
+  prose/docs updated accordingly.
+
+## 0.10.0
+
+One new capability: **provider-level pinning** (`providerPins`) — a second
+evidence surface for models the gateway serves *directly*, without routing
+metadata. Plus the measurement that forced it.
+
+- **What the wire actually looks like now (2026-10-14).** `api.cline.bot`
+  rotates `cline-pass/glm-5.3-flash` across several upstream providers: same
+  model, same echo (`z-ai/glm-5.3-flash`), measured 3/3 `Z.AI` at 17:59,
+  5/5 `InferenceNet` at 18:03, and 9/9 `Together` at 18:25 — including 3
+  requests that *carried* `gateway.only:["z-ai"]` and were still served by
+  Together. Direct-route responses carry a top-level `provider` field on every
+  frame and **no** `gateway.routing` metadata; the contributor-fallback shape
+  (`model: vmc/…-contributor-fallbacks`) is the exact inverse. The config
+  comment claiming "only the Z.AI official route serves this id (3/3)" was a
+  sampling-window illusion and has been rewritten.
+- **`providerPins` (new config).** For a pass-through model (`pins` configured
+  as `[]`) the response must now prove itself through the wire's top-level
+  `provider` field: every frame's value is compared case-insensitively against
+  the configured allow-list (`judgeProviders` over `providersOfText`, which
+  deliberately reads *top-level* keys only — nested
+  `providerAttempts[].provider` / `delta.provider` are not direct-route
+  evidence). Missing evidence fails closed, exactly like routing metadata
+  does: the fallback shape has no provider field, and when it carries routing
+  metadata the violation names that channel. Enforcement semantics are shared
+  with the channel pin (`strict` refuses — 400 buffered / stream error; `warn`
+  records and passes; `off` skips), and a model configured with *both* `pins`
+  and `providerPins` must satisfy both (`judgeEvidence`).
+- **Request side unchanged, counted separately.** A provider-pinned request is
+  sent byte-for-byte as it arrived (nothing to inject), so it is neither
+  `pinned` nor `skipped`: new counter `providerPinned`, new status-file fields
+  `providerPins` (the resolved config) and `lastProviderPin`
+  (`{at, url, model, expect}`). The startup note for an intentionally empty
+  per-model channel pin now says so ("provider-pinned to …") instead of
+  warning.
+- **Not a weights guarantee.** `providerPins` holds the gateway to what *it*
+  reports per frame — the only verifiable signal on this wire. With the
+  profile pinned to `[z.ai]` alone, turns served by Together/InferenceNet fail
+  (that is the point; the deployed cordis.patch.yml documents the accepted
+  cost and how to widen the list).
+- **Tests.** `test-fetch.mjs` gains §15 (the provider pin: config parsing,
+  buffered/streamed verdicts, the risky-name copy gate, fallback-shape
+  fail-closed, provider-evidence overflow, warn/off, both-pins coexistence) —
+  322 checks. The SSE event-assembly parser is now shared (`sseDocuments`) by
+  `routingsOfText` and `providersOfText` with identical behavior. The smoke
+  test's live turn is config-aware: it reads the clinepass row's own
+  `pins`/`providerPins` and asserts whichever evidence shape the profile
+  actually uses (a strict refusal of a foreign provider is asserted as the
+  legitimate outcome); §3's "who served it" check accepts the
+  no-routing-metadata shape. The `--negative` section still assumes the
+  deepseek routing shape and remains an expected-FAIL for the glm profile.
+
 ## 0.9.1
 
 One compatibility fix, forced by dsh 0.2.1-alpha.2. The pin itself is unchanged;

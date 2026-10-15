@@ -19,9 +19,16 @@
         # injected in-process by wrapping `globalThis.fetch`, so this plugin
         # opens no listener and no port.
         upstream: https://api.cline.bot
-        # Upstream channels every pinned request is restricted to.
+        # Upstream channels every pinned request is restricted to. 0.11.1 adds
+        # the gateway's anonymized label for the fallback-net shape (real
+        # channel names are no longer written into routing metadata since
+        # 2026-10-14); `deepseek` stays listed so verification resumes
+        # automatically if the label ever goes back to a real name. The first
+        # message of a conversation served via the anonymized channel carries
+        # a one-line warning; remove the entry to refuse it again.
         pin:
           - deepseek
+          - openai-compatible-private
         # Optional: per-model pins, e.g.
         # pins:
         #   cline-pass/deepseek-v4.1-flash:

@@ -9,11 +9,14 @@
  *     key field — appears natively on Settings → Models; no custom UI, and no
  *     hand-written streaming adapter that can drift from the harness contract.
  *
- *  2. This plugin adds the field itself, on the way out, without touching the
- *     route's proven request path. Cline Pass picks the upstream channel from a
- *     request-body field (`providerOptions.gateway.only`), and dsh deliberately
- *     withholds pi-ai's `openRouterRouting` / `vercelGatewayRouting` compat
- *     switches, so the field cannot be expressed in settings.
+ *  2. This plugin adds the pins themselves, on the way out, without touching the
+ *     route's proven request path. api.cline.bot speaks two routing dialects:
+ *     the Vercel AI Gateway field (`providerOptions.gateway.only`) and the
+ *     OpenRouter top-level `provider` object. As of 2026-09-22 the gateway only
+ *     honors the latter, so 0.11.0 writes both (the provider pin slug-ified:
+ *     "z.ai" → "z-ai"). dsh deliberately withholds pi-ai's `openRouterRouting`
+ *     / `vercelGatewayRouting` compat switches, so neither field can be
+ *     expressed in settings.
  *
  *     The injection is **in-process**: wrap `globalThis.fetch` for the lifetime
  *     of the process and rewrite the body of the gateway's own
@@ -221,6 +224,28 @@ const DEFAULT_PIN = ['deepseek']
  */
 const DEFAULT_ENFORCEMENT = 'strict'
 const ENFORCEMENT_VALUES = ['strict', 'warn', 'off']
+
+/**
+ * 网关给 VMC 回退网形状的**匿名渠道标签**（0.11.1）：2026-10-14 起 provider 元数据不再
+ * 写出真名，`finalProvider` / `resolvedProvider` / 成功的 `providerAttempts` 一律是这个值
+ * （实测与审计：`clinepass-deepseek-audit/`，权重同一性已验证 —— 正版 V4.1 Flash 的低噪声
+ * 重部署，contributor 档）。把它写进渠道钉的允许列表即视为放行；会话首条消息的提示
+ * （{@link pinnedBody} 的 `notice` → {@link withAnonymousNotice}）也以它为准。
+ */
+const ANONYMIZED_CHANNEL = 'openai-compatible-private'
+
+/** 会话首条消息的匿名渠道提示文案。想改措辞改这里；想整个关掉就从允许列表里拿掉它。 */
+const ANONYMIZED_NOTICE =
+  '⚠️ clinepass：deepseek 渠道已被网关匿名化为 openai-compatible-private（contributor 档：数据可能用于训练，无 ZDR）。本提示只在会话第一条消息显示。'
+/**
+ * 自动重试的默认次数（0.10.0）。语义是「校验失败后再补发几次」，总尝试数 = `retries + 1`。
+ *
+ * 默认开是 0.10.0 的立场：glm-5.3-flash 在 Z.AI / InferenceNet / Together 之间轮转，钉
+ * `[z.ai]` 意味着相当比例的轮次会被闸拦下 —— 而轮转是**按请求**的，补发一次大概率就落到
+ * 允许的 provider 上。拦下的尝试从未交付（缓冲路径内容没离开网关，流式路径在首个证据帧
+ * 就裁决），重试对调用方完全透明；`retries: 0` 恢复「拦下即结束」。
+ */
+const DEFAULT_RETRIES = 2
 const DEFAULT_CONTEXT_WINDOW = 921600
 const DEFAULT_MAX_TOKENS = 131072
 
@@ -292,6 +317,27 @@ export function withDefaults(raw, logger = console) {
       if (Array.isArray(channels)) pins[model] = channels.map(String).filter((entry) => entry.length > 0)
     }
   }
+  // provider 级钉选（0.10.0）：对「网关不执行渠道钉、直通响应也没有 routing 元数据」的
+  // 模型（实测 2026-10-14：glm-5.3-flash 由 Z.AI / InferenceNet / Together 轮转服务，
+  // gateway.only 被无视），改用响应**每帧顶层的 `provider` 字段**兑现本地钉选。网关在
+  // wire 上自己决定大小写（实测 "Z.AI"），所以配置在这里就归一化成小写，判定时两侧
+  // 都按小写比；非字符串条目是配置错误，丢弃而不是 String() 成一个假渠道名。
+  // 0.11.0：钉选同时上请求线 —— 显示名经 providerSlug 换成 slug，写进顶层
+  // provider.order（实测被执行：带 order 的 glm-5.3-flash 5/5 由 Z.AI 服务）。
+  const providerPins = {}
+  if (isPlainObject(raw?.providerPins)) {
+    for (const [model, providers] of Object.entries(raw.providerPins)) {
+      if (!Array.isArray(providers)) continue
+      providerPins[model] = [
+        ...new Set(
+          providers
+            .filter((entry) => typeof entry === 'string')
+            .map((entry) => entry.trim().toLowerCase())
+            .filter((entry) => entry.length > 0),
+        ),
+      ]
+    }
+  }
   const text = (value, fallback) => (typeof value === 'string' && value.length > 0 ? value : fallback)
   const rawUpstream = text(raw?.upstream, DEFAULT_UPSTREAM)
   let upstream = rawUpstream
@@ -322,7 +368,10 @@ export function withDefaults(raw, logger = console) {
     upstream: upstream.replace(/\/+$/, ''),
     pin,
     pins,
+    providerPins,
     enforcement,
+    // 自动重试（0.10.0）：校验失败后补发的次数，0 = 拦下即结束（旧行为）。
+    retries: nonNegativeInteger(raw?.retries, DEFAULT_RETRIES),
     provider: text(raw?.provider, PROVIDER),
     model: text(raw?.model, MODEL),
     displayName: text(raw?.displayName, 'Cline Pass'),
@@ -368,6 +417,21 @@ export function pinFor(config, model) {
 }
 
 /**
+ * The allowed wire-provider list for one wire model (provider 级钉选的证据面).
+ *
+ * 空数组表示这个模型**没有** provider 级钉选 —— 与 {@link pinFor} 不同，这里没有全局
+ * 兜底：providerPins 只按模型配置，不存在「默认 provider」可言。
+ *
+ * @param config - the complete configuration.
+ * @param model - wire model id（带路由前缀）。
+ * @returns 允许的 provider 列表（已归一化小写），可能为空。
+ */
+export function providerPinFor(config, model) {
+  const perModel = model === undefined ? undefined : config.providerPins?.[model]
+  return Array.isArray(perModel) ? perModel : []
+}
+
+/**
  * Add the gateway pin to a parsed chat request body.
  *
  * @param body - the parsed request body (not mutated).
@@ -383,6 +447,46 @@ export function withPin(body, only) {
     body: { ...body, providerOptions: { ...existing, gateway: { ...gateway, only } } },
     pinned: true,
   }
+}
+
+/**
+ * Render a providerPins display name as the OpenRouter wire slug.
+ *
+ * 网关在 wire 上自报的名字（"Z.AI"）与请求 `provider.order` 认的 slug（"z-ai"）不是
+ * 同一种词形：实测（2026-10-14）`order: ["z.ai"]` 会让网关摈断连接或静默换道，slug
+ * 才是请求线语言。规则取保守近似：小写、非字母数字各串折成一个连字符、去首尾连字符 ——
+ * "z.ai" → "z-ai"，"openai-compatible-private" 原样。显示名里的大小写分词（如
+ * "InferenceNet"）推不出官方连字符位置，这里不做词典：配了就按规则给，而响应侧闸门
+ * 仍 fail closed —— slug 钉错只会整轮失败，不会放进别家。
+ *
+ * @param name - the configured (display) provider name.
+ * @returns the wire slug; empty for a name made of punctuation only.
+ */
+export function providerSlug(name) {
+  return String(name).trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
+/**
+ * Add the OpenRouter-protocol wire pin (top-level `provider.order`) to a parsed
+ * chat request body.
+ *
+ * 与 {@link withPin} 并列的第二种请求线钉法：渠道钉写给 Gateway 协议
+ * （`providerOptions.gateway.only`，实测被无视但留着无害），provider 钉写给
+ * OpenRouter 协议（顶层 `provider.order`，实测被执行）。请求自带非空 `order` 时
+ * **尊重不覆盖**（与 pi 侧 guard 同一取舍）；`allow_fallbacks` 一律关死 —— 轮转
+ * 正是这里要防的事。
+ *
+ * @param body - the parsed request body (not mutated).
+ * @param providers - the allowed providers (display names, already lower-cased).
+ * @returns the body to send, and the slugs actually written (`[]` when none were).
+ */
+export function withProviderOrder(body, providers) {
+  if (!isPlainObject(body)) return { body, order: [] }
+  const slugs = (Array.isArray(providers) ? providers : []).map(providerSlug).filter((slug) => slug.length > 0)
+  if (slugs.length === 0) return { body, order: [] }
+  const existing = isPlainObject(body.provider) ? body.provider : {}
+  if (Array.isArray(existing.order) && existing.order.length > 0) return { body, order: [] }
+  return { body: { ...body, provider: { ...existing, order: slugs, allow_fallbacks: false } }, order: slugs }
 }
 
 /**
@@ -808,8 +912,44 @@ function bodyText(body) {
  *
  * @param text - the request body as text.
  * @param cfg - the complete configuration.
- * @returns `{ text, only, model }` when rewritten, else `{ problem }`.
+ * @returns `{ text, only, expect, order, model }` when rewritten, else `{ problem }`; a
+ *   body where neither pin lands (no channel pin, or a provider pin whose names render
+ *   no slug) gets `{ untouched: true, expect?, model? }` — the request is sent as-is,
+ *   and its *response* is verified instead.
  */
+/**
+ * 这是不是一个会话的首个模型请求（0.11.2 修正，「匿名渠道提示」的触发条件）。
+ *
+ * 0.11.1 判「非 system 消息恰 1 条」，2026-10-15 实测漏报：dsh 的上下文插件
+ * （time-context 等）会把快照作为**额外的 user 消息**注进同一条请求 —— 真实首条
+ * 请求的 wire 形状是 `[system, user(问候), user(time-context)]`，非 system 计数
+ * 是 2，条件永不成立；手搓单 user 消息的测试体测不出这种偏差。会话标题生成
+ * （session-title-first-prompt-llm）走同一路由、同样没有 assistant 历史，`stream`
+ * 也是 true —— 但它的 `max_tokens` 是 4096（dsh-base 组合），主会话请求是 384000，
+ * 差两个数量级。所以三个条件合取：流式、历史里没有任何 assistant 消息（turn-1
+ * step-2 起工具回填必然引入，不会重复提示）、输出预算足够大（把标题请求挡在外面
+ * —— 它的输出直接变成会话标题，垫不得）。
+ *
+ * 0.11.3：预算字段认两种拼写（`max_tokens` / `max_completion_tokens`，pi-ai 的
+ * MAX_TOKENS_FIELDS 按 provider 配置二选一）—— 0.11.2 只认前者，真实请求若用另一
+ * 拼写则守卫恒假、提示永不垫（2026-10-15 二次漏报，playground 复测仍无 ⚠️）。
+ * 配套诊断：{@link pinnedBody} 把每次请求的形状记进状态文件 `lastRequestShape`
+ * （「提示为什么没垫」这类问题从此不用再猜）。
+ */
+function isConversationStart(body) {
+  if (body?.stream !== true) return false
+  const budget = Number(body.max_tokens ?? body.max_completion_tokens)
+  if (!(budget > 8192)) return false
+  const messages = Array.isArray(body?.messages) ? body.messages : null
+  if (messages === null) return false
+  for (const message of messages) {
+    if (isPlainObject(message) && message.role === 'assistant') return false
+  }
+  return true
+}
+
+/** 最近一次 chat 请求的判定相关形状（0.11.3 诊断；状态文件 `lastRequestShape`）。 */
+
 function pinnedBody(text, cfg) {
   let body
   try {
@@ -818,10 +958,33 @@ function pinnedBody(text, cfg) {
     return { problem: 'the body is not JSON' }
   }
   if (!isPlainObject(body)) return { problem: 'the body is not a JSON object' }
-  const only = pinFor(cfg, typeof body.model === 'string' ? body.model : undefined)
+  const model = typeof body.model === 'string' ? body.model : undefined
+  const only = pinFor(cfg, model)
+  const expect = providerPinFor(cfg, model)
   const applied = withPin(body, only)
-  if (!applied.pinned) return { untouched: true }
-  return { text: JSON.stringify(applied.body), only, model: body.model ?? null }
+  // 0.11.0：provider 钉不再只守响应 —— wire 顶层 `provider.order`（显示名 slug 化）
+  // 一并写上。deepseek 形状（回退网）对 order 无感（实测 routing 不变），两侧同配也安全。
+  const wired = withProviderOrder(applied.body, expect)
+  // 0.11.1：允许列表里有匿名渠道且这是会话首条消息 → 响应前垫一条提示
+  // （见 {@link withAnonymousNotice}）。直通形状（only 为空）不提示 —— 它没有渠道匿名问题。
+  // 0.11.2：首条的判定改成 {@link isConversationStart}（流式 + 无 assistant 历史 +
+  // 大输出预算）—— 0.11.1 的「非 system 恰 1 条」在真实 dsh 会话里永不成立。
+  const notice = only.includes(ANONYMIZED_CHANNEL) && isConversationStart(body)
+  // 0.11.3 诊断：把判定相关的请求形状留给状态文件 —— 提示垫没垫、为什么，从此有据可查。
+  const shapeMessages = Array.isArray(body.messages) ? body.messages : null
+  const shape = {
+    at: new Date().toISOString(),
+    model: body.model ?? null,
+    stream: body.stream === true,
+    maxTokens: body.max_tokens ?? null,
+    maxCompletionTokens: body.max_completion_tokens ?? null,
+    roles: shapeMessages === null ? null : shapeMessages.map((m) => (isPlainObject(m) ? m.role : '?')).join(','),
+    notice,
+  }
+  if (applied.pinned || wired.order.length > 0) {
+    return { text: JSON.stringify(wired.body), only, expect, order: wired.order, model: body.model ?? null, notice, shape }
+  }
+  return expect.length > 0 ? { untouched: true, expect, model: body.model ?? null, notice, shape } : { untouched: true, notice, shape }
 }
 
 // ── 校验：网关到底把这次请求交给了谁 ────────────────────────────────────────
@@ -831,8 +994,14 @@ function pinnedBody(text, cfg) {
 // 响应体里的 routing 元数据逐字相同，`fallbacksAvailable` 永远列出全部 16 个渠道。
 // 也就是说「钉选」只是请求里的一段装饰，真正的路由由网关自己决定。
 //
-// 所以钉选必须**在本地兑现**：读完响应，从 routing 里读出真正服务它的渠道，不在允许
-// 列表里就整条丢掉、让这次调用失败 —— 而不是把一个非官方渠道的答案交给模型。
+// 但同一网关对 OpenRouter 协议的顶层 `provider` 字段是**执行**的（实测 2026-10-14，
+// 各 5 发：glm-5.3-flash 带 order:["z-ai"] 5/5 由 Z.AI 服务，不带 2/5；"z.ai" 这种
+// 显示名拼法则会让网关掐断连接 —— 请求线只认 slug）。所以 0.11.0 起两层并用：
+// 请求侧把 provider.order 写上（slug 化），响应侧的本地闸照旧 fail closed。
+//
+// 渠道钉（deepseek 那套）没有可执行的请求线字段，仍只能在本地兑现：读完响应，从
+// routing 里读出真正服务它的渠道，不在允许列表里就整条丢掉、让这次调用失败 ——
+// 而不是把一个非官方渠道的答案交给模型。
 
 /**
  * 递归收集某个 JSON 文档里所有 `routing` 对象（网关把它放在
@@ -869,25 +1038,48 @@ function collectRouting(node, out = []) {
  */
 export function routingsOfText(text) {
   const raw = []
-  const take = (data) => {
+  for (const document of sseDocuments(text)) collectRouting(document, raw)
+  const seen = new Set()
+  const unique = []
+  for (const routing of raw) {
+    const key = JSON.stringify(routing)
+    if (seen.has(key)) continue
+    seen.add(key)
+    unique.push(routing)
+  }
+  return unique
+}
+
+/**
+ * 把一段响应文本按 SSE 规则拆成 JSON 文档。
+ *
+ * {@link routingsOfText} 与 {@link providersOfText} 的共享解析层；规则与 0.9.x 的
+ * routingsOfText 内嵌解析逐字等价：
+ *
+ * - 空行分帧；同一事件里的多个 `data:` 行先用 `\n` 拼接再 parse（消费者 `data.join('\n')`
+ *   的做法），拼不出合法 JSON 再逐行 parse 一次兜底 —— 更严只会 fail closed，不会放行。
+ * - `data: [DONE]` 与空负载跳过。
+ * - SSE 规则拆不出**任何**文档时，整段再按单个 JSON 文档 parse 一次兜底（非流式响应的
+ *   形状）；拆得出文档就不再兜底 —— 帧里没有证据就是没有，拿整段硬 parse 也变不出来。
+ *
+ * @param text - 响应体原文（SSE 或单个 JSON 文档）。
+ * @returns 解析成功的 JSON 文档数组，可能为空。
+ */
+function sseDocuments(text) {
+  const documents = []
+  const parse = (data) => {
     if (data.trim() === '' || data.trim() === '[DONE]') return
     try {
-      collectRouting(JSON.parse(data), raw)
+      documents.push(JSON.parse(data))
     } catch {
       // 半截帧：SSE 允许，跳过。
     }
   }
-  // 按**事件**组装，而不是逐行 parse：同一事件里的多个 `data:` 行要先用 `\n` 拼起来才是
-  // 它的负载（消费者的做法：`data.join('\n')`）。一个 JSON 被拆到两行 `data:` 是完全合法的
-  // SSE —— 逐行 parse 会两边都失败，那一处 routing 就**根本不会被看到**。
   let data = []
   const flush = () => {
     if (data.length === 0) return
-    take(data.join('\n'))
-    // 再逐行试一次：`data: [DONE]` 和 routing 挤在**同一个事件**里时，消费者拼接后只看
-    // 前缀是 [DONE] 就收工（那一行后面的 JSON 它根本不解析），但那些字节仍然是我们**保留
-    // 并转发**的 —— 里面藏着什么必须一并过闸。更严只会 fail closed，不会放行。
-    if (data.length > 1) for (const line of data) take(line)
+    parse(data.join('\n'))
+    if (data.length > 1) for (const line of data) parse(line)
     data = []
   }
   for (const line of String(text).split(/\r\n|\r|\n/)) {
@@ -899,20 +1091,42 @@ export function routingsOfText(text) {
     else if (line === 'data') data.push('')
   }
   flush()
-  if (raw.length === 0) {
+  if (documents.length === 0) {
     try {
-      collectRouting(JSON.parse(String(text)), raw)
+      documents.push(JSON.parse(String(text)))
     } catch {
-      // 不是 JSON：下面按「没有元数据」处理。
+      // 不是 JSON：按「没有文档」处理。
     }
+  }
+  return documents
+}
+
+/**
+ * 从一次响应里取出**顶层** `provider` 字段（去重，保持出现顺序）。
+ *
+ * 这是 provider 级钉选的证据源：api.cline.bot 的直通形状（实测 2026-10-14，
+ * glm-5.3-flash 由 Z.AI / InferenceNet / Together 轮转服务）每个 chunk 都带顶层
+ * `provider` 字段，而回退网形状（model 回显 `vmc/…-contributor-fallbacks`）没有 ——
+ * 缺失就是「无法证明」，与渠道钉读不到 routing 元数据同等处理（fail closed）。
+ *
+ * 刻意**只读顶层**：routing 元数据里的 `providerAttempts[].provider`、`delta.provider`
+ * 之类的嵌套键不是直通证据 —— 逐层收集会把「试过别家但失败」的 attempt 名也算进来，
+ * 语义就滑回渠道钉那套 attempt 判定了。
+ *
+ * @param text - 响应体原文（SSE 或单个 JSON 文档）。
+ * @returns 去重后的顶层 provider 字符串数组（原始拼写），可能为空。
+ */
+export function providersOfText(text) {
+  const raw = []
+  for (const document of sseDocuments(text)) {
+    if (isPlainObject(document) && typeof document.provider === 'string' && document.provider.length > 0) raw.push(document.provider)
   }
   const seen = new Set()
   const unique = []
-  for (const routing of raw) {
-    const key = JSON.stringify(routing)
-    if (seen.has(key)) continue
-    seen.add(key)
-    unique.push(routing)
+  for (const provider of raw) {
+    if (seen.has(provider)) continue
+    seen.add(provider)
+    unique.push(provider)
   }
   return unique
 }
@@ -1018,6 +1232,99 @@ export function judgeRoutings(routings, allowed) {
     first ??= verdict
   }
   return { ...first, seen: list.length }
+}
+
+/**
+ * 判定一次响应的顶层 `provider` 字段是否证明「这次响应由允许的 provider 提供」。
+ *
+ * 与 {@link judgeRouting} 的渠道判定**并列**的第二种证据：直通模型（`pins: []`）的响应
+ * 没有 routing 元数据可查，但每帧都带网关写的顶层 `provider`（见 {@link providersOfText}
+ * 的说明）。判定规则沿用同一套直觉：
+ *
+ * - 一个证据都没有 = 不可证明 = 拒（fail closed）；
+ * - 任何一处的 provider 不在允许列表里就拒（按出现顺序，第一个越界的当被告）；
+ * - 比较大小写不敏感（网关在 wire 上自己决定大小写：实测 "Z.AI" / "InferenceNet" /
+ *   "Together"），但 reason 与 culprit 保留**原始拼写**，状态文件里才对得上网关的说法。
+ *
+ * @param providers - {@link providersOfText} 的返回值。
+ * @param expected - 允许的 provider 列表（已归一化小写）。
+ * @param routings - 同一响应里的 routing 对象；仅用于「无证据」时点名回退网渠道。
+ * @returns `{ ok: true, provider }` 或 `{ ok: false, reason, culprit }`。
+ */
+export function judgeProviders(providers, expected, routings = []) {
+  const list = expected.join('/')
+  if (providers.length === 0) {
+    // 直通形状没有 routing 元数据，但**回退网形状**有：把它当被告带出去，状态文件里
+    // 能直接看到这次实际落在了哪个渠道。
+    const culprit = routings.length > 0 ? routings[routings.length - 1] : null
+    return { ok: false, reason: `响应里没有顶层 provider 字段，无法证明它由 ${list} 提供`, culprit }
+  }
+  for (const provider of providers) {
+    if (!expected.includes(provider.trim().toLowerCase())) {
+      return { ok: false, reason: `provider=${provider}，允许的是 ${list}`, culprit: { finalProvider: provider } }
+    }
+  }
+  return { ok: true, provider: providers[0].trim().toLowerCase() }
+}
+
+/**
+ * 两种证据的合并判定：渠道钉看 routing 元数据，provider 钉看顶层 provider 字段；同一
+ * 模型两侧都配置了就必须**都**过关（语义取严）。失败时先到的被告先出场（provider 在
+ * 前 —— 它是「这次由谁直接服务」的直接说法）。成功结论合并：`provider` 取 provider
+ * 字段的归一化值，`attempts` 仍来自 routing。
+ *
+ * @param routings - {@link routingsOfText} 的返回值。
+ * @param providers - {@link providersOfText} 的返回值。
+ * @param channels - 渠道钉的允许列表（空 = 不查 routing）。
+ * @param expectedProviders - provider 钉的允许列表（空 = 不查 provider 字段）。
+ * @returns `{ ok: true, provider, attempts }` 或 `{ ok: false, reason, culprit }`。
+ */
+function judgeEvidence(routings, providers, channels, expectedProviders) {
+  const providerVerdict = expectedProviders.length > 0 ? judgeProviders(providers, expectedProviders, routings) : null
+  const routingVerdict = channels.length > 0 ? judgeRoutings(routings, channels) : null
+  if (providerVerdict !== null && !providerVerdict.ok) return providerVerdict
+  if (routingVerdict !== null && !routingVerdict.ok) return routingVerdict
+  if (providerVerdict !== null && routingVerdict !== null) return { ok: true, provider: providerVerdict.provider, attempts: routingVerdict.attempts ?? 0 }
+  return providerVerdict ?? routingVerdict ?? { ok: true, provider: null, attempts: 0 }
+}
+
+/**
+ * 早期裁决（自动重试用，0.10.0）：**只看已有证据，能给结论就给，给不了就是悬而未决**。
+ *
+ * 与 {@link judgeEvidence} 的差别在「无证据」的语义上。收尾裁决读不到任何证据就是
+ * fail closed —— 那是整条响应读完后的最终发言；而早期裁决发生在流的中途，「还没读到
+ * 证据」只说明证据帧没到，不是缺席。所以这里每个证据面只在**已经收到证据**时才参与：
+ *
+ * - provider 面有证据且失败，或 routing 面有证据且失败 → 返回那个失败（可重试 ——
+ *   此刻还没有任何字节交付给消费者）；
+ * - 有证据且**都**过关 → 返回成功（「到此为止的证据都合格」—— 后面若翻脸，由收尾
+ *   裁决兜底，那时内容已交付，不再重试）；
+ * - 任何一面没有证据 → null（悬而未决，继续等下一帧）。
+ *
+ * @param routings - 已收到的 routing 证据。
+ * @param providers - 已收到的顶层 provider 证据。
+ * @param channels - 渠道钉的允许列表（空 = 该面不参与）。
+ * @param expectedProviders - provider 钉的允许列表（空 = 该面不参与）。
+ * @returns `{ ok, … }`（有证据可判）或 null（悬而未决）。
+ */
+function earlyVerdict(routings, providers, channels, expectedProviders) {
+  const providerVerdict = expectedProviders.length > 0 && providers.length > 0 ? judgeProviders(providers, expectedProviders, routings) : null
+  const routingVerdict = channels.length > 0 && routings.length > 0 ? judgeRoutings(routings, channels) : null
+  if (providerVerdict !== null && !providerVerdict.ok) return providerVerdict
+  if (routingVerdict !== null && !routingVerdict.ok) return routingVerdict
+  return providerVerdict ?? routingVerdict
+}
+
+/**
+ * 状态文件与错误文案里的「允许列表」：provider 钉在场时把两侧的期望合并展示 —— 只用
+ * 渠道钉时与旧行为逐字一致。
+ *
+ * @param allowed - 渠道钉的允许列表。
+ * @param expectedProviders - provider 钉的允许列表。
+ * @returns 合并后的展示列表。
+ */
+function expectedList(allowed, expectedProviders) {
+  return expectedProviders.length > 0 ? (allowed.length > 0 ? [...allowed, ...expectedProviders] : [...expectedProviders]) : allowed
 }
 
 /**
@@ -1147,7 +1454,7 @@ function refusalMessage(streamed, offender, allowed) {
   const shown = displayableChannel(offender)
   const who =
     offender === null
-      ? '没能证明来源（响应里没有可用的 routing 元数据）'
+      ? '没能证明来源（响应里没有可用的来源证据）'
       : shown === null
         ? '由允许列表之外的渠道提供（名称未通过展示检查，原始名见状态文件的 violations 与错误 detail）'
         : `由 ${shown} 提供`
@@ -1261,9 +1568,13 @@ export function createFetchPin(config, logger = console) {
   let calling = false
   let hookState = 'absent'
   let lastPin = null
-  const counters = { seen: 0, pinned: 0, skipped: 0, blocked: 0, unverified: 0 }
+  /** 最近一次 provider 级钉选请求（providerPins 模型；0.11.0 起请求线也带 provider.order，响应由 wire 顶层的 provider 字段裁决）。 */
+  let lastProviderPin = null
+  const counters = { seen: 0, pinned: 0, providerPinned: 0, skipped: 0, blocked: 0, unverified: 0, retried: 0, anonymized: 0 }
   /** 最近一次校验通过 / 被拦下的记录（status 文件里能直接看到「网关把它交给了谁」）。 */
   let lastVerified = null
+  /** 最近一次由匿名渠道服务的请求（0.11.1；渠道名已被网关匿名化，见 {@link ANONYMIZED_CHANNEL}）。 */
+  let lastAnonymized = null
   let lastViolation = null
   /**
    * 违规**历史**：只留最后一条的 `lastViolation` 答不了「今天被拦的那几次各自路由去哪」。
@@ -1274,6 +1585,8 @@ export function createFetchPin(config, logger = console) {
   let lastUnverified = null
   /** 最近一次「这个请求没被钉上」以及原因（README 让用户按 seen/pinned 查的就是它）。 */
   let lastSkipped = null
+  /** 最近一次 chat 请求的判定相关形状（0.11.3 诊断；状态文件 `lastRequestShape`）。 */
+  let lastRequestShape = null
   /** provider profile 的登记结果，由 {@link noteProvision} 在 apply 里填。 */
   let provision = null
   /** 与 `provision` 配套的一句话（`failed` / `mismatch` / `repaired` 的原因）。 */
@@ -1312,16 +1625,23 @@ export function createFetchPin(config, logger = console) {
           provisionReason,
           upstream: cfg.upstream,
           pin: cfg.pin,
+          providerPins: cfg.providerPins,
           profileBaseURL: profileBaseURL(),
           counters: { ...counters },
           lastPin,
+          lastProviderPin,
           enforcement: cfg.enforcement,
+          // 自动重试的配置值（0.10.0）：0 = 拦下即结束；与 counters.retried 对读。
+          retries: cfg.retries,
           lastVerified,
+          lastAnonymized,
           lastViolation,
           // 最近 {@link VIOLATION_HISTORY_LIMIT} 条违规，按时间正序（最新在最后）。
           violations: [...violations],
           lastUnverified,
           lastSkipped,
+          // 0.11.3 诊断：最近一次 chat 请求的判定相关形状（提示垫没垫、为什么）。
+          lastRequestShape,
           // Config keys that were read and ignored, so an upgrade from the
           // port era is visible even where plugin warnings are not.
           ignoredOptions: cfg.ignoredOptions ?? [],
@@ -1352,7 +1672,13 @@ export function createFetchPin(config, logger = console) {
    * 返回值里 `{ kind: 'skip', reason }` 是**唯一**的「没钉上」形状：原因在这里产生，由调用方
    * 记进状态文件并打日志。计数与落盘都只发生在调用方那一处，免得两边各加一次。
    *
-   * @returns `{ kind: 'init', init }`、`{ kind: 'request', request }` 或 `{ kind: 'skip', reason }`。
+   * 每种可校验的形状都带 `resend(attempt) → [input, init]`（自动重试，0.10.0）：第 0 次
+   * 返回的就是首次发送要用的参数，第 ≥1 次返回**可重发**的等价参数 —— `Request` 的 body
+   * 会被 fetch 消费掉，重发必须用留存的 body 文本重建（字符串/Buffer 的 init body 不会被
+   * 消费，可原样重发）。
+   *
+   * @returns `{ kind: 'init', init, resend }`、`{ kind: 'request', request, resend }`、
+   *   `{ kind: 'provider', next, resend }` 或 `{ kind: 'skip', reason }`。
    */
   async function rewrite(input, init) {
     const direct = init ?? {}
@@ -1361,16 +1687,37 @@ export function createFetchPin(config, logger = console) {
       const { text, skip } = bodyText(direct.body)
       if (skip !== undefined) return { kind: 'skip', reason: skip }
       const next = pinnedBody(text, cfg)
-      if (next.text === undefined) return { kind: 'skip', reason: next.problem ?? NOTHING_TO_PIN }
-      return { kind: 'init', init: { ...direct, body: next.text, headers: withoutBodyLength(direct.headers ?? input?.headers) }, next }
+      if (next.shape !== undefined) lastRequestShape = next.shape
+      if (next.text === undefined) {
+        // provider 级钉选的兜底形状（0.11.0 起罕见：providerPins 配了但 slug 推不出，
+        // 请求线没得注入）：body 一字不动地发（`{ kind: 'provider' }`），由响应侧兑现
+        // 校验 —— 与 skip 的区别在于它的响应仍受闸管，不算「没钉上」。
+        // init body（字符串/Buffer）不会被 fetch 消费，重试原样重发。
+        if (next.untouched && next.expect?.length > 0) return { kind: 'provider', next, resend: () => [input, init] }
+        return { kind: 'skip', reason: next.problem ?? NOTHING_TO_PIN }
+      }
+      const pinned = { ...direct, body: next.text, headers: withoutBodyLength(direct.headers ?? input?.headers) }
+      return { kind: 'init', init: pinned, next, resend: () => [input, pinned] }
     }
     // A `Request` carries its own body; rebuild it with the pinned one, keeping
-    // the method, headers and signal it was constructed with.
+    // the method, headers and signal it was constructed with. The body text is
+    // kept for rebuilds: a Request's body stream is consumed by the first send,
+    // so a retry needs a fresh Request.
     if (typeof Request === 'function' && input instanceof Request) {
-      const next = pinnedBody(await input.clone().text(), cfg)
-      if (next.text === undefined) return { kind: 'skip', reason: next.problem ?? NOTHING_TO_PIN }
+      const raw = await input.clone().text()
+      const next = pinnedBody(raw, cfg)
+      if (next.shape !== undefined) lastRequestShape = next.shape
+      if (next.text === undefined) {
+        if (next.untouched && next.expect?.length > 0) {
+          const rebuilt = () => new Request(input, { ...direct, body: raw, headers: withoutBodyLength(direct.headers ?? input.headers) })
+          return { kind: 'provider', next, resend: (attempt) => (attempt === 0 ? [input, init] : [rebuilt(), undefined]) }
+        }
+        return { kind: 'skip', reason: next.problem ?? NOTHING_TO_PIN }
+      }
       const headers = withoutBodyLength(direct.headers ?? input.headers)
-      return { kind: 'request', request: new Request(input, { ...direct, body: next.text, headers }), next }
+      const rebuilt = () => new Request(input, { ...direct, body: next.text, headers })
+      const request = rebuilt()
+      return { kind: 'request', request, next, resend: (attempt) => [attempt === 0 ? request : rebuilt(), undefined] }
     }
     return { kind: 'skip', reason: 'it carries no readable body' }
   }
@@ -1407,14 +1754,25 @@ export function createFetchPin(config, logger = console) {
   /**
    * 记一次「网关没把请求交给允许的渠道」。
    *
+   * 两种结局共用这一处，靠 `retried` 区分：
+   *
+   * - **retried: false（最终拒绝）**：这次响应不会交付，调用方拿到拒绝。`blocked` 计数、
+   *   `lastViolation` 单槽都只属于它 —— 「上次被拦的是谁」必须指向调用方真的看到的拒绝，
+   *   被重试掉的中途尝试不能占这个槽。
+   * - **retried: true（被重试掉的尝试）**：这次响应同样被拦下、内容同样没有交付，但紧接着
+   *   会补发一次（自动重试，0.10.0）。计入 `retried` 而不是 `blocked`，`lastViolation`
+   *   不动；violations 历史照记 —— 审计面要回答的是「网关把它交给了谁」，被重试掉的那次
+   *   也是网关的一次真实路由。
+   *
    * @param reason - 判定失败的说明。
-   * @param allowed - 允许的渠道列表。
-   * @param routing - 读出（或读不出）的 routing。
+   * @param allowed - 允许的渠道列表（合并 provider 期望后的展示面）。
+   * @param routing - 读出（或读不出）的 routing / culprit。
    * @param url - 这次被拦下的请求地址（进历史，便于对上「哪一轮」）。
-   * @returns 给调用方的响应（strict 拒绝，warn 放行由调用方决定）。
+   * @param retried - 这次拦下之后是否紧接着自动重试。
    */
-  function recordViolation(reason, allowed, routing, url = null) {
-    counters.blocked += 1
+  function recordViolation(reason, allowed, routing, url = null, retried = false) {
+    if (retried) counters.retried += 1
+    else counters.blocked += 1
     const entry = {
       at: new Date().toISOString(),
       url,
@@ -1422,13 +1780,15 @@ export function createFetchPin(config, logger = console) {
       reason,
       finalProvider: typeof routing?.finalProvider === 'string' ? routing.finalProvider : null,
       fallbacksAvailable: Array.isArray(routing?.fallbacksAvailable) ? routing.fallbacksAvailable.slice(0, 20) : null,
+      retried,
     }
-    lastViolation = { ...entry }
+    if (!retried) lastViolation = { ...entry }
     // 历史比单槽多答一个问题：**今天被拦的每一次**各自路由去哪。`at` 是唯一能把它和
     // dsh 会话日志里那条 `turn/end` 错误对上的字段，所以必须写。
     violations = [...violations, entry].slice(-VIOLATION_HISTORY_LIMIT)
     publish()
-    logger.error?.('[clinepass] ✗ 拦下一条不是 %s 提供的响应：%s', allowed.join('/'), reason)
+    if (retried) logger.warn?.('[clinepass] ↻ 拦下一条不是 %s 提供的响应（%s），自动重试…', allowed.join('/'), reason)
+    else logger.error?.('[clinepass] ✗ 拦下一条不是 %s 提供的响应：%s', allowed.join('/'), reason)
   }
 
   /**
@@ -1454,27 +1814,163 @@ export function createFetchPin(config, logger = console) {
   }
 
   /**
-   * 校验一次「钉选」请求的响应确实由允许的渠道提供，并把结论落到状态文件。
+   * 直通形状的**早期取证**：把 SSE 流的头几帧读出来，凑齐第一份证据就提前裁决 ——
+   * 这是自动重试能对**流式**响应生效的全部依据。
    *
-   * 两条路径按响应类型分派：
+   * 渠道钉做不到这一点：routing 元数据在响应体**最后一帧**（信息论下界，见
+   * {@link streamedVerification} 的说明），早期取证等于把整条流缓冲掉，流式就没了。
+   * 所以调用方只在 **provider 钉在场**（`expectedProviders.length > 0`）时才走到这里 ——
+   * 直通形状实测每帧都带顶层 `provider` 字段，通常第一帧就够裁决。渠道侧的证据若恰好
+   * 也在早期出现（两种钉选并存的形状），{@link earlyVerdict} 同样会看到它。
    *
-   * - **SSE（chat 的正常形态）**：见 {@link streamedVerification}。内容逐帧立即转发
-   *   （保住逐字显示与分片时间戳，TPS 才有意义），只把终止帧扣到裁决之后；违规时
-   *   中断响应体，让这次调用作废。
-   * - **非 SSE（一次性 JSON）**：本来就没有流式可言，读完整条再判，违规返回 400。
+   * 三种出口：
    *
-   * 非 2xx 一律原样放行：那是一次失败的调用（429/5xx/…），没有内容会被「使用」，
-   * 而把网关的错误改写成自己的错误会掩盖配额、限流这些 dsh 需要看到的东西。
+   * - **读到证据帧就停**（`done: false`）：裁决是 {@link earlyVerdict} 的结论 —— 失败
+   *   → 调用方补发重试（没有字节交付过，完全透明）；成功 → 调用方把 `consumed` 字节
+   *   连同 reader 一起移交 {@link streamedVerification}，流式照常继续。
+   * - **读到终止帧 / 上游关流**（`done: true`）：整条响应都进了 `consumed`，用
+   *   {@link judgeEvidence} 做收尾裁决 —— 通过 → 调用方按缓冲路径放行；失败 → 也还能
+   *   重试（同样没有字节交付过），重试额度用尽才拒绝。
+   * - **读流失败**：记 `unverified`（裁决根本没发生），原样抛回 —— 与
+   *   {@link streamedVerification} 的读流失败同语义，只是发生在响应交付之前。
    *
-   * @param response - 上游响应。
-   * @param allowed - 这次请求的允许渠道列表。
+   * @param response - 上游 2xx SSE 响应（body 尚未被读过）。
+   * @param allowed - 渠道钉的允许列表。
+   * @param expectedProviders - provider 钉的允许列表。
+   * @param url - 请求 URL（记录用）。
+   * @param signal - 调用方的取消信号。
+   * @returns `{ done, verdict, consumed, reader, text }`；`text` 仅在 `done: true` 时有效（整条响应的解码文本）。
+   */
+  async function peekStreamEvidence(response, allowed, expectedProviders, url, signal) {
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let pending = new Uint8Array(0)
+    let consumed = new Uint8Array(0)
+    const routings = []
+    const providers = []
+    /** 处理一帧：收证据，然后停在「证据已出现」或「终止帧」上。 */
+    const take = (frame) => {
+      const text = decoder.decode(frame)
+      for (const routing of routingsOfText(text)) routings.push(routing)
+      for (const provider of providersOfText(text)) providers.push(provider)
+      if (isTerminatorFrame(frame)) {
+        const verdict = judgeEvidence(routings, providers, allowed, expectedProviders)
+        return { done: true, verdict, consumed, reader, text: new TextDecoder().decode(consumed) }
+      }
+      const early = earlyVerdict(routings, providers, allowed, expectedProviders)
+      if (early !== null) return { done: false, verdict: early, consumed, reader, text: null }
+      return null
+    }
+    for (;;) {
+      while (pending.length > 0) {
+        const end = nextFrameEnd(pending)
+        if (end === -1) break
+        const frame = pending.slice(0, end)
+        pending = pending.slice(end)
+        const stopped = take(frame)
+        if (stopped !== null) return stopped
+      }
+      let chunk
+      try {
+        chunk = await reader.read()
+      } catch (error) {
+        // 取消（用户按停止）或 socket 断：裁决没发生，记 unverified 后原样抛回。
+        const aborted = signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')
+        recordUnverified(url, aborted ? 'aborted' : 'stream failed', error)
+        throw error
+      }
+      if (chunk.done) {
+        // 上游没发空行就关流：剩下的是最后一帧，证据与文本都要算上。
+        if (pending.length > 0) {
+          const text = decoder.decode(pending)
+          pending = new Uint8Array(0)
+          for (const routing of routingsOfText(text)) routings.push(routing)
+          for (const provider of providersOfText(text)) providers.push(provider)
+        }
+        const verdict = judgeEvidence(routings, providers, allowed, expectedProviders)
+        return { done: true, verdict, consumed, reader, text: new TextDecoder().decode(consumed) }
+      }
+      pending = concatBytes(pending, chunk.value)
+      consumed = concatBytes(consumed, chunk.value)
+    }
+  }
+
+  /**
+   * 发送一次「钉选」请求并校验响应确实由允许的渠道（routing 元数据）或允许的 provider
+   * （wire 顶层的 `provider` 字段）提供；校验失败时按 `cfg.retries` **自动补发**，把结论
+   * 落到状态文件。
+   *
+   * 为什么要重试（0.10.0）：glm-5.3-flash 这类直通模型由网关在多家 provider 之间**按请求
+   * 轮转**，钉住其中一家意味着固定比例的轮次被闸拦下 —— 而下一次请求大概率就轮到允许的
+   * provider。补发对调用方完全透明：重试只发生在**没有任何内容交付**的时刻 ——
+   *
+   * - **缓冲路径**：整条响应读完再判，失败时内容从未离开网关，补发无痕。
+   * - **SSE + provider 钉**：{@link peekStreamEvidence} 在第一个证据帧上提前裁决，失败时
+   *   还没有任何帧交付过；成功（或渠道面证据未到）就移交 {@link streamedVerification}
+   *   照常流式。
+   * - **SSE + 仅渠道钉**：证据在最后一帧，内容必然已经流出 —— **不重试**（重试只会造成
+   *   内容重复），维持「边流边校验、违规中断」的原状。
+   *
+   * 补发请求由 `resend(attempt)` 生成（{@link rewrite} 为每种请求形状准备好重发闭包），
+   * 与首次发送逐字同参。每条被拦下的尝试都进 violations 历史（`retried` 字段区分结局）；
+   * 重试额度用尽才以 {@link refusalResponse} / 流中断收场。`warn` 从不重试（它的契约是
+   * 「只记录、照常交付」），`off` 根本不会走到这里。
+   *
+   * 非 2xx 一律原样放行（任何一次尝试上都成立）：那是一次失败的调用（429/5xx/…），没有
+   * 内容会被「使用」，而把网关的错误改写成自己的错误会掩盖配额、限流这些 dsh 需要看到的
+   * 东西。
+   *
+   * @param resend - `(attempt) => fetch 参数`：第 `attempt` 次发送的 `(input, init)`。
+   * @param allowed - 这次请求的允许渠道列表（渠道钉的证据面）。
    * @param url - 请求 URL（记录用）。
    * @param signal - 调用方的取消信号（用户中止这一轮时不该被记成一次「渠道违规」）。
+   * @param expectedProviders - 这次请求的允许 provider 列表（provider 钉的证据面；空 = 不查）。
+   * @param attempt - 当前是第几次尝试（0 起）；递归补发时 +1。
    * @returns 放行的响应，或被拒/被中断的响应。
    */
-  async function verifyPinned(response, allowed, url, signal) {
+  async function sendVerified(resend, allowed, url, signal, expectedProviders = [], attempt = 0) {
+    const expected = expectedList(allowed, expectedProviders)
+    const response = await Promise.resolve(resend(attempt))
     if (!response.ok) return response
-    if (isEventStream(response) && response.body !== null) return streamedVerification(response, allowed, url, signal)
+    if (isEventStream(response) && response.body !== null) {
+      // 流式 + strict + provider 钉在场：**总是**先做早期取证（此阶段没有任何字节交付），
+      // 裁决决定去向：失败 → 额度内无痕补发；额度用尽后按证据形状分流 —— 有证据帧的
+      //（早期就判了失败）移交流式照常走「违规中断」，证据缺席的（回退网形状）以缓冲
+      // 400 收场 —— 中断只在内容已流出时才有意义，这里内容从未流出。证据合格 → 移交流
+      // 式。无 provider 钉（纯渠道钉）或非 strict：与旧行为逐字一致。
+      if (cfg.enforcement === 'strict' && expectedProviders.length > 0) {
+        const early = await peekStreamEvidence(response, allowed, expectedProviders, url, signal)
+        const canRetry = attempt < cfg.retries
+        if (!early.done && !early.verdict.ok) {
+          if (canRetry) {
+            // 第一个证据帧就判了失败，而且还没有任何字节交付 —— 无痕补发。
+            recordViolation(early.verdict.reason, expected, early.verdict.culprit ?? null, url, true)
+            early.reader.cancel().catch(() => {})
+            return sendVerified(resend, allowed, url, signal, expectedProviders, attempt + 1)
+          }
+          // 额度用尽：退回旧流式语义 —— 已读字节一并移交，内容照常流出，收尾裁决违规中断。
+          return streamedVerification(response, allowed, url, signal, expectedProviders, { pending: early.consumed, reader: early.reader })
+        }
+        if (early.done) {
+          // 整条流都进了缓冲（终止帧已到或上游先关了流）：按缓冲路径收尾。
+          if (early.verdict.ok) {
+            recordVerified(url, early.verdict, expected)
+            return bufferedResponse(early.text, response)
+          }
+          // 证据缺席（回退网形状）或越界：同样没有**任何字节交付**过，额度内无痕补发，
+          // 用尽才缓冲 400 拒绝。0.11.0 修正：此前 peek 条件带着 `attempt < retries`，
+          // 最后一次尝试直接落到流式收尾，`retried` 恒 0、以流中断收场 —— 与设计意图
+          // （「照样补发 2 次，最终以 400 拒绝收场」）相悖，见 test-fetch.mjs §15 的重试
+          // 预算用例。
+          recordViolation(early.verdict.reason, expected, early.verdict.culprit ?? null, url, canRetry)
+          if (canRetry) return sendVerified(resend, allowed, url, signal, expectedProviders, attempt + 1)
+          return refusalResponse(early.verdict.reason, expected, early.verdict.culprit ?? null)
+        }
+        // 早期证据合格：把已读字节与 reader 一起移交，流式照常（收尾裁决仍会兜底）。
+        return streamedVerification(response, allowed, url, signal, expectedProviders, { pending: early.consumed, reader: early.reader })
+      }
+      return streamedVerification(response, allowed, url, signal, expectedProviders)
+    }
     let text
     try {
       text = await response.text()
@@ -1483,23 +1979,31 @@ export function createFetchPin(config, logger = console) {
       // 「已中止」路径（否则会显示成一条莫名其妙的 400，还污染 blocked 计数）。
       if (signal?.aborted === true || (error instanceof Error && error.name === 'AbortError')) throw error
       const reason = `响应体读取失败（${error instanceof Error ? error.message : String(error)}），无法确认它由允许的渠道提供`
-      recordViolation(reason, allowed, null, url)
-      return refusalResponse(reason, allowed)
+      recordViolation(reason, expected, null, url)
+      return refusalResponse(reason, expected)
     }
     let routings = []
+    let providers = []
     try {
       routings = routingsOfText(text)
     } catch {
       routings = []
     }
-    const verdict = judgeRoutings(routings, allowed)
+    try {
+      providers = providersOfText(text)
+    } catch {
+      providers = []
+    }
+    const verdict = judgeEvidence(routings, providers, allowed, expectedProviders)
     if (verdict.ok) {
-      recordVerified(url, verdict, allowed)
+      recordVerified(url, verdict, expected)
       return bufferedResponse(text, response)
     }
-    recordViolation(verdict.reason, allowed, verdict.culprit ?? null, url)
+    const retried = cfg.enforcement === 'strict' && attempt < cfg.retries
+    recordViolation(verdict.reason, expected, verdict.culprit ?? null, url, retried)
+    if (retried) return sendVerified(resend, allowed, url, signal, expectedProviders, attempt + 1)
     if (cfg.enforcement === 'warn') return bufferedResponse(text, response)
-    return refusalResponse(verdict.reason, allowed, verdict.culprit ?? null)
+    return refusalResponse(verdict.reason, expected, verdict.culprit ?? null)
   }
 
   /**
@@ -1525,27 +2029,42 @@ export function createFetchPin(config, logger = console) {
    * 取消（用户按停止）不是违规：上游 body 会先报错，裁决根本不会发生，所以不会污染
    * `blocked` 计数。
    *
+   * `pre` 是自动重试（0.10.0）的接缝：{@link sendVerified} 的早期取证可能已经读走了流的
+   * 头几个字节（并把 reader 锁住），通过这里移交 —— `pending` 先垫上已读字节，`reader`
+   * 复用同一个（body 已锁，不能再次 `getReader()`）。已垫的字节会照常走 `note()` 与逐帧
+   * 转发，证据去重靠 `seen*` 集合，不会重复计数。不传（默认 null）就是从零开始，行为与
+   * 0.9.x 逐字一致。
+   *
    * @param response - 上游 2xx SSE 响应。
    * @param allowed - 允许的渠道列表。
    * @param url - 请求 URL（记录用）。
+   * @param expectedProviders - 允许的 provider 列表（provider 钉的证据面；空 = 不查）。
+   * @param pre - 早期取证移交的 `{ pending, reader }`；不传 = 从零开始。
    * @returns 逐帧放行、按裁决收尾的响应。
    */
-  function streamedVerification(response, allowed, url, signal) {
+  function streamedVerification(response, allowed, url, signal, expectedProviders = [], pre = null) {
+    // 错误文案与状态文件里的「允许列表」：provider 钉在场时把两侧的期望一起说清。
+    const expected = expectedList(allowed, expectedProviders)
     const holdTerminator = cfg.enforcement === 'strict'
     /** 保留的 routing 处数上界：正常响应只有一处，超界按「无法证明」处理。 */
     const MAX_ROUTINGS = 64
+    /** 顶层 provider 个数上界：直通形状每帧同值（去重后 1 个），超界按「无法证明」处理。 */
+    const MAX_PROVIDERS = 64
     const decoder = new TextDecoder()
     let reader = null
-    let pending = new Uint8Array(0)
+    let pending = pre?.pending ?? new Uint8Array(0)
     const routings = []
     const seenRouting = new Set()
     let routingOverflow = false
+    const providers = []
+    const seenProvider = new Set()
+    let providerOverflow = false
     let sourceEnded = false
     let concluded = false
     let cancelled = false
 
-    /** 按背压向上游要字节；第一次真正要数据时才把 body 锁成 reader。 */
-    const source = () => (reader ??= response.body.getReader())
+    /** 按背压向上游要字节；第一次真正要数据时才把 body 锁成 reader（早期取证可能已锁）。 */
+    const source = () => (reader ??= pre?.reader ?? response.body.getReader())
     /**
      * 记下这一帧里出现的**每一处** routing（按内容去重）。
      *
@@ -1554,7 +2073,10 @@ export function createFetchPin(config, logger = console) {
      * 处理（见 conclude），不再继续攒。
      */
     const note = (frame) => {
-      for (const routing of routingsOfText(decoder.decode(frame))) {
+      // 两种证据都要在这一帧里收齐：TextDecoder 是有状态的（跨帧的多字节切分靠它），
+      // 一帧只解码一次，routing 与 provider 各自过闸。
+      const text = decoder.decode(frame)
+      for (const routing of routingsOfText(text)) {
         const key = JSON.stringify(routing)
         if (seenRouting.has(key)) continue
         if (seenRouting.size >= MAX_ROUTINGS) {
@@ -1563,6 +2085,15 @@ export function createFetchPin(config, logger = console) {
         }
         seenRouting.add(key)
         routings.push(routing)
+      }
+      for (const provider of providersOfText(text)) {
+        if (seenProvider.has(provider)) continue
+        if (seenProvider.size >= MAX_PROVIDERS) {
+          providerOverflow = true
+          continue
+        }
+        seenProvider.add(provider)
+        providers.push(provider)
       }
     }
     /**
@@ -1578,23 +2109,30 @@ export function createFetchPin(config, logger = console) {
       concluded = true
       // 判决做完了，上游剩下的字节不再需要（消费者也在 [DONE] 处停了）：顺手放掉 socket。
       if (reader !== null) reader.cancel().catch(() => {})
-      const verdict = routingOverflow
-        ? { ok: false, reason: `响应里出现了超过 ${MAX_ROUTINGS} 处各不相同的 routing 元数据，无法证明它由允许的渠道提供`, culprit: null }
-        : judgeRoutings(routings, allowed)
+      // 溢出按**在用的证据面**判定：provider 钉在场看 provider 溢出，渠道钉在场看
+      // routing 溢出；两者都在场时任一溢出都按无法证明处理。
+      const overflows = []
+      if (expectedProviders.length > 0 && providerOverflow) {
+        overflows.push(`响应里出现了超过 ${MAX_PROVIDERS} 个各不相同的顶层 provider 字段，无法证明它由 ${expectedProviders.join('/')} 提供`)
+      }
+      if (allowed.length > 0 && routingOverflow) {
+        overflows.push(`响应里出现了超过 ${MAX_ROUTINGS} 处各不相同的 routing 元数据，无法证明它由允许的渠道提供`)
+      }
+      const verdict = overflows.length > 0 ? { ok: false, reason: overflows[0], culprit: null } : judgeEvidence(routings, providers, allowed, expectedProviders)
       if (verdict.ok) {
-        recordVerified(url, verdict, allowed)
+        recordVerified(url, verdict, expected)
         if (heldFrame !== null) controller.enqueue(heldFrame)
         controller.close()
         return
       }
-      recordViolation(verdict.reason, allowed, verdict.culprit ?? null, url)
+      recordViolation(verdict.reason, expected, verdict.culprit ?? null, url)
       if (!holdTerminator) {
         // warn：终止帧早就放行了，这里只需要收尾。
         controller.close()
         return
       }
       // 扣住的终止帧就此丢掉：消费者看到的是流中断，而不是一次正常收尾。
-      controller.error(refusalError(verdict.reason, allowed, verdict.culprit ?? null))
+      controller.error(refusalError(verdict.reason, expected, verdict.culprit ?? null))
     }
     /**
      * 处理一帧：先读它的每一处 routing，再决定转发还是扣住。
@@ -1675,7 +2213,7 @@ export function createFetchPin(config, logger = console) {
           recordUnverified(url, signal?.aborted === true ? 'aborted' : 'cancelled', reason)
         }
         // reader 还没建就直接取消源；建了就只能经 reader 取消（body 已被锁住）。
-        const target = reader ?? response.body
+        const target = reader ?? pre?.reader ?? response.body
         target.cancel(reason).catch(() => {})
       },
     })
@@ -1688,10 +2226,95 @@ export function createFetchPin(config, logger = console) {
   /** 记一次校验通过，并立刻落盘（状态文件里的 lastVerified 不该慢一拍）。 */
   function recordVerified(url, verdict, allowed) {
     lastVerified = { at: new Date().toISOString(), url, provider: verdict.provider, allowed: [...allowed], attempts: verdict.attempts }
+    // 0.11.1：匿名渠道单独计数 —— 「今天的请求有多少走了被匿名的渠道」是这次行为变更
+    // 之后最有用的一格，跟 pinned/blocked 一样一眼可读。
+    if (verdict.provider === ANONYMIZED_CHANNEL) {
+      counters.anonymized += 1
+      lastAnonymized = { at: lastVerified.at, url, provider: verdict.provider }
+    }
     logger.info?.('[clinepass] ✓ %s 由 %s 提供（允许 %s），已放行', url, verdict.provider, allowed.join(', '))
     // 校验发生在响应到达之后，而请求发起时的那次 publish() 早于它 —— 不补这一次，
     // 状态文件里的 lastVerified 会永远慢一拍。
     publish()
+  }
+
+  /**
+   * 给响应垫上「匿名渠道」提示（0.11.1）。
+   *
+   * 只处理 SSE（dsh 的 chat 全是流式）：把一条合成的 OpenAI chunk 帧垫在响应体**最前面**，
+   * 消费者看到的第一段文字就是提示。提示帧不含 routing / provider 字段 —— 校验层
+   * （`note()` / `routingsOfText()`）扫过它等于扫过普通内容帧，不影响钉选判定；终止帧
+   * 仍是网关自己的那一帧，收尾语义不变。
+   *
+   * 非 SSE、或构造中途出任何错：原样返回 —— 提示是增强，绝不是闸，坏了就当没有。
+   *
+   * 为什么垫在流前而不是流尾：请求侧在 `pinnedBody` 就知道这次走的是匿名渠道形状
+   * （允许列表里有它），不必等最后一帧的 routing 证据 —— 那时内容早已流完，垫前已经晚了。
+   *
+   * @param response - 上游 2xx 响应（body 未读过）。
+   * @param model - 请求体里的 model id（提示帧回显用）。
+   * @returns 垫了提示的响应，或原响应。
+   */
+  function withAnonymousNotice(response, model) {
+    if (!isEventStream(response) || response.body === null) return response
+    try {
+      const chunk = {
+        id: 'clinepass-anonymized-notice',
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: typeof model === 'string' ? model : 'cline-pass/deepseek-v4.1-flash',
+        choices: [{ index: 0, delta: { role: 'assistant', content: ANONYMIZED_NOTICE }, finish_reason: null }],
+      }
+      const head = new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`)
+      const source = response.body
+      const headers = new Headers(response.headers)
+      // 与 bufferedResponse / streamedVerification 同一条铁律：body 已解码，这两个头必须删。
+      headers.delete('content-encoding')
+      headers.delete('content-length')
+      // 消费者随时可能取消（streamedVerification 读到终止帧就收尾并 cancel 上游 ——
+      // 实测 2026-10-15：真网关把 [DONE] 塞在中途 chunk 里时必然发生）。取消后泵的在途
+      // read 仍会回来，对已死的 controller 调 enqueue/close/error 会抛 ERR_INVALID_STATE
+      // 且成为未处理拒绝 —— 用标志位静默，别让提示的善后砸掉进程。
+      let cancelled = false
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(head)
+          const reader = source.getReader()
+          const pump = () =>
+            reader.read().then(
+              ({ done, value }) => {
+                if (cancelled) return
+                try {
+                  if (done) return controller.close()
+                  controller.enqueue(value)
+                } catch {
+                  // cancel 与在途 read 的竞态窗口：控制器已死，静默收摊。
+                  cancelled = true
+                  return
+                }
+                return pump()
+              },
+              (error) => {
+                if (cancelled) return
+                try {
+                  controller.error(error)
+                } catch {
+                  /* 控制器已死：消费者先取消了，什么都不用交付 */
+                }
+              },
+            )
+          pump()
+        },
+        cancel(reason) {
+          cancelled = true
+          // 取消要向上游传播：连接已经没用了（终止帧都发过了），不掐会挂着等超时。
+          source.cancel(reason).catch(() => {})
+        },
+      })
+      return new Response(body, { status: response.status, statusText: response.statusText, headers })
+    } catch {
+      return response
+    }
   }
 
   const wrapper = function pinnedFetch(input, init) {
@@ -1721,17 +2344,74 @@ export function createFetchPin(config, logger = console) {
           logger.warn?.('[clinepass] not pinning request #%s: %s', counters.seen, next.reason)
           return passThrough(input, init)
         }
-        counters.pinned += 1
-        lastPin = { at: new Date().toISOString(), url, model: next.next.model, only: next.next.only }
-        publish()
-        report(url, next.next)
-        const sent = next.kind === 'request' ? passThrough(next.request) : passThrough(input, next.init)
-        // 校验只对「带着 pin 的 chat 请求」有意义：pin 为空表示用户没要求钉选。
-        if (cfg.enforcement === 'off' || next.next.only.length === 0) return sent
+        // 自动重试（0.10.0）：rewrite 为每种请求形状准备好 `resend(attempt)` 重发闭包，
+        // 三种形状共用一条「发送 → 校验 → 失败补发」的路径。首次发送也走 resend(0)，
+        // 保证重试与首发**逐字同参**。
+        const resendCall = (attempt) => {
+          const [one, two] = next.resend(attempt)
+          // passThrough 可能同步返回 Response（测试桩、手装 fetch 都有这种形状），
+          // Promise.resolve 抹平 —— 与调用方 await 两侧的兼容语义一致。
+          const prepared = Promise.resolve(passThrough(one, two))
+          // 匿名渠道提示（0.11.1）：会话首条消息的首发响应前垫一条警告帧。只垫首发 ——
+          // 重试补发的响应再垫一次，提示就会出现两遍。
+          return attempt === 0 && next.next.notice === true
+            ? prepared.then((response) => withAnonymousNotice(response, next.next.model))
+            : prepared
+        }
+        if (next.kind === 'provider') {
+          // provider 级钉选的兜底路径（slug 推不出，请求线没得注入）：没有渠道可注入
+          // （pins: []），但响应必须用 wire 顶层的 provider 字段自证。请求按**原参**发
+          // （body 一字不动）；计数单列 —— 既不是 pinned（没注入），也不是 skipped（响应仍受闸管）。
+          const expect = next.next.expect ?? []
+          counters.providerPinned += 1
+          lastProviderPin = { at: new Date().toISOString(), url, model: next.next.model, expect }
+          publish()
+          logger.info?.(
+            '[clinepass] → #%s POST %s provider-pinned to %s (model %s, in-process)',
+            String(counters.seen).padStart(3, '0'),
+            url,
+            expect.join(', '),
+            next.next.model ?? '?',
+          )
+          if (cfg.enforcement === 'off' || expect.length === 0) return resendCall(0)
+          const signal = init?.signal ?? input?.signal
+          return sendVerified(resendCall, [], url, signal, expect)
+        }
+        const expect = next.next.expect ?? []
+        const only = next.next.only ?? []
         const signal = next.kind === 'request' ? next.request.signal : (next.init.signal ?? input?.signal)
-        // `Promise.resolve` 而不是直接 `.then`：真的 fetch 一定返回 promise，但测试替身
-        // 可能直接返回一个 Response，而 wrapper 不该因此炸掉。
-        return Promise.resolve(sent).then((response) => verifyPinned(response, next.next.only, url, signal))
+        if (expect.length > 0 && only.length === 0) {
+          // provider 级钉选（0.11.0 起连请求线一起钉：wire 顶层 provider.order）：证据面
+          // 仍是 wire 顶层的 provider 字段，所以计数单列 —— 不进 pinned（那是渠道钉，
+          // 看 routing 元数据），也不是 skipped（响应受闸管）。order 记进状态文件，
+          // 「配置写的是 z.ai、请求线上发的是 z-ai」在对数时一目了然。
+          counters.providerPinned += 1
+          lastProviderPin = {
+            at: new Date().toISOString(),
+            url,
+            model: next.next.model,
+            expect,
+            order: next.next.order ?? [],
+          }
+          publish()
+          logger.info?.(
+            '[clinepass] → #%s POST %s provider-pinned to %s (wire order: %s, model %s, in-process)',
+            String(counters.seen).padStart(3, '0'),
+            url,
+            expect.join(', '),
+            (next.next.order ?? []).join(', ') || 'absent',
+            next.next.model ?? '?',
+          )
+        } else {
+          counters.pinned += 1
+          lastPin = { at: new Date().toISOString(), url, model: next.next.model, only }
+          publish()
+          report(url, next.next)
+        }
+        // 校验只对「带着钉选要求的 chat 请求」有意义：两侧都空表示用户没要求钉选（走到
+        // 这里不可能 —— 要么注入了 only，要么带 expect，要么早在 rewrite 就 skip 了）。
+        if (cfg.enforcement === 'off' || (only.length === 0 && expect.length === 0)) return resendCall(0)
+        return sendVerified(resendCall, only, url, signal, expect)
       },
       (error) => {
         counters.skipped += 1
@@ -1810,7 +2490,7 @@ export function createFetchPin(config, logger = console) {
     /**
      * 当前校验状态的一份快照（冒烟测试与排查用；status 文件写的是同一批字段）。
      *
-     * @returns `{ counters, enforcement, provision, provisionReason, lastPin, lastVerified, lastViolation, lastUnverified, lastSkipped }`。
+     * @returns `{ counters, enforcement, provision, provisionReason, lastPin, lastProviderPin, lastVerified, lastViolation, lastUnverified, lastSkipped }`。
      */
     state: () => ({
       counters: { ...counters },
@@ -1818,11 +2498,14 @@ export function createFetchPin(config, logger = console) {
       provision,
       provisionReason,
       lastPin,
+      lastProviderPin,
       lastVerified,
+      lastAnonymized,
       lastViolation,
       violations: [...violations],
       lastUnverified,
       lastSkipped,
+      lastRequestShape,
     }),
     /** Re-check whether the hook still owns `globalThis.fetch` (also runs on a timer). */
     checkOwnership,
@@ -2166,6 +2849,16 @@ export async function apply(ctx, config) {
   }
   for (const [model, channels] of Object.entries(cfg.pins ?? {})) {
     if (Array.isArray(channels) && channels.length === 0 && (cfg.pin ?? []).length > 0) {
+      const expected = cfg.providerPins?.[model]
+      if (Array.isArray(expected) && expected.length > 0) {
+        // 有意的直通 + provider 级钉选：请求不动，响应由 wire 顶层的 provider 字段裁决。
+        logger.info?.(
+          '[clinepass] pins["%s"] is empty on purpose: the model is provider-pinned to %s — requests go out unmodified, responses are verified against the wire provider field',
+          model,
+          expected.join(', '),
+        )
+        continue
+      }
       logger.warn?.(
         '[clinepass] pins["%s"] is empty, so requests for that model go out unpinned even though pin is %s',
         model,
@@ -2289,13 +2982,17 @@ export async function apply(ctx, config) {
     }
   }
 
+  const providerPinnedModels = Object.entries(cfg.providerPins ?? {})
+    .filter(([, expected]) => Array.isArray(expected) && expected.length > 0)
+    .map(([model, expected]) => `${model} → ${expected.join('/')}`)
   logger.info?.(
-    '[clinepass] route "%s" served by pi-ai via %s; %s; pin %s (profile %s); prompt shows %s',
+    '[clinepass] route "%s" served by pi-ai via %s; %s; pin %s (profile %s); prompt shows %s%s',
     cfg.provider,
     hook.profileBaseURL(),
     status === 'installed' ? 'pin injected in-process, no listener' : `hook ${status}`,
     (cfg.pin ?? []).join(', ') || '(nothing)',
     provision,
     cfg.plainModelId ? `${withoutRoutePrefix(cfg.provider, cfg.model)} (no route prefix)` : 'the configured model id',
+    providerPinnedModels.length > 0 ? `; provider-pinned: ${providerPinnedModels.join(', ')}` : '',
   )
 }
