@@ -69,6 +69,15 @@
         api: openai-completions
         apiKeyEnv: CLINE_PASS_API_KEY
         baseURL: https://api.cline.bot/api/v1
+        # 默认思考档（0.12.1）。**必须显式声明，否则模型选择器会多出一个
+        # 「Provider default」选项**：客户端的档位表只在 defaultEffort 缺失时才插入它
+        # （@deepseek-ai/dsh-client-ui-model-selection/lib/client.js 的 effortChoices），
+        # 而 defaultEffort 只来自 profile 的 `reasoning`
+        # （@deepseek-ai/dsh-llm-pi-ai/lib/index.js 的 reasoningInfo ← describableReasoningLevel）。
+        # 声明之后：选择器只剩 High / Max，默认选中 High；未显式选档的会话也以
+        # reasoning_effort=high 发出。写的档位必须是下面 reasoningEfforts 声明过的，
+        # 否则请求即报 UNSUPPORTED_REASONING_EFFORT。
+        reasoning: high
         models:
           - id: cline-pass/deepseek-v4.1-flash
             name: DeepSeek V4.1 Flash

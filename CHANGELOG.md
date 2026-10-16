@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.12.1
+
+**随包写下的 provider 卡片补上 `reasoning: high`** —— 就是让模型选择器里不再出现
+「Provider default」那一项的那一行。`index.js` 未动。
+
+- 选择器的档位表只在模型目录没有 `defaultEffort` 时才插入「Provider default / 跟随
+  Provider」条目，而 `defaultEffort` 只来自 provider profile 的 `reasoning` 字段。随包
+  `cordis.patch.yml` 与 `install.mjs` 写下的静态卡片此前没声明它，于是**新装的人**选择器里
+  会多出这一项（本机是自己手写的 profile 行，补上后已验证目录变成
+  `efforts: [High, Max], defaultEffort: "high"`）。
+- 现在两处都带 `reasoning: high`：选择器只剩 **High / Max** 且默认选中 **High**；未显式选档
+  的会话也会以 `reasoning_effort=high` 发出。写的档位必须是模型声明过的（下面
+  `reasoningEfforts` 里的 `high` / `max`），否则请求报 `UNSUPPORTED_REASONING_EFFORT`。
+- **自己写 `llm-pi-ai` 行的人注意**：patch 行是**整行替换 config、不合并**，所以请把
+  `reasoning: high` 与 `reasoningEfforts: {high, max}` 一起写进你那行（README 里有可粘贴的
+  整段）。
+- 已知边界：运行时 `provisionProfile()` **仍然不写也不改档位**（只对齐 `contextWindow` /
+  `maxTokens`），所以「没有 patch 行、只靠运行时登记」的 profile 依旧会看到那个
+  `Provider default` —— 那种装法本来就要自己写 `llm-pi-ai` 行。
+
 ## 0.12.0
 
 **插件只剩两件事：观察真实 Provider、画 Cline Pass 用量卡。** 这是一个删减版本，不是

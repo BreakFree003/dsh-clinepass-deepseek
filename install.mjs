@@ -122,6 +122,11 @@ const PROVIDER_BLOCK = `# ── Cline Pass provider card ───────�
         api: openai-completions
         apiKeyEnv: CLINE_PASS_API_KEY
         baseURL: https://api.cline.bot/api/v1
+        # The default thinking level. It has to be declared: the model picker only
+        # inserts its "Provider default" entry when defaultEffort is absent, and
+        # defaultEffort comes from this field alone. Declared, the picker offers
+        # High / Max and starts on High.
+        reasoning: high
         models:
           - id: cline-pass/deepseek-v4.1-flash
             name: DeepSeek V4.1 Flash

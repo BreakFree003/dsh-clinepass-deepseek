@@ -59,10 +59,17 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
   在 dsh 0.1.7 上这次写入并不可靠（冷启动时 settings 服务还没起来；全新 profile 的写入会等
   清单写锁），所以**别只依赖它**。
 
-> **自己写 `llm-pi-ai` 行的人必读**：静态卡声明了 `reasoningEfforts: {high, max}`，而运行时的
-> `provisionProfile()` **只**对齐 `contextWindow` / `maxTokens` —— 它既不声明档位、也不改写你
-> 写下的档位。而 patch 行是**整行替换 config、不合并**，所以自己写就必须把 `reasoningEfforts`
-> 一起写上，否则这个模型在 composer 里没有任何思考档可选。可粘贴：
+> **自己写 `llm-pi-ai` 行的人必读**：静态卡声明了 `reasoningEfforts: {high, max}` **和
+> `reasoning: high`**，而运行时的 `provisionProfile()` **只**对齐 `contextWindow` /
+> `maxTokens` —— 它既不声明档位、也不写默认档、也不改写你写下的值。而 patch 行是**整行替换
+> config、不合并**，所以自己写就必须把这两个字段一起写上：
+>
+> - 少了 `reasoningEfforts`，这个模型在 composer 里没有任何思考档可选；
+> - 少了 `reasoning`，选择器会多出一个 **「Provider default / 跟随 Provider」** 条目（客户端
+>   只在模型目录没有 `defaultEffort` 时才插入它），而且未显式选档的会话会落到上游自己的默认
+>   档。写上 `reasoning: high` 就只剩 **High / Max**，默认 High。
+>
+> 可粘贴：
 
 ```yaml
 - id: llm-pi-ai
@@ -73,6 +80,7 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
         api: openai-completions
         apiKeyEnv: CLINE_PASS_API_KEY
         baseURL: https://api.cline.bot/api/v1
+        reasoning: high          # 默认思考档；不写就会多出「Provider default」选项
         models:
           - id: cline-pass/deepseek-v4.1-flash
             name: DeepSeek V4.1 Flash
@@ -152,8 +160,9 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
 - **提示词变化**：0.6.2 起插件会把 persona 里的模型 id 去掉前缀；0.12.0 删掉了这件事，persona
   现在原样显示 `cline-pass/deepseek-v4.1-flash`。
 - **effort**：插件不再写 `agent-default-model.reasoningEffort`，也不再往卡片上写
-  `reasoningEfforts`。想固定思考档就在自己的 profile 补丁里显式给（例：`agent-default-model`
-  写 `reasoningEffort: high`），并在卡片里声明档位。
+  `reasoningEfforts` / `reasoning`。想固定思考档就在自己的 profile 补丁里显式给（例：
+  `agent-default-model` 写 `reasoningEffort: high`），并在卡片里声明档位与默认档
+  （`reasoning: high`）。
 
 ## 验证
 
@@ -235,8 +244,9 @@ store; the browser cannot read it by design, which is why the host half fetches 
 
 **Configuration**: `upstream`, `provider`, `model`, `displayName`, `contextWindow`, `maxTokens`,
 `apiKeyEnv`, `provision`, `usage`, `usageRoute`, `usageTimeoutMs`, `usageCacheMs`, `statusFile`. If
-you declare the `llm-pi-ai` row yourself, include `reasoningEfforts` — the runtime provisioner only
-aligns `contextWindow`/`maxTokens` and never touches the levels.
+you declare the `llm-pi-ai` row yourself, include `reasoningEfforts` **and** `reasoning: high` —
+the runtime provisioner only aligns `contextWindow`/`maxTokens`, and a row without `reasoning`
+leaves the picker showing a "Provider default" entry.
 
 **Verify**: `npm test`, the two `checks/` scripts (they import the *installed* copy, so deploy
 first), `smoke-test.mjs`, and `cat ~/.dsh/dsh-clinepass-status.json` (`hook`, `counters.seen` /
