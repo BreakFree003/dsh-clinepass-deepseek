@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.12.2
+
+**恢复 persona 里的裸模型 id 显示** —— 0.12.0 把它连同请求侧的钉选一起删掉了，那是误删：
+这段代码与请求改写无关，删掉后上下文里会显示 `cline-pass/deepseek-v4.1-flash`，而每个第一方
+路由显示的都是裸 id（随包的 `deepseek` 路由声明 `deepseek-v4-flash`）。现在 persona 又读作
+`You are a coding agent powered by the deepseek-v4.1-flash model.`，与官方部署一致；
+`plainModelId: false` 可以关掉它（关掉后启动行会说明显示的是配置里的完整 id）。
+
+为什么必须带前缀、又为什么只能改模板：
+
+- **前缀是 wire 要求**：Cline 网关要 `type/model`（裸 id 报
+  `invalid model format. Expected format: modelType/model`），而 dsh 把目录 id 原样发给
+  wire —— 所以前缀只能留在请求体里，问题是 `{{model}}` 会把它渲染进 persona。
+- **不能改目录 id**：老会话的 `model/selection` 与 `request/header` 记的是带前缀的 id，
+  `dsh-llm-pi-ai` 用目录解析选择 —— 改名会让它们报 `UNKNOWN_MODEL`，直到每个会话重新选模型。
+- **不能重注册 `model` 变量**：`@deepseek-ai/dsh-agent` 的 `installModelSelection` 在每个内层
+  listener 返回之后都会用会话的当前选择覆写 `variables.provider` / `variables.model`，什么注册
+  都活不过它。
+- **不能直接改 `variables.model`**：`@deepseek-ai/dsh-session-reference` 会快照
+  `assembly.variables` 来估算引用预算，解析不了的 id 会让预算静默回落到默认值。
+- 所以改写落在**还没渲染的 persona 模板**上（`{{…}}` 在 `renderPrompt` 里才解析）：只把
+  `{{model}}` 这个 token 换成裸 id，同一段里的其它变量照常，`variables` 一个字节不改。
+  listener 用 `{ prepend: true }` 挂在 `installModelSelection` **外层**，才能看到下一个请求
+  真正会用的模型（包括本插件挂载前就已存在的 agent）。
+- **契约风险**：这条依赖 dsh 的内部形状 —— 事件名 `system-prompt/assemble`、assembly 的
+  `{sections:[{name,text,interpolate?}], variables}`、段名
+  `deployment:persona-prefix` / `deployment:persona-suffix`。dsh 升级后要复查（README
+  「升级 dsh 后要复查的提示词契约」有清单）；形状对不上时**原样返回**，绝不改坏提示词。
+- 测试：`test-fetch.mjs` §14（17 条，从 0.11.4 的 §12 原样移植）与时序化的 apply 断言
+  （注册 / prepend / 启动行文案 / `plainModelId: false` 不注册）。`withDefaults` 里
+  `plainModelId` 不再是「被丢弃的遗留键」，默认 `true`。
+
 ## 0.12.1
 
 **随包写下的 provider 卡片补上 `reasoning: high`** —— 就是让模型选择器里不再出现

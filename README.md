@@ -139,30 +139,57 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
 | `maxTokens` | `131072` | 同上 |
 | `apiKeyEnv` | `CLINE_PASS_API_KEY` | 凭据库里的键名 |
 | `provision` | `true` | `false` = 不登记/不修复 provider 卡片（那卡片就得自己声明） |
+| `plainModelId` | `true` | persona 里显示**裸模型 id**（`deepseek-v4.1-flash`）；`false` = 保持完整 id（详见下节） |
 | `usage` | `true` | `false` = 不挂载用量路由（卡片会显示「没挂载」而不是一直转圈） |
 | `usageRoute` | `/api/clinepass.usage` | 用量路由路径 |
 | `usageTimeoutMs` | `15000` | 宿主读网关的超时 |
 | `usageCacheMs` | `60000` | 成功读取的缓存时长；`0` = 每次重取（失败只缓存 5 秒） |
 | `statusFile` | `<DSH_HOME>/dsh-clinepass-status.json` | 观察结果落盘处；给字符串换路径，`false` 关掉 |
 
-## 迁移（0.11.x → 0.12.0）
+## 迁移（0.11.x → 0.12.x）
 
 **0.12.0 是删减版**，请求侧整块没了：
 
 - 删掉的配置键：`pin` / `pins` / `providerPins` / `enforcement` / `retries`，以及
-  `alignReasoningEffort` / `plainModelId`。**旧行照常加载** —— 这些键被忽略并记进状态文件的
+  `alignReasoningEffort`。**旧行照常加载** —— 这些键被忽略并记进状态文件的
   `ignoredOptions`（不刷警告，否则每个没清理的旧行都会在每次启动时叫一次）。更早的端口时代键
   （`transport` / `listen` / `captureDir` / `address` / `baseURL`）同样忽略，但会各警告一次。
+  0.12.0 曾把 `plainModelId` 一起归进这份遗留名单，那是误删；0.12.2 起它又是真选项。
 - **为什么不再需要钉选**：2026-10-16 复测，订阅路由上的 `deepseek` 已由第一方服务（响应里的上游
   `system_fingerprint` 与官方 `api.deepseek.com` 逐字相同、prefix cache 是 64 块对齐记账、
   provider id 是 UUID 形状）。本地钉选改变不了任何结果，只剩每次请求多一段装饰字段。证据见
   [`../clinepass-deepseek-audit/README.md`](../clinepass-deepseek-audit/README.md) §九。
-- **提示词变化**：0.6.2 起插件会把 persona 里的模型 id 去掉前缀；0.12.0 删掉了这件事，persona
-  现在原样显示 `cline-pass/deepseek-v4.1-flash`。
 - **effort**：插件不再写 `agent-default-model.reasoningEffort`，也不再往卡片上写
   `reasoningEfforts` / `reasoning`。想固定思考档就在自己的 profile 补丁里显式给（例：
   `agent-default-model` 写 `reasoningEffort: high`），并在卡片里声明档位与默认档
   （`reasoning: high`）。
+
+## 提示词里的模型 id（0.12.2 起）
+
+网关要求请求体里是 `type/model`（裸 id 报 `invalid model format`），而 dsh 把目录 id 原样发给
+wire —— 于是 `{{model}}` 会把这段**传输细节**渲染进 persona，第一方路由都不会这样。插件因此把
+persona 模板里的 `{{model}}` 换成裸 id：上下文里读作
+`You are a coding agent powered by the deepseek-v4.1-flash model.`，与官方部署一致。
+`plainModelId: false` 关掉它（启动行会说明显示的是配置里的完整 id）。
+
+只能改**模板**，因为三条看似更省事的路都走不通：改目录 id（老会话的 `model/selection` 与
+`request/header` 记的是带前缀的 id，`dsh-llm-pi-ai` 按目录解析选择 → 报 `UNKNOWN_MODEL`）；重注册
+`model` 变量（`dsh-agent` 的 `installModelSelection` 在每个内层 listener 之后用会话当前选择覆写
+`variables.provider`/`model`）；直接改 `variables.model`（`dsh-session-reference` 靠快照
+`assembly.variables` 估算引用预算，解析不了的 id 会让预算静默回落）。所以 listener 用
+`{ prepend: true }` 挂在 `installModelSelection` **外层**，只替换模板里的 `{{model}}` token，
+`variables` 一字不改，段名对不上就原样返回。
+
+**升级 dsh 后要复查的提示词契约**（形状变了不会报错，只会静默不生效）：
+
+- 事件名仍是 `system-prompt/assemble`，且 listener 能拿到 `next()` 之后的 assembly；
+- assembly 形状仍是 `{ sections: [{ name, text, interpolate? }], variables }`，`{{…}}` 在
+  `renderPrompt` 里才解析（模板在 assemble 时仍是未渲染的原文）；
+- 段名仍是 `deployment:persona-prefix` / `deployment:persona-suffix`；
+- `@deepseek-ai/dsh-agent` 仍在 assemble 内层用会话 selection 覆写 `variables.model`
+  —— 这决定 `{ prepend: true }` 是否还必要；
+- 生效确认：新会话日志里搜 `coding agent powered by`（应是裸 id），或
+  `node test-fetch.mjs`（§14 就是这份契约，不需要 dsh、不需要外网）。
 
 ## 验证
 
@@ -233,8 +260,12 @@ Cline Pass usage card** on Settings → Models.
 forwarded frame by frame, never buffered. 0.12.0 removed the request-side channel pin, enforcement,
 retries and violation bookkeeping, because the subscription route's `deepseek` is served first-party
 (same upstream `system_fingerprint` as `api.deepseek.com`, 64-token-aligned prefix-cache accounting).
-Legacy keys (`pin`, `pins`, `providerPins`, `enforcement`, `retries`, `alignReasoningEffort`,
-`plainModelId`) still load — they are ignored and listed in the status file's `ignoredOptions`.
+Legacy keys (`pin`, `pins`, `providerPins`, `enforcement`, `retries`, `alignReasoningEffort`) still
+load — they are ignored and listed in the status file's `ignoredOptions`.
+
+It does rewrite the **prompt template**: the wire needs the `type/model` prefix, so the persona
+sections are patched to the bare id (`You are a coding agent powered by the deepseek-v4.1-flash
+model.`), `variables` untouched; `plainModelId: false` turns that off (see 「提示词里的模型 id」).
 
 **Install** with `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1` (the
 package declares `dsh.bundle.patch`, so its two config rows come along automatically), with
@@ -243,7 +274,8 @@ paste your key into the card on Settings → Models (stored as `CLINE_PASS_API_K
 store; the browser cannot read it by design, which is why the host half fetches the usage numbers).
 
 **Configuration**: `upstream`, `provider`, `model`, `displayName`, `contextWindow`, `maxTokens`,
-`apiKeyEnv`, `provision`, `usage`, `usageRoute`, `usageTimeoutMs`, `usageCacheMs`, `statusFile`. If
+`apiKeyEnv`, `provision`, `plainModelId`, `usage`, `usageRoute`, `usageTimeoutMs`, `usageCacheMs`,
+`statusFile`. If
 you declare the `llm-pi-ai` row yourself, include `reasoningEfforts` **and** `reasoning: high` —
 the runtime provisioner only aligns `contextWindow`/`maxTokens`, and a row without `reasoning`
 leaves the picker showing a "Provider default" entry.

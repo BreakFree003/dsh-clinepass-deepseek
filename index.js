@@ -28,6 +28,13 @@
  * profile on first boot (create when absent, repair only the address, never
  * rewrite anything else), so mounting the plugin is the whole install.
  *
+ * Finally, it keeps that prefix out of the **prompt**: the persona would
+ * otherwise read "powered by the cline-pass/deepseek-v4.1-flash model", while
+ * every first-party route shows a bare model id (the shipped `deepseek` route
+ * declares `deepseek-v4-flash`, no prefix). The wire keeps the prefix; only the
+ * display drops it — see `installPromptDisplay`, and `plainModelId` to turn it
+ * off.
+ *
  * Deliberately dependency-free: only Node built-ins, so the whole thing can be
  * read, tested and audited in one file.
  *
@@ -250,11 +257,13 @@ function isPlainObject(value) {
  * shows them too, for a front end where plugin `warn` lines are not visible.
  *
  * 0.12.0 removed the request-side pin, so its options (`pin`, `pins`,
- * `providerPins`, `enforcement`, `retries`, plus the prompt/effort switches
- * `alignReasoningEffort` / `plainModelId`) are also accepted and dropped — but
- * **silently**: there is no behaviour left for them to select, and every stale
- * row would otherwise warn on every boot. They are still recorded in
- * `ignoredOptions`, so a config that nobody has cleaned up stays visible.
+ * `providerPins`, `enforcement`, `retries`, `alignReasoningEffort`) are also
+ * accepted and dropped — but **silently**: there is no behaviour left for them to
+ * select, and every stale row would otherwise warn on every boot. They are still
+ * recorded in `ignoredOptions`, so a config that nobody has cleaned up stays
+ * visible. (`plainModelId` was dropped along with them by mistake in 0.12.0; it
+ * selects the prompt display and is a real option again since 0.12.2 — see
+ * `installPromptDisplay`.)
  *
  * @param raw - whatever configuration arrived.
  * @param logger - where to report a removed option.
@@ -271,7 +280,7 @@ export function withDefaults(raw, logger = console) {
       )
     }
   }
-  for (const retired of ['pin', 'pins', 'providerPins', 'enforcement', 'retries', 'alignReasoningEffort', 'plainModelId']) {
+  for (const retired of ['pin', 'pins', 'providerPins', 'enforcement', 'retries', 'alignReasoningEffort']) {
     if (raw?.[retired] !== undefined && !ignored.includes(retired)) ignored.push(retired)
   }
   const text = (value, fallback) => (typeof value === 'string' && value.length > 0 ? value : fallback)
@@ -297,6 +306,9 @@ export function withDefaults(raw, logger = console) {
     maxTokens: positiveInteger(raw?.maxTokens, DEFAULT_MAX_TOKENS),
     apiKeyEnv: text(raw?.apiKeyEnv, KEY_REF),
     provision: raw?.provision !== false,
+    // The persona shows the bare model id by default (`withoutRoutePrefix`); an
+    // explicit `false` keeps the wire id in the prompt too.
+    plainModelId: raw?.plainModelId !== false,
     usage: raw?.usage !== false,
     usageRoute: text(raw?.usageRoute, USAGE_ROUTE),
     usageTimeoutMs: positiveInteger(raw?.usageTimeoutMs, DEFAULT_USAGE_TIMEOUT_MS),
@@ -1683,6 +1695,100 @@ export async function provisionProfile(settings, cfg, logger = console, note = (
 }
 
 /**
+ * Prompt sections whose `{{model}}` reference *displays* the model id: the two
+ * persona lines, spelled as the `PERSONA_PREFIX_SECTION` / `PERSONA_SUFFIX_SECTION`
+ * ids of `@deepseek-ai/dsh-system-prompt`.
+ *
+ * Spelled out rather than imported because this package ships no dependencies on
+ * purpose; `test-fetch.mjs` pins the behavior that depends on them.
+ */
+const PERSONA_SECTIONS = ['deployment:persona-prefix', 'deployment:persona-suffix']
+
+/**
+ * The model id without this route's own prefix (`cline-pass/x` → `x`).
+ *
+ * Only the exact `<provider>/` prefix is dropped: a bare id, or a slash that
+ * belongs to the model's own name, is left alone.
+ *
+ * @param provider - the route id whose prefix is a wire requirement.
+ * @param model - the configured or selected model id.
+ * @returns the id to show, or the id unchanged.
+ */
+function withoutRoutePrefix(provider, model) {
+  if (typeof model !== 'string') return model
+  const prefix = `${provider}/`
+  return model.startsWith(prefix) && model.length > prefix.length ? model.slice(prefix.length) : model
+}
+
+/**
+ * Keep this route's wire prefix out of the model-facing prompt.
+ *
+ * Cline's gateway requires `type/model` in the request body (a bare id is
+ * rejected: "invalid model format. Expected format: modelType/model"), and dsh
+ * sends a catalog id to the wire verbatim — so this route's id has to carry the
+ * prefix even though it is a *transport* detail. `{{model}}` then renders it
+ * into the persona as if it were the model's name, which no first-party route
+ * does.
+ *
+ * Three ways this must not be done, each for a concrete reason:
+ *
+ *   - **Not by changing the catalog id.** Every existing session's
+ *     `model/selection` and `request/header` record the prefixed id, and
+ *     `dsh-llm-pi-ai` resolves a selection against the catalog, so a renamed id
+ *     fails as `UNKNOWN_MODEL` until each session re-picks its model.
+ *   - **Not by re-registering the `model` prompt variable.** `installModelSelection`
+ *     in `@deepseek-ai/dsh-agent` overwrites `variables.provider`/`variables.model`
+ *     with the session's live selection after every inner listener returns, so no
+ *     registration — global or scoped — survives it.
+ *   - **Not by editing `variables.model` here.** `@deepseek-ai/dsh-session-reference`
+ *     snapshots `assembly.variables` to size its reference budget; an id it cannot
+ *     resolve drops that budget to its default without a word.
+ *
+ * So the rewrite lands on the persona *templates*, which are still unrendered at
+ * assembly time (`{{…}}` groups resolve later, in `renderPrompt`): replacing the
+ * reference token leaves every other variable in the section working, and the
+ * variables stay exactly as they were.
+ *
+ * The listener is prepended to sit *outside* the per-agent `installModelSelection`
+ * listener, which is what makes it see the model the next request will actually
+ * use — including for agents that already existed when this plugin mounted, where
+ * registration order alone would have put it inside.
+ *
+ * @param ctx - host plugin context.
+ * @param cfg - the complete configuration.
+ */
+export function installPromptDisplay(ctx, cfg) {
+  ctx.on(
+    'system-prompt/assemble',
+    async (_assembly, _context, next) => {
+      const assembly = await next()
+      const variables = assembly?.variables
+      // Only this route's own ids, and only a session actually on this route:
+      // a bare official id, another provider, or another route's prefix is not
+      // this plugin's business. An unreadable assembly is left alone too — a
+      // display rule must never break the prompt it decorates.
+      if (!Array.isArray(assembly?.sections)) return assembly
+      if (variables?.provider !== cfg.provider) return assembly
+      const model = variables.model
+      const plain = withoutRoutePrefix(cfg.provider, model)
+      if (plain === model) return assembly
+      let changed = false
+      const sections = assembly.sections.map((section) => {
+        if (!PERSONA_SECTIONS.includes(section.name)) return section
+        // `interpolate: false` marks literal prose, where `{{model}}` is meant to
+        // survive as exactly those characters.
+        if (section.interpolate === false) return section
+        if (typeof section.text !== 'string' || !section.text.includes('{{model}}')) return section
+        changed = true
+        return { ...section, text: section.text.replaceAll('{{model}}', plain) }
+      })
+      return changed ? { ...assembly, sections } : assembly
+    },
+    { prepend: true },
+  )
+}
+
+/**
  * Install the in-process observer and provision the provider profile.
  *
  * The settings seam is required: provisioning must finish before the first turn
@@ -1705,6 +1811,10 @@ export async function apply(ctx, config) {
     logger.error?.('[clinepass] upstream "%s" is not a URL; nothing was installed or provisioned', cfg.upstream)
     return
   }
+
+  // Registered only once the address is known to be usable: a misconfigured
+  // plugin should change nothing at all, prompt included.
+  if (cfg.plainModelId) installPromptDisplay(ctx, cfg)
 
   const observer = createFetchObserver(cfg, logger)
   status = observer.install()
@@ -1817,10 +1927,11 @@ export async function apply(ctx, config) {
   }
 
   logger.info?.(
-    '[clinepass] route "%s" served by pi-ai via %s; %s (observer only — requests and responses are not modified); profile %s',
+    '[clinepass] route "%s" served by pi-ai via %s; %s (observer only — requests and responses are not modified); profile %s; prompt shows %s',
     cfg.provider,
     observer.profileBaseURL(),
     status === 'installed' ? 'in-process fetch observer installed, no listener' : `observer ${status}`,
     provision,
+    cfg.plainModelId ? `${withoutRoutePrefix(cfg.provider, cfg.model)} (no route prefix)` : 'the configured model id',
   )
 }

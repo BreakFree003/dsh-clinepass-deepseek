@@ -24,6 +24,7 @@ import {
   createUsageHandler,
   apply,
   isGatewayChat,
+  installPromptDisplay,
   isTerminatorFrame,
   nextFrameEnd,
   observedProviderOf,
@@ -614,7 +615,7 @@ console.log('\n── 11. apply() ───────────────�
     const ctx = {
       logger,
       effect: (register) => effects.push(register()),
-      on: (event, listener) => listeners.set(event, listener),
+      on: (event, listener, options) => listeners.set(event, { listener, options }),
       get: (name) => (name === 'settings' ? settings : undefined),
       inject: () => Promise.resolve(),
       ...(loader === undefined ? {} : { root: { loader } }),
@@ -629,13 +630,19 @@ console.log('\n── 11. apply() ───────────────�
     const real = globalThis.fetch
     const statusPath = path.join(SCRATCH, 'apply-status.json')
     const settings = makeSettings({ providers: {} })
-    const { ctx, effects } = applyCtx({ settings })
+    const logger = recorder()
+    const { ctx, effects, listeners } = applyCtx({ settings, logger })
     await apply(ctx, { statusFile: statusPath, usage: false })
     check('apply installs the observer into the process', globalThis.fetch !== real && typeof globalThis.fetch[MARK] === 'function')
     check('…and registers exactly one disposer', effects.length === 1 && typeof effects[0] === 'function', String(effects.length))
     check('…leaving the profile it provisioned', settings.writes.length === 1, JSON.stringify(settings.writes.length))
     check('…with the outcome in the status file', readStatus(statusPath)?.provision === 'created', JSON.stringify(readStatus(statusPath)?.provision))
     check('…and the hook reported installed', readStatus(statusPath)?.hook === 'installed', String(readStatus(statusPath)?.hook))
+    // The prompt display is part of a healthy mount: the listener goes on the bus,
+    // prepended, and the boot line names the id the prompt will show.
+    check('apply registers the prompt-display listener', listeners.has('system-prompt/assemble'), JSON.stringify([...listeners.keys()]))
+    check('…prepended, outside the model-selection listener', listeners.get('system-prompt/assemble')?.options?.prepend === true, JSON.stringify(listeners.get('system-prompt/assemble')?.options))
+    check('…and the boot line says which model id the prompt shows', logger.lines.info.some((line) => line.includes('prompt shows deepseek-v4.1-flash')), JSON.stringify(logger.lines.info))
     effects[0]()
     check('the disposer restores the original fetch', globalThis.fetch === real)
     check('…and the record says so', readStatus(statusPath)?.hook === 'uninstalled', String(readStatus(statusPath)?.hook))
@@ -651,6 +658,21 @@ console.log('\n── 11. apply() ───────────────�
     check('a bad upstream installs nothing', globalThis.fetch === real && effects.length === 0)
     check('…and provisions nothing', settings.writes.length === 0)
     check('…saying why', logger.lines.error.some((line) => line.includes('is not a URL')), JSON.stringify(logger.lines.error))
+  }
+
+  {
+    // `plainModelId: false` is the documented way to keep the wire id in the
+    // prompt: no listener is registered, and the boot line says so.
+    const real = globalThis.fetch
+    const settings = makeSettings({ providers: {} })
+    const logger = recorder()
+    const { ctx, effects, listeners } = applyCtx({ settings, logger })
+    await apply(ctx, { plainModelId: false, statusFile: false, usage: false })
+    check('plainModelId: false registers no prompt listener', !listeners.has('system-prompt/assemble'), JSON.stringify([...listeners.keys()]))
+    check('…and the boot line says the configured id is what shows', logger.lines.info.some((line) => line.includes('prompt shows the configured model id')), JSON.stringify(logger.lines.info))
+    check('…while the observer still installs', globalThis.fetch !== real && effects.length === 1)
+    effects[0]()
+    check('…and is disposed again', globalThis.fetch === real)
   }
 
   {
@@ -868,6 +890,88 @@ console.log('\n── 13. no secret material ───────────�
   const leakedInBody = [SECRET, API_KEY, COOKIE, BUILD, 'authorization', 'x-api-key'].filter((needle) => bodyText.includes(needle))
   check('?status=1 still answers with the provider', JSON.parse(bodyText).provider === 'deepseek', bodyText)
   check('…and its body carries no credential or header either', leakedInBody.length === 0, JSON.stringify(leakedInBody))
+}
+
+// ── 14. the prompt display ──────────────────────────────────────────────────
+//
+// Cline's gateway requires the `type/model` prefix in the request body, so this
+// route's id carries a *transport* detail that `{{model}}` then renders into the
+// persona as if it were the model's name. The rewrite lands on the persona
+// templates only — never on the catalog id, never on `variables` — and the
+// assertions below are the contract that keeps it that way. Ported from 0.11.4
+// (§12), where 0.12.0 deleted it by mistake.
+console.log('\n── 14. the prompt display ────────────────────────────────')
+{
+  /** A context double that only has to record listeners. */
+  const promptCtx = () => {
+    const listeners = new Map()
+    return { ctx: { on: (event, listener, options) => listeners.set(event, { listener, options }) }, listeners }
+  }
+  const cfg = withDefaults({})
+  const { ctx, listeners } = promptCtx()
+  installPromptDisplay(ctx, cfg)
+  const registered = listeners.get('system-prompt/assemble')
+  check('the assembly listener is registered on the event bus', registered !== undefined)
+  // The whole reason the rewrite works: `installModelSelection` applies the
+  // session's live selection *after* every inner listener returns, and only a
+  // listener outside it ever sees the model the next request will use.
+  check('…prepended, so it sits outside the model-selection listener', registered?.options?.prepend === true, JSON.stringify(registered?.options))
+
+  /** An assembly as the loop leaves it, with the live selection already applied. */
+  const assembly = (variables = {}) => ({
+    sections: [
+      { name: 'harness:identity', text: 'You are an AI agent powered by DeepSeek Harness.' },
+      { name: 'deployment:persona-prefix', text: 'You are a coding agent powered by the {{model}} model.' },
+      { name: 'deployment:persona-suffix', text: 'Your working directory is {{cwd}}.' },
+      { name: 'tool:bash', text: 'Model {{model}}, literally.', interpolate: false },
+    ],
+    contexts: [],
+    tools: [],
+    variables: { provider: 'cline-pass', model: 'cline-pass/deepseek-v4.1-flash', cwd: '/tmp', ...variables },
+  })
+  const through = (input) => registered.listener(input, {}, () => Promise.resolve(input))
+  const textOf = (result, name) => result.sections.find((section) => section.name === name).text
+
+  const live = await through(assembly())
+  check(
+    'the persona shows the bare DeepSeek id',
+    textOf(live, 'deployment:persona-prefix') === 'You are a coding agent powered by the deepseek-v4.1-flash model.',
+    textOf(live, 'deployment:persona-prefix'),
+  )
+  check('…while the variables keep the wire id', live.variables.model === 'cline-pass/deepseek-v4.1-flash', live.variables.model)
+  check('a sibling variable in the same section still resolves later', textOf(live, 'deployment:persona-suffix') === 'Your working directory is {{cwd}}.')
+  check('a literal (interpolate: false) section is untouched', textOf(live, 'tool:bash') === 'Model {{model}}, literally.')
+  check('the harness identity is untouched', textOf(live, 'harness:identity') === 'You are an AI agent powered by DeepSeek Harness.')
+  check('the input assembly is not mutated', assembly().sections[1].text === 'You are a coding agent powered by the {{model}} model.')
+  check('every other variable in the section is untouched', live.variables.provider === 'cline-pass' && live.variables.cwd === '/tmp', JSON.stringify(live.variables))
+
+  const official = assembly({ provider: 'deepseek', model: 'deepseek-v4-flash' })
+  check('an official bare id is a no-op (same assembly)', (await through(official)) === official)
+  const otherRoute = assembly({ provider: 'other', model: 'other/glm-5.3-flash' })
+  check('another route’s prefixed id is not ours to rename', (await through(otherRoute)) === otherRoute)
+  const bareOnThisRoute = assembly({ model: 'glm-5.3-flash' })
+  check('a bare id on this route is a no-op', (await through(bareOnThisRoute)) === bareOnThisRoute)
+  const prefixOnly = assembly({ model: 'cline-pass/' })
+  check('a prefix with no model behind it is a no-op', (await through(prefixOnly)) === prefixOnly)
+  const noReference = { ...assembly(), sections: [{ name: 'deployment:persona-prefix', text: 'Be brief.' }] }
+  check('a persona without the reference is a no-op', (await through(noReference)) === noReference)
+  check('an assembly with no section list is passed straight through', (await through(undefined)) === undefined)
+
+  const renamed = promptCtx()
+  installPromptDisplay(renamed.ctx, withDefaults({ provider: 'tunnel', model: 'tunnel/deepseek-v4.1-flash' }))
+  const renamedLive = await renamed.listeners.get('system-prompt/assemble').listener(assembly({ provider: 'tunnel', model: 'tunnel/deepseek-v4.1-flash' }), {}, () => Promise.resolve(assembly({ provider: 'tunnel', model: 'tunnel/deepseek-v4.1-flash' })))
+  check(
+    'a renamed route strips its own prefix, not a hardcoded one',
+    textOf(renamedLive, 'deployment:persona-prefix') === 'You are a coding agent powered by the deepseek-v4.1-flash model.',
+    textOf(renamedLive, 'deployment:persona-prefix'),
+  )
+
+  // `plainModelId: false` is what turns the display off; this is the same gate
+  // `apply()` uses, so the option is proven where a user actually sets it.
+  const offCfg = withDefaults({ plainModelId: false })
+  const off = promptCtx()
+  if (offCfg.plainModelId) installPromptDisplay(off.ctx, offCfg)
+  check('plainModelId: false registers no listener', !off.listeners.has('system-prompt/assemble'), JSON.stringify([...off.listeners.keys()]))
 }
 
 console.log(`\nRESULT: ${failures.length === 0 ? 'FETCH OK' : `FAILED (${failures.join(' | ')})`}`)

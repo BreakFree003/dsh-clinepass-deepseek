@@ -84,12 +84,21 @@ console.log('\n── 1. option surface ─────────────�
 
   // 0.12.0 retired the request-side pin: its options load and are dropped, and
   // they are recorded rather than warned about — every stale row would otherwise
-  // warn on every boot.
+  // warn on every boot. `plainModelId` was dropped along with them by mistake and
+  // is a real option again since 0.12.2 (the prompt display), so it is NOT in
+  // this list.
   const retiredLogs = recorder()
-  const retired = withDefaults({ pin: ['deepseek'], pins: { m: [] }, providerPins: { m: ['z.ai'] }, enforcement: 'warn', retries: 2, alignReasoningEffort: false, plainModelId: false }, retiredLogs)
-  check('the retired pin options are recorded, not fatal', ['pin', 'pins', 'providerPins', 'enforcement', 'retries', 'alignReasoningEffort', 'plainModelId'].every((name) => retired.ignoredOptions.includes(name)), JSON.stringify(retired.ignoredOptions))
+  const retired = withDefaults({ pin: ['deepseek'], pins: { m: [] }, providerPins: { m: ['z.ai'] }, enforcement: 'warn', retries: 2, alignReasoningEffort: false }, retiredLogs)
+  check('the retired pin options are recorded, not fatal', ['pin', 'pins', 'providerPins', 'enforcement', 'retries', 'alignReasoningEffort'].every((name) => retired.ignoredOptions.includes(name)), JSON.stringify(retired.ignoredOptions))
   check('…silently, so a stale row does not warn on every boot', retiredLogs.lines.warn.length === 0, JSON.stringify(retiredLogs.lines.warn))
   check('…and they are not part of the config', retired.pin === undefined && retired.enforcement === undefined && retired.retries === undefined)
+
+  // The prompt display is on by default and selects `withoutRoutePrefix`; only an
+  // explicit `false` turns it off, and it is never a retired key.
+  check('the prompt display is on by default', withDefaults({}).plainModelId === true)
+  check('plainModelId: false turns it off', withDefaults({ plainModelId: false }).plainModelId === false)
+  check('…and it is a real option, not a retired one', !withDefaults({ plainModelId: false }).ignoredOptions.includes('plainModelId'), JSON.stringify(withDefaults({ plainModelId: false }).ignoredOptions))
+  check('a non-false value leaves the display on', withDefaults({ plainModelId: true }).plainModelId === true && withDefaults({ plainModelId: 'no' }).plainModelId === true)
 
   // Passing an already-normalised config through again (apply does) must not
   // re-warn or lose the record.
