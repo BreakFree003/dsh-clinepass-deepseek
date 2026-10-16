@@ -284,15 +284,20 @@ console.log('\n── 3. createUsageHandler ────────────
   check('an unexpected throw answers 500 rather than rejecting', crashResponse.status === 500 && crashBody.reason === 'internal', JSON.stringify(crashBody))
   check('…and is reported to the log', log.lines.warn.length === 1, JSON.stringify(log.lines.warn))
 
-  // ?status=1 queries hook status without hitting gateway or exploding credentials
+  // ?status=1 reads the observer's memory: no gateway call, no credential lookup.
   const mockHook = {
-    state: () => ({ lastVerified: { provider: 'openai-compatible-private', model: 'cline-pass/deepseek-v4.1-flash' } }),
-    verifiedBySession: (sid) => (sid === 'sess-abc' ? { provider: 'together', model: 'cline-pass/glm-5.3-flash', warn: true, reason: 'provider=Together，允许的是 z.ai' } : null),
+    status: () => ({ lastVerified: { provider: 'openai-compatible-private', model: 'cline-pass/deepseek-v4.1-flash', at: '2026-10-16T00:00:00.000Z', anonymized: true } }),
+    verifiedBySession: (sid) => (sid === 'sess-abc' ? { provider: 'together', model: 'cline-pass/glm-5.3-flash', at: '2026-10-16T01:00:00.000Z', anonymized: false } : null),
   }
   const statusHandler = createUsageHandler(exploding, cfg, log, { hook: mockHook })
   const statusRes = await statusHandler(new Request('http://127.0.0.1:3080/api/clinepass.usage?status=1&sessionId=sess-abc'))
   const statusJson = await statusRes.json()
-  check('?status=1 answers hook status matching session', statusJson.ok === true && statusJson.provider === 'together' && statusJson.warn === true && statusJson.reason.includes('Together'), JSON.stringify(statusJson))
+  check('?status=1 answers the observer status for that session', statusJson.ok === true && statusJson.provider === 'together' && statusJson.anonymized === false && statusJson.model === 'cline-pass/glm-5.3-flash' && statusJson.at === '2026-10-16T01:00:00.000Z', JSON.stringify(statusJson))
+  check('…with no gating fields left', !('warn' in statusJson) && !('allowed' in statusJson) && !('reason' in statusJson) && !('attempts' in statusJson), JSON.stringify(statusJson))
+
+  const emptyHook = createUsageHandler(exploding, cfg, log, { hook: { status: () => ({ lastVerified: null }) } })
+  const emptyJson = await (await emptyHook(new Request('http://127.0.0.1:3080/api/clinepass.usage?status=1&sessionId=nope'))).json()
+  check('…and no observation answers no-observation', emptyJson.ok === false && emptyJson.reason === 'no-observation', JSON.stringify(emptyJson))
 }
 
 // ── 4. route registration ───────────────────────────────────────────────────
@@ -1046,16 +1051,29 @@ console.log('\n── 8. client render ─────────────�
     )
     check('…renders nothing while the session has no model selection yet', blankDock === null, JSON.stringify(blankDock))
 
-    // warn 模式：状态查询说 warn=true 时，胶囊必须把它显示出来（⚠️ + 原因进 tooltip）。
-    globalThis.window.__ANSWER__ = { ok: true, provider: 'together', anonymized: false, warn: true, reason: 'finalProvider=together，允许的是 deepseek' }
-    const warnedDock = await renderChecked(
+    // 0.12.0：状态查询不再有 warn/reason —— 胶囊只显示 provider 名，匿名时才换样式。
+    globalThis.window.__ANSWER__ = { ok: true, provider: 'together', anonymized: false, model: 'cline-pass/glm-5.3-flash', at: '2026-10-16T00:00:00.000Z' }
+    const plainDock = await renderChecked(
+      dockMount.dockSeat,
+      dockMount.stub,
+      dockProps({ lastUsed: { provider: 'cline-pass', model: 'cline-pass/glm-5.3-flash' }, next: null }),
+      'the second-provider re-render keeps the same hook count',
+    )
+    check('another provider is shown by name', textOf(plainDock).join(' ').includes('Provider: together'), textOf(plainDock).join(' | '))
+    check('…with no gating suffix', !textOf(plainDock).join(' ').includes('⚠️'), textOf(plainDock).join(' | '))
+    check('…and no gating reason in the tooltip', plainDock?.children?.[0]?.props?.title === '网关返回提供方: together', JSON.stringify(plainDock?.children?.[0]?.props?.title ?? null))
+
+    // 匿名渠道仍要能认出来：告警配色 + 说明性 tooltip。
+    globalThis.window.__ANSWER__ = { ok: true, provider: 'openai-compatible-private', anonymized: true, model: 'cline-pass/deepseek-v4.1-flash', at: '2026-10-16T00:00:00.000Z' }
+    const anonDock = await renderChecked(
       dockMount.dockSeat,
       dockMount.stub,
       dockProps({ lastUsed: { provider: 'cline-pass', model: 'cline-pass/deepseek-v4.1-flash' }, next: null }),
-      'the warn-mode re-render keeps the same hook count',
+      'the anonymized re-render keeps the same hook count',
     )
-    check('a warned provider is labelled with ⚠️', textOf(warnedDock).join(' ').includes('Provider: together ⚠️'), textOf(warnedDock).join(' | '))
-    check('…and the reason reaches the tooltip', warnedDock?.children?.[0]?.props?.title?.includes('finalProvider=together') === true, JSON.stringify(warnedDock?.children?.[0]?.props?.title ?? null))
+    check('an anonymized provider is labelled', textOf(anonDock).join(' ').includes('Provider: openai-compatible-private'), textOf(anonDock).join(' | '))
+    check('…and explained in the tooltip', typeof anonDock?.children?.[0]?.props?.title === 'string' && anonDock.children[0].props.title.includes('openai-compatible-private'), JSON.stringify(anonDock?.children?.[0]?.props?.title ?? null))
+    check('…without a gating badge', !textOf(anonDock).join(' ').includes('⚠️'), textOf(anonDock).join(' | '))
 
     // 轮询：running 为真时挂一个 2 秒的 ticker，running 落下后清掉（useSession 是
     // 上一条用例唯一没覆盖的路径 —— 没传它时 running 恒为 false，ticker 永不出现）。

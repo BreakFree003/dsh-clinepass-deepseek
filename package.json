@@ -1,7 +1,7 @@
 {
   "name": "dsh-clinepass",
-  "version": "0.11.4",
-  "description": "Cline Pass for DeepSeek Harness: an OpenAI-compatible provider route whose requests are pinned to the DeepSeek upstream channel, with the API key entered on Settings → Models.",
+  "version": "0.12.0",
+  "description": "Cline Pass for DeepSeek Harness: an OpenAI-compatible provider route that provisions itself on Settings → Models, reports the real upstream provider it sees in the gateway's chat responses (composer pill + status file), and draws the Cline Pass usage card. It never rewrites a request.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -47,8 +47,9 @@
     "cline",
     "cline-pass",
     "provider",
-    "plugin",
-    "deepseek"
+    "provider-observer",
+    "usage",
+    "plugin"
   ],
   "license": "MIT",
   "repository": {

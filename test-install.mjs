@@ -181,7 +181,7 @@ console.log('\n── 5. canonical rows / upgrades ─────────�
   const row = h.read(h.patchPath)
   check('the canonical row sets no transport', !/transport:/.test(row), JSON.stringify(row))
   check('the canonical row opens no listener', !/listen:/.test(row), JSON.stringify(row))
-  check('the canonical row still names the gateway and the pin', /upstream: https:\/\/api\.cline\.bot/.test(row) && /- deepseek/.test(row))
+  check('the canonical row names the gateway and nothing else', /upstream: https:\/\/api\.cline\.bot/.test(row) && !/pin:/.test(row) && !/enforcement:/.test(row) && !/retries:/.test(row), JSON.stringify(row))
   h.install()
   check('re-installing is idempotent', (h.read(h.patchPath).match(/id: clinepass/g) ?? []).length === 1)
 
@@ -209,7 +209,7 @@ console.log('\n── 5. canonical rows / upgrades ─────────�
   const loaderRow = after.slice(0, after.indexOf('- id: llm-pi-ai'))
   check(
     'a legacy row is upgraded to the canonical config',
-    !/baseURL:/.test(loaderRow) && !/listen:/.test(loaderRow) && /pin:\n          - deepseek/.test(loaderRow),
+    !/baseURL:/.test(loaderRow) && !/listen:/.test(loaderRow) && !/pin:/.test(loaderRow) && /upstream: https:\/\/api\.cline\.bot/.test(loaderRow),
     JSON.stringify(loaderRow),
   )
   check('upgrading keeps exactly one row', (after.match(/id: clinepass/g) ?? []).length === 1)

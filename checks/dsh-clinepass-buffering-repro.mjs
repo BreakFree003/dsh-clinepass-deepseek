@@ -1,19 +1,22 @@
 /**
- * Stream pacing check for the dsh-clinepass pin gate.
+ * Stream pacing check for the dsh-clinepass observer.
  *
- * `enforcement: off` and `strict` must pace the body the same way: the gate
- * forwards every frame as it arrives and holds back only the SSE terminator
- * until `gateway.routing` has been judged. If `strict` ever collapses to a
- * single late chunk again, someone has reintroduced "read the whole response,
- * then release it" — which restores the pin but destroys the chunk arrival
- * times dsh measures output speed (TPS) from.
+ * The observer must relay the body **exactly as it arrived**: every frame
+ * forwarded on its own, as soon as the upstream produced it. If it ever
+ * collapses to a single late chunk, someone has reintroduced "read the whole
+ * response, then release it" — which would destroy the chunk arrival times dsh
+ * measures output speed (TPS) from. That risk is the whole reason the observer
+ * wraps the body in a pull-driven stream instead of returning a buffered clone.
  *
- * A mock upstream streams 40 SSE frames, 25 ms apart (~1 s total).
+ * A mock upstream streams 40 SSE frames, 25 ms apart (~1 s total), then the
+ * routing metadata and `[DONE]`.
+ *
+ * Run after deploying the package:  node checks/dsh-clinepass-buffering-repro.mjs
  */
 
 // 同 dsh-clinepass/checks/dsh-clinepass-streaming-gate-check.mjs：路径是安装包（2026-09-27 起），不是
 // profile 的 plugins/dsh-clinepass。
-import { createFetchPin } from '/Users/breakfree/.dsh/profiles/web/node_modules/dsh-clinepass/index.js'
+import { createFetchObserver } from '/Users/breakfree/.dsh/profiles/web/node_modules/dsh-clinepass/index.js'
 
 const GATEWAY = 'https://api.cline.bot'
 const CHAT = `${GATEWAY}/api/v1/chat/completions`
@@ -68,15 +71,14 @@ const init = {
     messages: [{ role: 'user', content: 'hi' }],
     stream: true,
     max_tokens: 512,
-    providerOptions: { gateway: { only: ['deepseek'] } },
   }),
 }
 
-async function run(enforcement) {
+async function run(label) {
   const realFetch = globalThis.fetch
   globalThis.fetch = async () => mockUpstream()
-  const hook = createFetchPin({ upstream: GATEWAY, enforcement }, quiet)
-  hook.install()
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: false }, quiet)
+  observer.install()
   const t0 = Date.now()
   const response = await globalThis.fetch(CHAT, init)
   const reader = response.body.getReader()
@@ -86,16 +88,32 @@ async function run(enforcement) {
     if (done) break
     arrivals.push({ at: Date.now() - t0, bytes: value.byteLength })
   }
-  hook.uninstall()
+  await sleep(10)
+  const observed = observer.status().lastVerified
+  observer.uninstall()
   globalThis.fetch = realFetch
   const span = arrivals.at(-1) ? arrivals.at(-1).at - arrivals[0].at : 0
   console.log(
-    `enforcement=${enforcement.padEnd(7)} status=${response.status}  chunks=${String(arrivals.length).padStart(3)}` +
+    `${label.padEnd(26)} status=${response.status}  chunks=${String(arrivals.length).padStart(3)}` +
       `  first=${String(arrivals[0]?.at ?? -1).padStart(5)}ms  last=${String(arrivals.at(-1)?.at ?? -1).padStart(5)}ms` +
-      `  spread=${String(span).padStart(5)}ms  upstream spread=${FRAMES * GAP_MS}ms`,
+      `  spread=${String(span).padStart(5)}ms  upstream spread=${FRAMES * GAP_MS}ms  observed=${observed?.provider ?? '(none)'}`,
   )
   console.log('   first 5 arrivals (ms since request):', arrivals.slice(0, 5).map((a) => a.at).join(', '))
+  return { arrivals, span, status: response.status, observed }
 }
 
-await run('off')
-await run('strict')
+const plain = await run('observer installed')
+
+const checks = [
+  ['every frame is relayed as its own chunk', plain.arrivals.length === FRAMES + 2, `${plain.arrivals.length} chunks for ${FRAMES + 2} frames`],
+  ['…spread over the upstream timeline, not in one lump', plain.span >= GAP_MS * (FRAMES - 2), `span=${plain.span}ms`],
+  ['…with the first frame delivered immediately', plain.arrivals[0].at <= GAP_MS * 2, `first=${plain.arrivals[0].at}ms`],
+  ['…and the observer still records the provider', plain.observed?.provider === 'deepseek', JSON.stringify(plain.observed)],
+]
+let failed = 0
+for (const [label, pass, detail] of checks) {
+  console.log(`${pass ? '  ok  ' : ' FAIL '} ${label}${detail === undefined ? '' : ` — ${detail}`}`)
+  if (!pass) failed += 1
+}
+console.log(failed === 0 ? '\nPACING OK' : `\nPACING FAILED (${failed})`)
+process.exit(failed === 0 ? 0 : 1)

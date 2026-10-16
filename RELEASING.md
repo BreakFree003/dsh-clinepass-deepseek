@@ -17,7 +17,8 @@
 - 改 `package.json` 的 `version`；
 - 在 `CHANGELOG.md` **顶部**加 `## <version>` 段（`test-package.mjs` 会断言「顶段 ==
   manifest 版本」，加错位置会直接把测试跑红）；
-- README 里那两处**锁版本的示例**（中文段与英文段）改成新 tag —— 它是文档里最容易过期的一行；
+- README 安装一节里那个**锁版本的示例**（`dsh plugin … add github:…#vX.Y.Z`）改成新 tag ——
+  它是文档里最容易过期的一行（README 现在只有这一处版本号，别再加第二处）；
 - 扫一遍 README / CHANGELOG 里**互相打架**的地方：计数、版本号、安装示例引用的 tag、
   以及「某行为已变」之后还留在 FAQ 里的旧说法。**记不住的数就不要写** ——
   写清结论即可（例：「写法换过很多种」而不是「一共试过 N 种」）。
@@ -46,8 +47,7 @@ git push origin v<version>
 ```
 
 - tag 用 **annotated**（`-a`），message 跟已有的保持一致：`dsh-clinepass <version>`。
-- **公开出去的 tag 不要重打。** README 里 v0.6.0 / v0.6.1 两处都记着这条：任何按 commit
-  pin 过的 lockfile 都会被重打弄坏。
+- **公开出去的 tag 不要重打。** 任何按 commit pin 过的 lockfile 都会被重打弄坏；要改就用新版本号。
 - 只给**真正产出过 `package.json` 版本**的版本打 tag / release。例：0.7.1 与 0.7.2 是同一批
   改动，`package.json` 直接跳到 0.7.2，所以 0.7.1 只有 CHANGELOG 段，没有 tag、也没有 release。
 

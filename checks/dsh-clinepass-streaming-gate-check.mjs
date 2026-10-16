@@ -1,21 +1,32 @@
 /**
- * End-to-end check of the streamed pin gate against the REAL reader.
+ * End-to-end check of the in-process **observer** against the REAL reader.
  *
- * The plugin's own tests read the response body by hand. The part that can
+ * The plugin's own tests read response bodies by hand. The part that can
  * silently break is the interaction with the OpenAI SDK (which is what
- * `@earendil-works/pi-ai` uses): if withholding `data: [DONE]` until the verdict
- * confuses the SDK, messages would stop assembling. So drive the real SDK
- * through the installed hook, on a mock gateway that streams like the real one.
+ * `@earendil-works/pi-ai` uses): if the pass-through stream reorders or delays
+ * frames, or ends the body somewhere the SDK does not expect, messages stop
+ * assembling. So the real SDK is driven through the installed observer, on a
+ * mock gateway that streams exactly like the real one.
+ *
+ * What this proves, in observer terms (0.12.0):
+ *   1. the SDK's request reaches the gateway **unmodified** — no injected
+ *      routing field, same model id, one call;
+ *   2. the stream still assembles into a complete assistant message, with the
+ *      deltas arriving as they were produced;
+ *   3. the observer still reads the real upstream out of that same response,
+ *      including the anonymous fallback-net label.
+ *
+ * Run after deploying the package:  node checks/dsh-clinepass-streaming-gate-check.mjs
  */
 import OpenAI from '/Users/breakfree/.dsh/profiles/web/node_modules/openai/index.mjs'
 // 装在 node_modules 里的安装包（自 2026-09-27 起；此前是 profile 的 plugins/dsh-clinepass，
 // 那条路径已经不存在了 —— 别把这里改回去）。手动安装路线才会落在 plugins/ 下。
-import { createFetchPin } from '/Users/breakfree/.dsh/profiles/web/node_modules/dsh-clinepass/index.js'
+import { createFetchObserver } from '/Users/breakfree/.dsh/profiles/web/node_modules/dsh-clinepass/index.js'
 
 const GATEWAY = 'https://api.cline.bot'
-const CHAT = `${GATEWAY}/api/v1/chat/completions`
 const enc = (text) => new TextEncoder().encode(text)
 const quiet = { info() {}, warn() {}, error() {} }
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const delta = (index) => `data: ${JSON.stringify({
   id: 'gen_test', object: 'chat.completion.chunk', created: 1, model: 'deepseek/deepseek-v4.1-flash',
@@ -47,8 +58,9 @@ const routingFrame = (provider) => `data: ${JSON.stringify({
 })}\n\n`
 
 /** A mock gateway that streams like the real one: deltas, a flush frame, routing, then [DONE]. */
-function mockGateway(provider, { gapMs = 10, deltas = 6, holdMs = 150 } = {}) {
-  return async () => {
+function mockGateway(provider, received, { gapMs = 10, deltas = 6, holdMs = 150 } = {}) {
+  return async (input, init) => {
+    received.push({ input, init })
     const stream = new ReadableStream({
       async start(controller) {
         for (let index = 0; index < deltas; index += 1) {
@@ -66,11 +78,12 @@ function mockGateway(provider, { gapMs = 10, deltas = 6, holdMs = 150 } = {}) {
   }
 }
 
-async function run(label, provider, enforcement) {
+async function run(label, provider) {
   const realFetch = globalThis.fetch
-  globalThis.fetch = mockGateway(provider)
-  const hook = createFetchPin({ upstream: GATEWAY, enforcement }, quiet)
-  hook.install()
+  const received = []
+  globalThis.fetch = mockGateway(provider, received)
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: false }, quiet)
+  observer.install()
   const client = new OpenAI({ apiKey: 'sk_test', baseURL: `${GATEWAY}/api/v1` })
   const arrivals = []
   let assembled = ''
@@ -83,39 +96,49 @@ async function run(label, provider, enforcement) {
     )
     for await (const chunk of stream) {
       const text = chunk.choices[0]?.delta?.content ?? ''
-      if (text !== '') { assembled += text; arrivals.push({ text, at: Date.now() }) }
+      if (text !== '') {
+        assembled += text
+        arrivals.push({ text, at: Date.now() })
+      }
     }
     completed = true
   } catch (error) {
     failure = error
   }
-  hook.uninstall()
+  await sleep(10)
+  const observed = observer.status().lastVerified
+  const counters = { ...observer.counters }
+  observer.uninstall()
   globalThis.fetch = realFetch
   const spread = arrivals.length > 1 ? arrivals.at(-1).at - arrivals[0].at : 0
+  const sentBody = typeof received[0]?.init?.body === 'string' ? received[0].init.body : null
   console.log(
     `${label.padEnd(26)} assembled=${JSON.stringify(assembled)}  chunks=${arrivals.length}` +
-      `  spread=${String(spread).padStart(4)}ms  error=${failure === null ? 'none' : JSON.stringify(failure.message.slice(0, 60))}` +
-      `  blocked=${hook.counters.blocked}`,
+      `  spread=${String(spread).padStart(4)}ms  observed=${observed?.provider ?? '(none)'}` +
+      `  anonymized=${String(observed?.anonymized ?? false)}  error=${failure === null ? 'none' : JSON.stringify(failure.message.slice(0, 60))}`,
   )
-  return { assembled, failure, completed }
+  return { assembled, failure, completed, arrivals, observed, received, sentBody, counters }
 }
 
-const ok = await run('strict + deepseek', 'deepseek', 'strict')
-const foreign = await run('strict + alibaba', 'alibaba', 'strict')
-const warned = await run('warn + alibaba', 'alibaba', 'warn')
+const ok = await run('deepseek (first-party)', 'deepseek')
+const anon = await run('openai-compatible-private', 'openai-compatible-private')
 
-const spread = (r) => (r.arrivals ?? []).length
 const checks = [
   ['a verified stream completes through the SDK', ok.completed && ok.assembled === 'tok0tok1tok2tok3tok4tok5'],
   ['…with no SDK error', ok.failure === null],
-  ['a foreign stream makes the SDK throw instead of completing', !foreign.completed && foreign.failure !== null],
-  ['…so no completed assistant message reaches the caller', !foreign.completed],
-  ['…while its deltas were already delivered (the documented tradeoff)', foreign.assembled.length > 0],
-  ['warn streams to completion regardless', warned.completed && warned.assembled === 'tok0tok1tok2tok3tok4tok5' && warned.failure === null],
+  ['…and the deltas arrived spread over the stream, not in one lump', ok.arrivals.length === 6 && ok.arrivals.at(-1).at - ok.arrivals[0].at >= 40],
+  ['the observer saw exactly one gateway call', ok.received.length === 1, String(ok.received.length)],
+  ['…and the SDK body went out with no injected routing field', ok.sentBody !== null && !ok.sentBody.includes('providerOptions') && !ok.sentBody.includes('"provider"'), ok.sentBody],
+  ['…and the model id reached the wire unchanged', ok.sentBody !== null && JSON.parse(ok.sentBody).model === 'cline-pass/deepseek-v4.1-flash'],
+  ['the observer recorded the real provider', ok.observed?.provider === 'deepseek', JSON.stringify(ok.observed)],
+  ['…and counted it as verified', ok.counters.verified === 1 && ok.counters.unknown === 0, JSON.stringify(ok.counters)],
+  ['an anonymized upstream still completes through the SDK', anon.completed && anon.assembled === 'tok0tok1tok2tok3tok4tok5' && anon.failure === null],
+  ['…and is reported as the anonymous label', anon.observed?.provider === 'openai-compatible-private' && anon.observed?.anonymized === true, JSON.stringify(anon.observed)],
+  ['…counted separately', anon.counters.anonymized === 1, JSON.stringify(anon.counters)],
 ]
 let failed = 0
-for (const [label, pass] of checks) {
-  console.log(`${pass ? '  ok  ' : ' FAIL '} ${label}`)
+for (const [label, pass, detail] of checks) {
+  console.log(`${pass ? '  ok  ' : ' FAIL '} ${label}${detail === undefined ? '' : ` — ${detail}`}`)
   if (!pass) failed += 1
 }
 console.log(failed === 0 ? '\nE2E OK' : `\nE2E FAILED (${failed})`)

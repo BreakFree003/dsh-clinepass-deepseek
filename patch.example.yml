@@ -1,43 +1,39 @@
 # The loader row dsh-clinepass needs in a profile's cordis.patch.yml.
 #
-# Since 0.8.0 the Cline Pass *provider card* is a second patch row that ships
-# with the package (`cordis.patch.yml`) and is appended by install.mjs — see the
-# README section 「卡片怎么来的：随包声明」. It is declared rather than written at
-# run time because on dsh 0.1.7 that write is not dependable (the settings
-# service is not up at a cold start, and on a fresh profile the write waits on
-# the profile manifest's writer lock). If you declare `- id: llm-pi-ai` yourself,
-# copy the `cline-pass:` block from the README into your row — a patch row
-# replaces that row's whole config, so it would otherwise drop this provider.
+# The Cline Pass *provider card* is a second patch row that ships with the
+# package (`cordis.patch.yml`) and is also appended by install.mjs — see the
+# README section 「卡片从哪来」. It is declared rather than written at run time
+# because on dsh 0.1.7 that write is not dependable (the settings service is not
+# up at a cold start, and on a fresh profile the write waits on the profile
+# manifest's writer lock). If you declare `- id: llm-pi-ai` yourself, copy the
+# `cline-pass:` block from the README into your row — a patch row replaces that
+# row's whole config, so it would otherwise drop this provider. Include
+# `reasoningEfforts` there: the runtime provisioner only aligns
+# `contextWindow`/`maxTokens` and never touches the levels.
 #
-# `upstream` and `pin` have working defaults (https://api.cline.bot,
-# ["deepseek"]), so mounting this row is enough. install.mjs appends it for you.
+# `upstream` has a working default (https://api.cline.bot), so mounting this row
+# is enough. install.mjs appends it for you.
+#
+# 0.12.0 removed the request-side pin, enforcement and retries: the plugin is an
+# **observer** now, so there is nothing left to configure about a request. A row
+# that still carries `pin` / `pins` / `providerPins` / `enforcement` / `retries`
+# (or `alignReasoningEffort` / `plainModelId`) loads fine — those keys are
+# ignored and listed in the status file's `ignoredOptions`.
 - insert:
     - id: clinepass
       name: './plugins/dsh-clinepass/index.js'
       config:
-        # Real gateway origin. The profile is pointed straight at it: the pin is
-        # injected in-process by wrapping `globalThis.fetch`, so this plugin
+        # Real gateway origin. The profile is pointed straight at it; the
+        # observer wraps `globalThis.fetch` in this process, so this plugin
         # opens no listener and no port.
         upstream: https://api.cline.bot
-        # Upstream channels every pinned request is restricted to. 0.11.1 adds
-        # the gateway's anonymized label for the fallback-net shape (real
-        # channel names are no longer written into routing metadata since
-        # 2026-10-14); `deepseek` stays listed so verification resumes
-        # automatically if the label ever goes back to a real name. The first
-        # message of a conversation served via the anonymized channel carries
-        # a one-line warning; remove the entry to refuse it again.
-        pin:
-          - deepseek
-          - openai-compatible-private
-        # Optional: per-model pins, e.g.
-        # pins:
-        #   cline-pass/deepseek-v4.1-flash:
-        #     - deepseek
-        # Optional: where the running plugin reports its state
-        # (`hook`/`seen`/`pinned`/`lastPin`). Defaults to
-        # <DSH_HOME>/dsh-clinepass-status.json; `false` turns it off.
+        # Optional: where the running plugin reports what it has seen
+        # (`hook` / `counters.seen` / `verified` / `anonymized` / `unknown` /
+        # `lastVerified`). Defaults to <DSH_HOME>/dsh-clinepass-status.json;
+        # `false` turns it off.
         # statusFile: /tmp/dsh-clinepass-status.json
-        # Optional: `false` to skip provisioning the provider card, and
-        # `false` to skip migrating a stored reasoning effort.
+        # Optional: `false` skips provisioning the provider card (declare it in
+        # your own `- id: llm-pi-ai` row instead), `false` on `usage` skips
+        # mounting the usage route behind the Settings → Models card.
         # provision: true
-        # alignReasoningEffort: true
+        # usage: true

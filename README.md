@@ -1,410 +1,74 @@
 # dsh-clinepass
 
-把 **Cline Pass** 接进 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh），并把每条请求**钉死在 DeepSeek 官方渠道**上（不回退）。
-API key 在 **设置 → 模型** 里直接填，卡片上还带一条 **5 小时 / 每周 / 每月** 的用量条（显示剩余量）。**默认不开任何本地端口。**
+把 **Cline Pass** 接进 DeepSeek Harness：注册一条 OpenAI 兼容的 pi-ai 路由 `cline-pass`，并做两件事 ——
 
-> Cline Pass for DeepSeek Harness. One provider route, pinned to the DeepSeek upstream channel, with the API key entered on **Settings → Models** — plus a usage card for the 5-hour, weekly and monthly windows.
+1. **观察真实 Provider**：只读地看这条路由的聊天响应，读出上游到底是谁（含网关的匿名标签
+   `openai-compatible-private`），写进状态文件，供 composer 底部的 **Provider 胶囊**显示；
+2. **画用量卡**：设置 → 模型 → Cline Pass 卡片上的 5 小时 / 每周 / 每月用量条。
 
-> **分享性质，非长期维护项目。** 这是作者自用插件的公开快照：按 MIT **原样**提供，
-> **不承诺持续维护，也不承诺跟进上游 dsh 的接口漂移**。插件依赖 dsh 的内部行为
-> （pi-ai 每次请求新建 client、不传自己的 `options.fetch`，因此真正发请求的是全局
-> `fetch`）；上游哪天改掉这一点，插件会**静默失效**——下面的状态文件
-> （`hook: installed`）就是为这件事准备的报警器。装之前建议先读「验证」一节。
-> 能跑测试不代表上游永远不变。
->
-> 维护者发版走 [RELEASING.md](./RELEASING.md) 里的清单 —— **tag 和 GitHub Release 是两件事**，
-> 只推 tag 的话 Releases 页面会是空的。
+**它不改写任何请求。** 不碰 body、不碰 headers、不重试、不另发请求；SSE 响应逐帧转发，
+不在本地缓冲整包。这是 0.12.0 的形态，也是它和 0.11.x 最大的区别（见「迁移」）。
 
----
-
-## 它做了什么（架构）
-
-四件事各由最合适的部分负责：
-
-1. **路由本身**是一个普通的 **pi-ai provider profile**（`llm-pi-ai.providers.cline-pass`）：OpenAI 兼容协议 + 一个存在凭据库里的 key。
-   正因为如此，它才会**原生出现在「设置 → 模型」**里 —— key 输入框、模型目录、地址都是 dsh 自带的界面，不需要自写 UI，也不需要一个可能随 dsh 升级而漂移的手写流式 adapter。
-
-2. **本插件**只做一件事：给请求体加上**渠道钉选字段**。
-   Cline Pass 的钉选是请求体里的 `providerOptions.gateway.only`，而 dsh 刻意屏蔽了 pi-ai 的 `openRouterRouting` / `vercelGatewayRouting` 兼容开关 —— settings 里写不了。插件把这个字段加在**出去的请求**上，字节层面其它什么都不動，SSE / 工具调用 / 推理 / 用量 / 图片全部走 pi-ai 已验证的通路。
-
-3. **提示词里的模型名去前缀**（0.6.2 起）。网关要求请求体的 `model` 是 `type/model` 形状（裸 id 会被拒：
-   `invalid model format. Expected format: modelType/model`），而 dsh 把 catalog 的 `models[].id` 原样发给线上 ——
-   所以这条路由的 id 必须写成 `cline-pass/deepseek-v4.1-flash`。前缀是**传输层**的要求，但 `{{model}}`
-   会把它当模型名渲染进 persona，而官方部署的提示词里是没有前缀的（官方 `deepseek` 路由的 id 本身就是裸 id）。
-   插件因此在提示词**装配**时把 persona 两段模板里的 `{{model}}` 换成 `deepseek-v4.1-flash`：线上 id、
-   会话记录、选择器都不动，只改提示词显示。详见下面的 `plainModelId` 选项。
-
-4. **Cline Pass 卡片上的用量条**（0.7.0 起）：5 小时 / 每周 / 每月三条，显示**剩余**百分比、重置倒计时和读取
-   时间，带一个刷新按钮。数据由**宿主半边**用凭据库里的 key 去问网关
-   （`GET https://api.cline.bot/api/v1/users/me/plan/usage-limits`，与开源的
-   [CodexBar](https://github.com/steipete/CodexBar) 同一个端点），挂在一条同源路径上给浏览器读 ——
-   **浏览器永远拿不到 key**。详见下面的「用量条」一节。
-
-
-```
-dsh ──pi-ai──> https://api.cline.bot/api/v1   （进程内改写请求体，无监听、无端口）
-```
-
-注入方式是**进程内**的：包一层 `globalThis.fetch`，只改写发往**本网关**的 `chat/completions` 请求体。
-依赖的是 pi-ai 的既有行为（它每次请求新建 client、不传自己的 `options.fetch`，所以真正承载请求的就是全局 fetch）；万一将来 dsh 改成自带 fetch，就会**静默失效** —— 下面的状态文件就是为此存在的。
-
-> **0.5.0 起，本插件不再开任何监听。** 之前的 loopback 反代 transport（`transport: proxy` / `listen` / `captureDir`）已经删除；旧配置里还留着这些字段不会报错，但会在启动日志里被指出一次并忽略。
->
-> **0.7.0 起多了一条「路径」，仍然没有监听。** 用量条需要浏览器读一份宿主取来的数据，插件把它注册成
-> dsh **自己那台 HTTP 服务**上的一条 exact 路由（`/api/clinepass.usage`，走
-> `ctx.connection.fetch.register`）—— 加的是**路径**，不是端口、不是 socket、不是第二次监听；
-> 插件进程里依然没有任何 `listen`。这条路径在 dsh 自己的 Host/Origin 信任栅栏和浏览器 cookie
-> 认证**之后**才被派发，和设置页读凭据走的是同一层。
-
-
-只有落到 `upstream` 这一个 origin 的 `chat/completions` 会被改写；**其它 provider 的请求连对象都不会被复制**（同一个 `init` 原样传给原函数）。
-
-## 钉选现在由本地兑现（2026-09-22 起，**必读**）
-
-`providerOptions.gateway.only` 是 [Vercel AI Gateway 文档](https://vercel.com/docs/ai-gateway/models-and-providers/provider-options)里的「钉住渠道」写法，
-`api.cline.bot` 曾经执行它。**现在不再执行了。** 实测（2026-09-22）：
-
-| 请求里的 only | HTTP | 响应里的 `routing.finalProvider` | `fallbacksAvailable` |
-| --- | --- | --- | --- |
-| `['deepseek']` | 200 | `deepseek` | **15~16 个渠道** |
-| `['baseten']`（2026-09-30 的决定性对照） | 200 | `deepseek` | **16 个渠道** |
-| `['__no_such_upstream__']`（不可能存在） | 200 | `deepseek` | **15~16 个渠道** |
-| 完全不传 | 200 | `deepseek` | **15~16 个渠道** |
-
-几种请求的 `routing` 元数据逐字相同，`planningReasoning` 都是
-`System credentials planned for: deepseek, alibaba, … Total execution order: deepseek(system) → alibaba(system) → …`
-—— 规划器把全部 16 个 system 渠道按顺序排进计划，`only` 连痕迹都没有。写法换过很多种
-（`order` / `models` / `sort` / 顶层 `only` / 顶层 `provider: { only }` /
-`provider: { order, allow_fallbacks: false }` / `providerOptions.only` / snake_case / 双写 …），
-`routing` 的字段集合每次都一模一样。
-
-最决定性的一条是 **`sort`**：[Vercel 文档](https://vercel.com/docs/ai-gateway/models-and-providers/provider-filtering-and-ordering)
-写明 `sort` 生效时响应元数据里会出现 `gateway.routing.sort`。实测发 `sort: "cost"` /
-`sort: "ttft"`，`routing` 里**没有** `sort` 字段 —— 也就是说整个 provider 路由选项块都被
-网关丢掉了，不是「写法不对」。所以 **「钉到 DeepSeek 官方渠道」不能靠请求字段实现**，
-只能由本插件在本地兑现。
-
-### 2026-09-30 复测：网关的元数据形状变了，结论没变
-
-同一天又打了一轮真网关（`max_tokens: 512`、非流式、每种形状 2 次），两件事值得记下来：
-
-1. **`routing` 多了新字段、也少了一些旧写法**：出现了
-   `affinity: {outcome, pinnedProvider}`、嵌套的 `modelAttempts[].providerAttempts[]`、
-   `totalProviderAttemptCount`、`originalModelId`、`clientSessionId`、`clientSessionIdSource`。
-   插件读的 `finalProvider` / `resolvedProvider` / `modelAttempts[].providerAttempts[]` 都还在，
-   而且解析是**递归找 `routing`**、不认路径，所以本地闸不需要跟着改。
-2. **钉选仍然不被执行**：钉 `['baseten']` 照样由 `deepseek` 服务，元数据与「钉 deepseek」
-   「钉一个不存在的渠道」「完全不钉」逐字相同。`affinity.pinnedProvider` 永远是 `deepseek`
-   —— 那是网关自己的偏好（列表里第一个 system 渠道），不是我们的字段被听懂了。顺手试了把
-   钉选口搬到 `affinity`（`providerOptions.gateway.affinity = { provider: 'baseten' }` 与
-   `= 'baseten'` 两种形状），结果同样是 `deepseek`。
-
-还有一个只会在调试时咬人的坑：`max_tokens` 给小了（如 24），推理模型把额度烧在 reasoning
-上，网关直接回 HTTP 500 `{"error":"empty response content","success":false}` —— 那不是路由
-问题，别把它读成「上游坏了」。
-
-### 2026-10-14 第三次实测：直通形状认 OpenRouter 协议的顶层 `provider` 字段
-
-前面的「钉选不被执行」结论是在 **deepseek（回退网形状）** 上得出的。同一天对**直通形状**
-（`cline-pass/glm-5.3-flash`，响应每帧带顶层 `provider` 字段、没有 routing 元数据）重跑了
-对照，各 5 发，结论反过来：
-
-| 请求形状 | 结果 |
-| --- | --- |
-| 不带任何 `provider` 字段 | 2/5 `Z.AI`、3/5 `Friendli` —— 轮转实锤 |
-| 顶层 `provider: { only: ["z.ai"] }`（显示名拼法） | 连接被网关摈断 / 帧里没有 provider 字段 —— **请求线只认 slug** |
-| 顶层 `provider: { order: ["z-ai"], allow_fallbacks: false }` | **5/5 `Z.AI`** |
-| 顶层 `provider: { only: ["z-ai"], allow_fallbacks: false }` | **5/5 `Z.AI`** |
-
-也就是说网关的两套路由方言要分开看：Gateway 协议的 `providerOptions.gateway.only`（回退
-网形状）依旧被无视 —— 上表的 09-22 结论原样成立；OpenRouter 协议的顶层 `provider.order`
-（直通形状）**被执行**。0.11.0 据此把 provider 钉也写上请求线：显示名经 `providerSlug`
-换成 slug，顶层 `provider.order` + `allow_fallbacks: false`（请求自带非空 `order` 时尊重
-不覆盖）。deepseek 形状对多出来的 `provider` 字段无感（实测 routing 不变），两侧同配也安全。
-
-### 本地闸怎么工作
-
-1. 照旧注入 `providerOptions.gateway.only`（成本为零；网关哪天恢复执行就自动生效）；
-2. 响应**逐帧立即转发**，只把 SSE 的终止帧 `data: [DONE]` 扣在手里；
-3. 终止帧到达（或上游关流）时裁决：`finalProvider` 与**每一个成功过的 `providerAttempt`**
-   都必须在允许列表里（中途换过渠道的话，前半段内容来自别家），网关同时给出的
-   `resolvedProvider` 也一起查 —— 任何一个字段指向别家就拒。通过才放行终止帧；违规就让
-   响应体**报错**，这次调用作废。终止帧一到就收尾，**不等上游关流**（网关发完不关连接的话，
-   等下去只会把这一轮吊到空闲超时）。
-4. 一个响应体里出现**多处** `routing` 时，**逐处都要过闸**：任何一处指向别家就拒。只信
-   最后一处等于把结论交给被审的一方 —— 服务这次请求的渠道控制着自己那部分帧，可以再塞一个
-   自称「由允许渠道提供」的 `routing` 把真话盖掉。解析按**事件**组装（同一事件的多行 `data:`
-   先拼接，和消费者一致），所以「一个 JSON 被拆到两行」也跑不掉；被拒的那一处会进
-   `violations` 历史（`lastViolation` 仍然保留最近一条，形状不变）。保留的 routing 处数有
-   上界（64），超界按不可证明处理。
-
-为什么是「撤回」而不是「先缓冲再放行」：`routing` 只在**最后一帧**才出现（实测第 41/41 帧），
-早一刻都拿不到，所以要么牺牲流式、要么在拿到结论之前先让内容出去。后者才是可用的那条 ——
-内容虽然显示过，但**装配之前**这次调用就已经作废：dsh 只落一条 `assistant/attempt`（没有
-surface op，不进上下文），绝不会装配 `assistant/message`，于是工具也不会执行。用缓冲换来的
-「一次都不显示」代价太大：它同时毁掉了 dsh 用来算输出速度（TPS）的分片到达时间，面板会把
-本地排空耗时当成生成耗时（实测 16,000+ tok/s，真值 ~150）。
-
-### 2026-10-14 晚：网关把渠道名匿名化了（0.11.1）
-
-同一天更晚的时候，回退网形状（`cline-pass/deepseek-v4.1-flash` →
-`vmc/deepseek-v4p1-flash-contributor-fallbacks`）的 `routing` 元数据不再写出真名：
-`finalProvider` / `resolvedProvider` / 成功的 `providerAttempts` 一律是
-**`openai-compatible-private`**，`fallbacksAvailable` 变成空列表。`planningReasoning`
-只说 `Routed via VMC … → private/deepseek-v4p1-flash-contributor…`。渠道钉停在
-`[deepseek]` 上意味着**每条请求都是 strict 拒绝** —— 字面契约下这是正确行为，但渠道没法用。
-
-放行之前先做了权重同一性审计（N=200 单 token 分布指纹 + 置换检验：与官方 API 不可区分，
-JSD 0.017 / p=0.557，GLM impostor 对照 p=0.002；近平局探针的分歧方向与量化签名**相反**；
-temp=0 完全确定；prefix cache 记账为 token 精确）：结论是**正版 V4.1 Flash 权重的低噪声
-第三方重部署**（contributor 档：数据可能用于训练、无 ZDR）。证据与复现在 dsh 工作区的
-`clinepass-deepseek-audit/`。
-
-0.11.1 据此：渠道钉默认改为 `[deepseek, openai-compatible-private]`（保留真名 —— 网关哪天
-改回来校验自动恢复）；状态文件新增 `counters.anonymized` 与 `lastAnonymized`。其余闸门语义
-（resolvedProvider / 成功 attempts / 缺证据 fail closed）逐字不变，不在允许列表的渠道照旧拒。
-
-0.11.1/0.11.2 曾在会话**首条消息**的回复前垫一条匿名渠道提示帧（`withAnonymousNotice`）；
-**0.11.3 已删除**：那条合成 assistant 帧会进模型上下文（正是这个插件要避免的东西），代价
-大于收益。现在响应体逐字就是网关的，匿名渠道只在 `counters.anonymized` / `lastAnonymized`
-和底部胶囊的图标上体现。
-
-### provider 级钉选（0.10.0）：直通模型的第二证据面
-
-渠道钉的证据是 `routing` 元数据 —— 但 2026-10-14 实测发现另一类模型根本不走那条证据链：
-`cline-pass/glm-5.3-flash` 在网关上是**直通形状**（模型回显恒为 `z-ai/glm-5.3-flash`），
-每帧带**顶层 `provider` 字段**、没有 `gateway.routing` 元数据。而且它不是钉在一家上的：
-一小时内的三轮实测分别是 3/3 `Z.AI`（17:59）、5/5 `InferenceNet`（18:03）、9/9
-`Together`（18:25，其中 3 次带 `gateway.only:["z-ai"]`，照样 Together —— 请求侧钉选被
-无视，与 deepseek 2026-09-22 的结论一致）。换句话说，网关在多家 provider 之间轮转这个
-模型，本文件旧注释里「只有 Z.AI 官方直通一个渠道（3/3）」的结论是采样窗口造成的错觉。
-
-对这类模型（`pins` 把它配成 `[]` 的直通配置），0.10.0 起提供第二种钉选 —— `providerPins`；
-0.11.0 起它**连请求线一起钉**：
-
-```yaml
-pins:
-  cline-pass/glm-5.3-flash: []      # 渠道钉关掉（Gateway 协议对直通形状无效）
-providerPins:
-  cline-pass/glm-5.3-flash: [z.ai]  # 请求线写 provider.order: [z-ai]（slug 化）；响应仍逐帧自证
-```
-
-规则与渠道钉同一套直觉，证据换成 wire 顶层的 `provider` 字段：
-
-- 证据是**顶层**字段（`providersOfText` 只读顶层）：routing 元数据里的
-  `providerAttempts[].provider`、`delta.provider` 之类的嵌套键不算 —— 那会把「试过别家
-  但失败」的 attempt 名也当成直通证据。
-- **任何一帧**的 provider 不在允许列表里就拒；比较大小写不敏感（网关在 wire 上自己决定
-  大小写：实测 `Z.AI` / `InferenceNet` / `Together`），但违规记录保留原始拼写。
-- **证据缺失同样 fail closed**：贡献者回退网形状（model 回显
-  `vmc/…-contributor-fallbacks`）没有 provider 字段 —— 与渠道钉读不到 routing 元数据
-  同等处理。那个形状若带了 routing 元数据，`violations` 里会点名它的渠道
-  （`finalProvider`），诊断时能直接看到这次落在了哪。
-- **请求线钉法（0.11.0）**：配置里的显示名经 `providerSlug` 换成 wire slug（小写、非字
-  母数字各串折成 `-`：`z.ai` → `z-ai`），写进顶层 `provider.order` 并关死
-  `allow_fallbacks`。实测带 order 的 glm 5/5 落在 Z.AI —— 轮转在请求侧就被钉死；响应
-  侧闸门照旧，slug 钉错只会整轮失败（fail closed），不会放进别家。请求自带非空 `order`
-  时尊重不覆盖。
-- 流式路径与渠道钉一致：内容逐帧立即转发，只扣终止帧；违规就中断响应体，这次调用作废。
-  `warn` / `off` 语义也一致。
-- 同一模型两侧都配了（`pins` + `providerPins`）就必须**都**过关：请求注入
-  `gateway.only`，响应的 routing 与 provider 字段各自过闸（`judgeEvidence` 合并裁决）。
-- 计数单列：这类请求算 `counters.providerPinned`（不是 `pinned` —— 那是渠道钉、看
-  routing；也不是 `skipped` —— 响应仍受闸管），状态文件另记 `providerPins` 配置与
-  `lastProviderPin = {at, url, model, expect, order}`（`order` 是实际写上请求线的 slug，
-  「配置写 z.ai、线上发 z-ai」在对数时一目了然）。
-
-代价要说清（0.11.0 起大头已被请求线钉法消掉）：响应闸约束的是「网关自己报告的 provider」，
-不是「z.ai 官方权重」—— 网关说谁就是谁，这是 wire 上唯一可验证的证据。请求线钉死后轮转
-不该再发生；若仍轮到列表之外（slug 失效、网关行为又变），这一轮直接失败（400 / 流中断），
-自动重试会先无痕补发（`retries` 次，见配置表），用尽才把失败交给调用方。要放行其它实测过
-的直通 provider 就把名字加进列表（如 `[z.ai, together, inferencenet]`，大小写随意；请求线
-上各自按同一规则 slug 化）。
-
-### 违规文案：点名渠道，但只点得起名的渠道
-
-dsh 会在错误文案上跑**好几套**判定 —— `mapStopReason` 先用 pi-ai 的上下文溢出模式与
-`isContextWindowExceededError`，再是配额，最后才是 `classifyPiAiError`（可重试的那几类会被
-按 `maxRetries` 重打）。**溢出那条还会触发会话压缩**。渠道名由网关给，原样插进文案就是给
-被审方改判词的机会：一个叫 `context_length_exceeded` 的渠道名足以让 dsh 去压缩你的会话。
-
-所以插值只走一道闸（`displayableChannel()`）：**形状像网关 slug、且不含任何判定词根的名字
-才写进文案**，闸外的一律退回固定说法。真实的 16 个渠道名都在闸内，于是正常情况你会看到：
-
-> cline-pass 渠道校验未通过：本次响应由 baseten 提供，允许列表是 deepseek。……
-
-这不是「加个正则就安全了」的证明 —— 判定有好几套、随时会增补，护栏必然滞后。它保证的是
-**被审方无法自己选择写进文案的字符串**。测试钉的是两面：安全名必须出现；
-`context_length_exceeded` / `rate_limit` / `channel-500` 这类名字一个字都不许出现，并且换任何
-危险名文案都必须逐字相同（被审方无法靠改名改变判词）。原始名（**不净化**）照旧进三处不参与
-判定的地方 —— 状态文件的 `violations`、错误对象的 `detail` 属性、插件日志 —— 所以「谁被拦了」
-永远不会因为展示闸而丢失。
-
-非 2xx 的上游响应一律原样放行（那是一次失败的调用，没有内容会被「使用」，改写它会掩盖
-配额/限流信号）；非 SSE（一次性 JSON）的响应没有流式可言，仍是读完再判、违规返回 HTTP 400。
-有一点要知道：抛出的错误虽然带 `code: "PROVIDER_PIN_VIOLATION"`，但 pi-ai 会用自己的
-`mapStopReason` 重写失败码，所以**在 dsh 侧看到的是 `PI_AI_ERROR`**（或非 SSE 路径的
-`INVALID_REQUEST`），不是 `PROVIDER_PIN_VIOLATION` —— 那个 code 只在我们自己的错误对象上。
-
-**撤回能覆盖的**是「流自己走完」的情况：校验发生在收尾之前，违规时内容不进上下文、工具
-不执行。它覆盖不了这些（都是实测过的边界，不是理论担忧）：
-
-- **中途被中止的流**（用户按停止 / 父级 interrupt）：`routing` 还没到，裁决没有发生，而
-  dsh 会把已经显示出去的那部分**当成「被打断的回复」记进上下文**（`interrupted: true` 的
-  `assistant/message`，只含文字与推理，不含工具调用）。0.7.1 的缓冲实现里中止发生在内容放
-  出去之前，所以没有这个口子 —— 这是换回真实 TPS 的一处**退让**。这类流会被记成
-  `counters.unverified` / `lastUnverified`（`reason: "aborted"`），不至于悄悄发生。
-- **网关自报的 `routing`**：闸信的是网关给的那段元数据。网关说谎或链路被换掉，本地无从
-  证明 —— 这是「只看上游自述」的固有边界。
-- **只有 `success: true` 的非允许 attempt 会被拒**：「先试别家失败、再由官方渠道服务」是
-  正常重试，拒掉会误伤；而「失败前已经吐过字节」那种形状还没在网关上实测到，真遇到要把
-  规则收紧成「出现任何非允许渠道的 attempt 就拒」。
-
-### 想只告警 / 想关掉
-
-```yaml
-# profile 的 cordis.patch.yml 里那条 clinepass 行
-- id: clinepass
-  config:
-    enforcement: warn   # strict（默认）| warn | off
-```
-
-`off` 不扣终止帧也不校验：回到「请求字段钉选 + 没有任何校验」的旧行为（它本来就是流式的）。
-
-那张 provider 卡片本身是**声明式**的：包自带的 `cordis.patch.yml`（方式 A）或安装器（方式 B/C）把
-`llm-pi-ai.providers['cline-pass']` 写进 profile patch，**重启即有卡片，零运行时写入**（原因见
-「卡片怎么来的：随包声明」）。插件启动时仍会**试着登记**一次：认得出是自己那张卡、只是地址过期了
-（例如从旧版反代换过来后地址还指着 `127.0.0.1:8791`），就只把地址改回来；认不出（是别人/手工建的）
-就原样不动并报警 —— 状态文件里是 `provision: "mismatch"` 加上一句 `provisionReason`。
+- 环境要求：**node ≥ 20**，dsh 0.1.7 及以上。宿主半边只用 node 内置模块，浏览器半边只向
+  web shell 的静态模块表要 React；**没有任何第三方依赖**，也没有构建步骤。
+- **分享性质，非长期维护项目**：按 MIT 原样提供，不承诺持续维护、也不承诺跟进上游 dsh 的接口
+  漂移。发版清单见 [RELEASING.md](./RELEASING.md)（**tag 和 GitHub Release 是两件事**）。
 
 ---
-
-## 环境要求
-
-- dsh：实测过 `0.1.6-alpha.1`（本插件主要是在它上面开发与验证的）和 `0.1.7-rc.2`（下面
-  「实战记录」那一节所在的机器跑的就是它）。这个版本上有两条与 settings 服务有关的坑，都已经处理：
-  (1) `get()` 被移除，值要经 `describe()` 读 —— 0.7.4 及更早会抛 `settings.get is not a function`
-  （状态文件里 `provision: "failed"` + 原因），0.7.5 起已适配；
-  (2) **冷启动时 settings 服务还没注册** —— 0.8.0 起改成走 `ctx.inject(['settings'], …)` 等它（不再抛），
-  并且**不再依赖这次写入**：卡片由包声明，见下面「卡片怎么来的：随包声明」。
-  注意 npm 上**没有** `0.1.5` 这个版本，只有
-  `0.1.5-alpha.*` / `0.1.5-rc.*`；`dsh plugin` 与 `dsh.bundle` 相关的模块从 `0.1.2-alpha.3`
-  的包里就已存在，但那些更早的版本没有实测过，不保证。
-- Node.js ≥ 20
-- 一个 Cline Pass API key（`sk_...`）
-
-**没有任何第三方依赖**：插件只用 Node 内置模块，`index.js` 一个文件就能读完、审完。`test-fetch.mjs` / `test-settings.mjs` / `test-install.mjs` / `test-usage.mjs` 在任何目录都能跑（不需要 dsh 的 `node_modules`）；`test-package.mjs` 会读 `CHANGELOG.md` 和 `install.mjs`，所以要在**源码检出**里跑（它本来也不随安装复制过去）；`smoke-test.mjs` 要读 `settings.yaml`，所以需要 dsh 自带的 `js-yaml`。
-
 ## 安装
 
-### 方式 A：一条命令（推荐）
+三种方式，**选一种，别混用**。装完都要**重启 dsh**（profile 只在启动时读一次）。
 
-```sh
+### 方式 A：一条命令（bundle 包，推荐）
+
+```bash
 dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1
+# 钉某个 tag：同上，末尾加 #v0.12.0
 ```
 
-`dsh plugin` 把命令转发给 profile 目录里的 pnpm；装完它再看这个包有没有声明
-`dsh.bundle.patch`（`package.json` 里有），有就**自动把 `dsh-clinepass` 追加进
-`dsh.profile.bundles`** —— 不用 clone，也不用自己动 `cordis.patch.yml`。插件行来自
-包自带的 `cordis.patch.yml`；卸载同样交给 pnpm：
+包自己声明了 `dsh.bundle.patch`，所以 `dsh plugin`（pnpm 的转发器）装上它之后会把这个包追加到
+profile 清单的 `dsh.profile.bundles` 里 —— 那两行配置（`- id: clinepass` 的 loader 行，以及声明
+Cline Pass 卡片的 `- id: llm-pi-ai` 行）随包生效，**不需要手写任何东西**。卸载同样干净：
+`dsh plugin --profile web remove dsh-clinepass`。
 
-```sh
-dsh plugin --profile web remove dsh-clinepass
+### 方式 B：安装器（不需要 pnpm，离线可用）
+
+```bash
+node install.mjs                 # 默认装进 $DSH_HOME/profiles/web/plugins/dsh-clinepass
+node install.mjs --dry-run       # 只打印会做什么
 ```
 
-要锁版本就带上 tag（不带则取默认分支的最新提交）：
-
-```sh
-dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1#v0.11.0
-```
-
-> 这条路径要求 PATH 上有 `pnpm` —— `dsh plugin` 本身就是 pnpm 转发器。
-
-### 方式 B：用安装器（不需要 pnpm，离线可用）
-
-```sh
-git clone https://github.com/BreakFree003/dsh-clinepass-deepseekv4.1
-cd dsh-clinepass-deepseekv4.1
-node install.mjs                    # 默认装进 ~/.dsh，profile web
-```
-
-常用参数：
-
-```sh
-node install.mjs --dsh-home /tmp/mydsh         # 装进别的 DSH_HOME
-node install.mjs --profile headless            # 装进别的 profile
-node install.mjs --dry-run                     # 只看会改什么
-```
-
-> `--transport` / `--port` 在 0.5.0 已移除。安装器会明确拒绝它们，而不是默默忽略 —— 一个被忽略的 `--port` 看起来会像"生效了"。
->
-> `--dry-run` 只是不写文件，**仍然要求那个 profile 已经存在**：没有的话它会报 `no profile at …` 并以 1 退出（信息里告诉你了先启动一次 dsh）。这不是 bug，是不想对着一个你还没创建的目标做"预览"。
-
-安装器会：把插件复制到 `<DSH_HOME>/profiles/<profile>/plugins/dsh-clinepass/`，并把一条 loader 行追加到该 profile 的 `cordis.patch.yml`（**幂等**，改动前自动备份；重跑会把旧行升级成当前规范形态）。
-
-> **A 和 B 二选一。** 两条路径挂载的都是 id 为 `clinepass` 的那一行，只是来源不同：
-> A 取包自带的 `cordis.patch.yml`，B 往你 profile 的 `cordis.patch.yml` 里写。同时用
-> 会挂两份。换路径前先按「卸载」清掉上一种。
+它把插件文件复制进 profile 的 `plugins/dsh-clinepass/`，给 `cordis.patch.yml`（会先备份）追加一行
+loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-ai` 的 provider 行；如果你
+自己的补丁里已经声明了 `llm-pi-ai`，它**不动你那一行**，只提示你把 `cline-pass:` 段自己写进去
+（下面的 YAML 可以直接粘贴）。其它开关：`--dsh-home <path>` / `--profile <name>` /
+`--name <dir>` / `--no-patch`。
 
 ### 方式 C：手动
 
-1. 复制 `index.js`、`client.js`、`package.json`、`test-fetch.mjs`、`test-settings.mjs` 到
-   `<DSH_HOME>/profiles/<profile>/plugins/dsh-clinepass/`。**`client.js` 是 0.7.0 起的浏览器半边**（用量卡片）：
-   浏览器半边是从 `package.json` 发现的，manifest 声明了它却没有文件，最轻是卡片不出现、最重是客户端半边加载失败；
-   不要用量卡片就把它连同 `package.json` 里的 `dsh.client` 一并去掉。这是**最小可运行集**：不含 `cordis.patch.yml`
-   （这条路由是你手写 loader 行挂的，用不到它）、`install.mjs` / `uninstall.mjs`、`smoke-test.mjs`，以及
-   `test-usage.mjs` / `test-install.mjs` / `test-package.mjs`（最后一个检查的是仓库/安装器布局，这样装跑不了）；
-2. 在 `<DSH_HOME>/profiles/<profile>/cordis.patch.yml` 里加一段（见 `patch.example.yml`）：
+把 `index.js` / `client.js` / `package.json` / `cordis.patch.yml` 复制进
+`<profile>/plugins/dsh-clinepass/`，再照 [patch.example.yml](./patch.example.yml) 自己写 loader 行。
+
+### 卡片从哪来
+
+「Cline Pass」卡片就是一个普通的 pi-ai provider（`llm-pi-ai.providers.cline-pass`），有两个来源：
+
+- **随包/随安装器声明的静态行**（方式 A / B 都写了这一行）—— 重启即有卡片，不看服务时序；
+- **插件运行时的 `provisionProfile()`** —— 它认得出自己写的那张卡，只把模型条目的
+  `contextWindow` / `maxTokens` 对齐成配置值，**绝不覆盖别人的卡**，也不改档位声明。
+  在 dsh 0.1.7 上这次写入并不可靠（冷启动时 settings 服务还没起来；全新 profile 的写入会等
+  清单写锁），所以**别只依赖它**。
+
+> **自己写 `llm-pi-ai` 行的人必读**：静态卡声明了 `reasoningEfforts: {high, max}`，而运行时的
+> `provisionProfile()` **只**对齐 `contextWindow` / `maxTokens` —— 它既不声明档位、也不改写你
+> 写下的档位。而 patch 行是**整行替换 config、不合并**，所以自己写就必须把 `reasoningEfforts`
+> 一起写上，否则这个模型在 composer 里没有任何思考档可选。可粘贴：
 
 ```yaml
-- insert:
-    - id: clinepass
-      name: './plugins/dsh-clinepass/index.js'
-      config:
-        upstream: https://api.cline.bot
-        pin:
-          - deepseek
-```
-
-### 然后
-
-1. **重启 dsh**（profile 只在启动时读取）：终端里 `Ctrl-C`，再 `dsh web`。
-2. 打开 **设置 → 模型**：应当能看到一张 **Cline Pass** 卡片 —— 三种安装方式都会替你把
-   `llm-pi-ai.providers['cline-pass']` 声明好，**不需要手写任何东西**。把 API key 粘进去、保存。
-3. 在模型选择器里选 **Cline Pass / DeepSeek V4.1 Flash**。
-
-> 唯一的例外是**你自己已经声明过 `- id: llm-pi-ai`** 的 profile：patch 按行整体替换 config、
-> 不是合并，谁也没法替你把 `cline-pass:` 塞进那一行。见下面「如果你自己声明了 `llm-pi-ai`」。
-
-### 卡片怎么来的：随包声明，不是启动时写进去的
-
-插件启动时**会**登记这张卡片（`provisionProfile`）：认得出就只修地址、绝不覆盖别人的卡片。
-但**它不能是唯一来源** —— dsh 0.1.7 上实测两件事：
-
-1. **冷启动那一刻 settings 服务还没注册**。0.8.0 起插件不再直接读 `ctx.settings`（那会抛
-   `cannot get property "settings" without inject`，然后 `apply()` 当场中断、后面一步都不跑），
-   而是走 `ctx.inject(['settings'], …)` 等它 —— 探针实测 0.1.7 上服务确实会到
-   （`inject-fired` + `ctx.get('settings', false)` 可见）。
-2. **全新 profile 上的 settings 写入会一直等写锁**，不是报错而是一直挂着：干净 `DSH_HOME` 里实测，
-   拿着 `package.json.lock` 的正是 dsh 自己（进程空闲），状态文件停在 `provision: "pending"`，
-   patch 文件永远不落地。
-
-所以卡片改成**声明式**：由包自带的 `cordis.patch.yml`（方式 A）或安装器（方式 B/C）把
-`llm-pi-ai.providers['cline-pass']` 写进 profile patch。**重启即有卡片、零运行时写入** ——
-全新 profile 实测：`provision: "present"`（插件认出了它，什么都不用写）、profile 自己的
-`cordis.patch.yml` 保持 `[]` 不变、`package.json.lock` 也不再出现。
-
-`provision` 的取值因此变成：`present` = 卡片已在（新装的正常状态）；`created` / `repaired` /
-`mismatch` = 插件在运行时创建、修地址或发现卡片被改过（settings 服务到位时才会发生）；
-`pending` = 正在等服务注册、还没轮到它；`failed` / `unavailable` 看 `provisionReason`。
-
-### 如果你自己声明了 `llm-pi-ai`
-
-**只有这种情况需要你动手。** patch 是按行**整体替换** `config`、不是深度合并：你自己的
-`- id: llm-pi-ai` 会覆盖包里的那一行（连带 `cline-pass:`），所以请把这一段并进你自己的行：
-
-```yaml
-      cline-pass:            # 缩进到你自己的 providers: 底下
+- id: llm-pi-ai
+  config:
+    providers:
+      cline-pass:
         displayName: Cline Pass
         api: openai-completions
         apiKeyEnv: CLINE_PASS_API_KEY
@@ -420,347 +84,166 @@ node install.mjs --dry-run                     # 只看会改什么
               max: max
 ```
 
-（整行的完整形态见本包根目录的 `cordis.patch.yml`。）安装器发现你已经声明过 `llm-pi-ai` 时会
-**跳过**这一步并在输出里说明 —— 它不会去替换你的行。
+## 设置 API key
 
-**API key 照旧在设置页里粘**：上面的 `apiKeyEnv` 只是 key 的存放名，不是 key 本身。
+**设置 → 模型 → Cline Pass** 卡片里的 **API key** 字段，填好保存。它写进 dsh 的凭据库，键名就是
+`CLINE_PASS_API_KEY`（可用 `apiKeyEnv` 改）。
 
-> **为什么不干脆自带一套 provider 适配器（像别的独立插件那样）？** 两条硬约束：
-> 「设置 → 模型」的卡片按 **settings 命名空间**选布局（`layoutOf`），只有 `llm-pi-ai` /
-> `llm-deepseek` 有原生布局，别的命名空间渲染成一张**提交按钮被禁用、也没有 API key 输入框**的
-> 「unknown」卡片 —— 自带适配器就得自带浏览器半边 UI；而 `providerOptions.gateway.only` 这个字段
-> 在任何受支持的配置里都表达不出来（pi-ai 的 compat 开关被 dsh 的 pi-ai 适配器 `withhold` 掉），
-> 只能像本插件这样在 `fetch` 层改写请求体。复用内置 pi-ai 路由 + 声明式卡片是摩擦最小的路线，
-> **代价就是这张卡片挂在 `llm-pi-ai` 那一行上**。
+浏览器侧**读不到**这把 key —— dsh 的凭据缝是单向的（只能写）。所以用量卡不在浏览器里请求网关：
+宿主半边用 key 去读，只把**数字**发回同一条同源路径。
 
-想让它成为默认模型，**dsh 0.1.7 上**是在同一个 profile patch 里加一行（0.1.6 及更早才是
-`~/.dsh/settings.yaml` 里那个 `agent-default-model:` 段）：
+## Provider 胶囊
 
-```yaml
-- id: agent-default-model
-  config:
-    provider: cline-pass
-    model: cline-pass/deepseek-v4.1-flash
-    reasoningEffort: high
-```
+在 composer 底部，显示这条路由**最近一次真实上游**：
 
-> 档位只有两个：`high`（线上 `reasoning_effort: "high"`）和 `max`（线上 `"max"`）。`max` 就是 pi-ai 升级顺序里的最高档，profile 里可以直接声明它，不需要别名。
-> 从旧版本升上来不用手改：插件会把卡片地址改回网关，把卡片里那两个档位声明补齐，并清掉已废弃的 `xhigh`；如果你 settings 里存的正是 `xhigh`，启动时会把它改成 `max`（同一个意思，不会悄悄降档）。
+- 有结论时是 `Provider: <名字>`（例如 `Provider: deepseek`）；悬停有说明，点一下立即重读；
+- 网关返回**匿名标签** `openai-compatible-private`（VMC 回退网形状）时换成警示色 + 专门图标 +
+  tooltip（contributor 档：数据可能用于训练，无 ZDR）；
+- 还没观察到任何结论时显示 `Provider: --`（tooltip「等待 API 返回…」）；
+- 数据来自状态文件，经宿主路由 `?status=1` 暴露；按 session → model 两级记忆；
+- **读不到元数据就不给结论**：那种响应只计 `seen`，胶囊保持上一次的结论（或 `--`）。
 
----
+服务端在放行终止帧之前就写完结论，所以一轮结束通常立刻可见；胶囊在回合结束后还会补读一次，
+运行中每 2 秒刷新一次。
 
-## 设置 key（重点）
+## 用量卡
 
-「设置 → 模型 → Cline Pass → 编辑」里的 **API 密钥** 就是它：
+**设置 → 模型 → Cline Pass** 卡片，三个**滚动窗口**：5 小时 / 每周 / 每月。
 
-- key 存在 dsh 凭据库里，引用名 `CLINE_PASS_API_KEY`；
-- 卡片会显示「API 密钥已配置 / 缺失」；
-- 换 key 直接覆盖，不需重启。
-
-key 也可以在启动环境里给（凭据库优先）：`CLINE_PASS_API_KEY=sk_... dsh web`。
-
----
-
-## 用量条（设置 → 模型 → Cline Pass）
-
-卡片下半部分会多出三条。显示的是**剩余**（还够用多少），不是已用：
-
-```
-ClinePass 剩余用量                 更新于 15:25  刷新
-5 小时  ██████████████████████████  98%
-        2 小时 59 分 后重置 · 2026/9/16 18:42:08
-每周    █████░░░░░░░░░░░░░░░░░░░░░  18%
-        3 天 23 小时 后重置 · 2026/9/20 15:42:08
-每月    ██░░░░░░░░░░░░░░░░░░░░░░░░   9%
-        11 天 23 小时 后重置 · 2026/9/28 15:42:08
-```
-
-- 百分比是**剩余**，进度条跟它是同一个量（油表：越满 = 剩得越多），颜色按剩余分档：
-  >30% 绿、≤30% 黄、≤10% 红。**标题里写了「剩余」**，因为右边那个百分比是裸数字 ——
-  不写清楚就只能靠猜它到底是已用还是剩余。
-- 网关只返回 `percentUsed`：响应里**没有**任何绝对额度字段（`limit` / `used` / `remaining`
-  都没有），所以「剩余」只能是 `100 - percentUsed`。差值按一位小数收口后再取 —— 直接算
-  `100 - 82.4` 会得到 `17.599999999999994`，那不是「剩余 17.6%」。结果夹在 0–100，用完就是 `0%`。
-- 宿主半边**不做这个翻转**：它照网关的原样带 `percentUsed`，怎么显示是浏览器半边的事。
-- 三条来自网关的 `five_hour` / `weekly` / `monthly` 三个窗口；网关返回的其它窗口类型（它有过
-  `experimental_pool` 这类实验值）**不显示**，而不是猜一个名字画上去。
-- 「刷新」绕过缓存真问一次；不点它的话一次成功读取会缓存 `usageCacheMs`（默认 60 秒），
-  所以来回切设置页不会刷屏打网关。失败也记 **5 秒**（不是 60 秒）：网关挂着时反复进出设置页
-  不会再打一遍网关，但重新填好 key 后下一次看仍然是新的 —— 而且卡片在 key 变化时会**强制**
-  重读，直接绕开这段短缓存。
-- 浏览器这一侧也有自己的超时（20 秒）：宿主只保证它到网关那一段。没有它，一个卡住的 dsh
-  会让卡片永远停在「读取中…」，而那时刷新按钮是禁用的 —— 用户没有任何可点的东西。
-- 语言跟随 dsh 的「设置 → 通用 → 语言」（中/英两套文案写死在 `client.js` 里）。
-
-**数据是怎么到浏览器里的**：dsh 的凭据设计是**密钥只能写、不能读**（`credentials/set` 单向，
-没有任何 read 路径把它交回来），所以浏览器里没有 key，也就不能自己请求 Cline。于是：
-
-1. 宿主半边从凭据库取出 `CLINE_PASS_API_KEY`（环境变量也算，凭据库那一层已经覆盖），
-   用 `Authorization: Bearer <key>` 请求 `GET https://api.cline.bot/api/v1/users/me/plan/usage-limits`；
-2. 把响应用 `normalizeUsage` 收窄成三个窗口的 `{type, percentUsed, resetsAt}`，**只有这些数字**
-   挂到 `/api/clinepass.usage` 上；
-3. 浏览器半边（`client.js`）读这条同源路径，渲染成上面那三条。
-
-几个刻意的取舍：
-
-- **key 从不进浏览器**：不写进 DOM、不写进返回体、不进日志。返回体里只有三个数字。
-- **`resetsAt` 在宿主侧归一化**：网关发的是**纳秒**精度（`...T11:38:00.490486029Z`），
-  `Date` 的规范只承诺毫秒。宿主（永远是 Node）转一次，浏览器就不用去当宽容解析器。
-- **不认识的响应一律不画**：`success` 必须恰好是 `true`、`percentUsed` 必须是有限数（夹到 0–100）、
-  读不懂就整条不显示并说明原因，而不是画一个错的条。
-- **卡片按槽位挂载，不改 dsh 的文件**：用的是 dsh 给外部插件留的
-  `settings.models.provider-card` slot（注册在 `llm-pi-ai` 这个 key 上，非本路由的卡片直接
-  返回 `null`）。所以不是补丁，dsh 升级不会把它打散（对比改 `node_modules` 里客户端 bundle 的做法）。
-- **`client.js` 是手写的、没有构建步骤**（与 `dsh-notify-ping` 同款）：它只 `require('react')`，
-  而 React 是 web shell 静态模块表里的基线模块，所以既不需要 tsdown，也不需要写 `dsh.client.external`。
-
-**排障**
-
-| 现象 | 原因 / 处理 |
-| --- | --- |
-| 卡片上没有用量条 | 刚装完没重启：浏览器半边的 bundle 是宿主**启动时**组进 boot 图的，重启 dsh 后才有（宿主半边的路由是保存即生效的，所以别拿路由能通当已经好了）；或 `usage: false` |
-| 卡片整块不显示，DOM 里只有空的 `<div data-slot-error="settings.models.provider-card">` | 客户端半边抛异常，被 slot 的 error boundary 吞了。**最常见的原因是访问了没写进 `inject` 的 cordis 服务** —— cordis 对未声明的服务属性是抛错（`cannot get property "x" without inject`），不是返回 undefined。浏览器控制台里有原始异常；`test-usage.mjs` 有一条静态断言守着这一类 |
-| 用量条显示「还没填 API 密钥」 | 密钥没配，或配到了别的引用名。在卡片下面的「API 密钥」里填 `sk_...` 保存 |
-| 显示「网关拒绝了这把 API 密钥」 | key 失效或不对（网关返回 401/403）；重新填一次 |
-| 显示「连不上网关」/「超时」 | 本机到 `api.cline.bot` 的网络问题；插件不会重试，点「刷新」 |
-| 想确认宿主这半边活着 | 带 token 打开页面后访问 `/api/clinepass.usage`，应返回 `{"ok":true,"limits":[…]}`；或把 `usage: false` 再看卡片上的条是否消失 |
-
----
+- 网关只报**已用**百分比（`percentUsed`），卡片显示的是**剩余** = `100 − percentUsed`，
+  外加重置倒计时、读取时间，和一个刷新按钮（绕过缓存）。
+- 数字来自 `GET https://api.cline.bot/api/v1/users/me/plan/usage-limits`（用你存的那把 key）。
+- 上限本身不在这张卡上：它来自订阅的 `entitlements.cline_pass.inferenceCapThreshold`（三个窗口各自
+  的美元阈值）。2026-10-16 标定过一次记账单位（1 单位 = 1e-8 USD，于是 5 小时 / 每周 / 每月 ≈
+  **$10 / $25 / $50**；Cline 官方并不公布这些数字）—— 仅供理解量级，别当成契约。
 
 ## 配置项
 
-全部有默认值，只挂载就够用。
+`withDefaults()` 里的全部键；不写就是下面的默认值。
 
-| 字段 | 默认 | 说明 |
-| --- | --- | --- |
-| `upstream` | `https://api.cline.bot` | 真网关 origin |
-| `pin` | `['deepseek']` | 所有请求限制到的上游渠道 |
-| `pins` | `{}` | 按模型覆盖，如 `{ 'cline-pass/deepseek-v4.1-flash': ['deepseek'] }` |
-| `providerPins` | `{}` | 按模型配置的 **provider 级钉选**（0.10.0）：直通模型（`pins` 配 `[]`、无 routing 元数据）的请求线上写入顶层 `provider.order`（显示名 slug 化，0.11.0 起），响应必须用每帧顶层的 `provider` 字段自证由列内 provider 服务，大小写不敏感；证据缺失与越界同样 fail closed（见「provider 级钉选」一节）。与 `pins` 同模型并存时两侧都必须过关 |
-| `provider` | `cline-pass` | provider 路由 id（= profile 的 key） |
-| `model` | `cline-pass/deepseek-v4.1-flash` | 模型 id，**原样作为线上 `model` 字段**（网关要求 `type/model`） |
-| `displayName` | `Cline Pass` | 选择器里的名字 |
-| `contextWindow` / `maxTokens` | `921600` / `131072` | 模型容量，登记 profile 时使用 |
-| `apiKeyEnv` | `CLINE_PASS_API_KEY` | profile 里记录的凭据引用 |
-| `enforcement` | `strict` | 边流边校验响应是否真由允许的渠道提供：`strict` = 违规就在终止帧之前中断这条流、这次调用作废（内容已显示，但不进上下文、不执行工具）；`warn` = 同样校验但只告警放行；`off` = 不校验、不扣终止帧 |
-| `retries` | `2` | 校验失败后的自动补发次数（0.10.0 起；总尝试数 = `retries + 1`）。只发生在**没有任何字节交付**的时刻（缓冲路径全程；流式路径在首个证据帧上提前裁决），对调用方透明；`0` = 拦下即结束。被补发掉的尝试计入 `counters.retried` 进 violations 历史，不占 `blocked` 与 `lastViolation` |
-| `provision` | `true` | 启动时试着登记 provider 卡片：自家卡片地址过期就只修地址，别人的卡片不动。卡片本身已由包/安装器声明，所以新装时这里通常是 `present`（无事可做）；dsh 0.1.7 上服务未就位时会等它（`pending`），不会中断启动 |
-| `alignReasoningEffort` | `true` | 若 `agent-default-model.reasoningEffort` 不是本模型声明的档位（只剩 `high` / `max` 两个），启动时对齐：废弃的 `xhigh` → `max`，其它不认识的值 → `high` |
-| `plainModelId` | `true` | 提示词（persona 两段）里显示**去掉本路由前缀**的 id：`cline-pass/deepseek-v4.1-flash` → `deepseek-v4.1-flash`。线上 id、会话记录、选择器都不受影响；`false` 则原样显示完整 id |
-| `usage` | `true` | 在「设置 → 模型 → Cline Pass」卡片上显示用量条（5 小时 / 每周 / 每月，**剩余**量）。`false` 时宿主不注册路由、不读凭据，并显式广播 `enabled: false` 让浏览器半边**不渲染这张卡片**（浏览器半边是从 `package.json` 发现的，配置管不到它加载与否，所以必须显式告知） |
-| `usageRoute` | `/api/clinepass.usage` | 用量数据这条 exact 路由的路径。宿主会把它一并告诉浏览器半边，两边不会走散 |
-| `usageTimeoutMs` | `15000` | 问网关的超时；超时按「网关没应答」显示，不会挂住设置页 |
-| `usageCacheMs` | `60000` | 一次成功读取的缓存时长。设置页每次重渲染都会读它，缓存是为了不把重渲染变成一串网关请求；`0` = 每次都真问 |
-| `statusFile` | `true` | 把钉选状态写到 `<DSH_HOME>/dsh-clinepass-status.json`（见下）；也可给自定义路径，或 `false` 关掉 |
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `upstream` | `https://api.cline.bot` | 网关 **origin**（profile 的 baseURL 是它 + `/api/v1`）。带路径会被截成 origin 并警告；不是 URL 则什么都不装 |
+| `provider` | `cline-pass` | 路由 id（卡片与胶囊都认它） |
+| `model` | `cline-pass/deepseek-v4.1-flash` | 模型 id（请求体要带 `type/` 前缀） |
+| `displayName` | `Cline Pass` | 设置页卡片标题 |
+| `contextWindow` | `921600` | 登记/对齐卡片用 |
+| `maxTokens` | `131072` | 同上 |
+| `apiKeyEnv` | `CLINE_PASS_API_KEY` | 凭据库里的键名 |
+| `provision` | `true` | `false` = 不登记/不修复 provider 卡片（那卡片就得自己声明） |
+| `usage` | `true` | `false` = 不挂载用量路由（卡片会显示「没挂载」而不是一直转圈） |
+| `usageRoute` | `/api/clinepass.usage` | 用量路由路径 |
+| `usageTimeoutMs` | `15000` | 宿主读网关的超时 |
+| `usageCacheMs` | `60000` | 成功读取的缓存时长；`0` = 每次重取（失败只缓存 5 秒） |
+| `statusFile` | `<DSH_HOME>/dsh-clinepass-status.json` | 观察结果落盘处；给字符串换路径，`false` 关掉 |
 
-> `pin: []` = 不注入任何字段（纯透传）。`pins` 优先于 `pin`；把某个模型配成 `pins: { '<model>': [] }` 等于**单独关掉**那条路由的钉选，启动时会警告。
->
-> `plainModelId` 只改**提示词模板**（`deployment:persona-prefix` / `-suffix` 两段里的 `{{model}}`），
-> 且仅当会话确实跑在本路由、且 id 以本路由自己的 `<provider>/` 开头时才改；官方路由的裸 id、
-> 别的 provider、本路由上的裸 id、以及 `interpolate: false` 的字面量段落一律不动。
-> 刻意不去改 catalog id（已存会话的 `model/selection` / `request/header` 里记的还是带前缀的 id，
-> 改名会让它们一直报 `UNKNOWN_MODEL`），也不去改 prompt variable（会话层的
-> `installModelSelection` 会在内层 listener 返回后覆盖 `variables.model`，而且
-> `session-reference` 会快照那些变量算引用预算）。
->
-> 已删除（0.5.0）：`transport`、`listen`、`captureDir`，以及旧版的 `address` / `baseURL`。旧配置里留着不会报错，启动日志会各指出一次。
+## 迁移（0.11.x → 0.12.0）
+
+**0.12.0 是删减版**，请求侧整块没了：
+
+- 删掉的配置键：`pin` / `pins` / `providerPins` / `enforcement` / `retries`，以及
+  `alignReasoningEffort` / `plainModelId`。**旧行照常加载** —— 这些键被忽略并记进状态文件的
+  `ignoredOptions`（不刷警告，否则每个没清理的旧行都会在每次启动时叫一次）。更早的端口时代键
+  （`transport` / `listen` / `captureDir` / `address` / `baseURL`）同样忽略，但会各警告一次。
+- **为什么不再需要钉选**：2026-10-16 复测，订阅路由上的 `deepseek` 已由第一方服务（响应里的上游
+  `system_fingerprint` 与官方 `api.deepseek.com` 逐字相同、prefix cache 是 64 块对齐记账、
+  provider id 是 UUID 形状）。本地钉选改变不了任何结果，只剩每次请求多一段装饰字段。证据见
+  [`../clinepass-deepseek-audit/README.md`](../clinepass-deepseek-audit/README.md) §九。
+- **提示词变化**：0.6.2 起插件会把 persona 里的模型 id 去掉前缀；0.12.0 删掉了这件事，persona
+  现在原样显示 `cline-pass/deepseek-v4.1-flash`。
+- **effort**：插件不再写 `agent-default-model.reasoningEffort`，也不再往卡片上写
+  `reasoningEfforts`。想固定思考档就在自己的 profile 补丁里显式给（例：`agent-default-model`
+  写 `reasoningEffort: high`），并在卡片里声明档位。
 
 ## 验证
 
-```sh
-cat ~/.dsh/dsh-clinepass-status.json     # 正在跑的 dsh 自己写的状态（见下）
-# 实际是 2 空格缩进的 JSON，字段就是这些：
-# {
-#   "service": "dsh-clinepass", "transport": "fetch", "hook": "installed",
-#   "provision": "present",   # present | created | repaired | mismatch | pending | failed | off | unavailable
-#   "provisionReason": null,  # 上面那个值的原因（present / created 时为 null）
-#   "upstream": "https://api.cline.bot", "pin": ["deepseek"],
-#   "providerPins": { "cline-pass/glm-5.3-flash": ["z.ai"] },
-#   "profileBaseURL": "https://api.cline.bot/api/v1",
-#   "counters": { "seen": 4, "pinned": 4, "providerPinned": 0, "skipped": 0, "blocked": 0, "unverified": 0, "retried": 0 },
-#   "lastPin": { "model": "cline-pass/deepseek-v4.1-flash", "only": ["deepseek"] },
-#   "lastProviderPin": { "at": "…", "model": "cline-pass/glm-5.3-flash", "expect": ["z.ai"], "order": ["z-ai"] },
-#   "enforcement": "strict",
-#   "lastVerified": { "at": "…", "url": "…/chat/completions", "provider": "deepseek",
-#                     "allowed": ["deepseek"], "attempts": 1 },
-#   "lastViolation": null, "violations": [], "lastUnverified": null, "lastSkipped": null,
-#   "ignoredOptions": [], "pid": 1234, "at": "2026-09-15T11:13:13.910Z"
-# }
-
-node test-package.mjs       # 打包不变量：bundle 声明可用、无生命周期脚本、bundle 行与安装器行不漂移、client 半边声明可用
-node test-fetch.mjs         # 单元测试：URL 域限定/透传保真/安装卸载/请求体形态/robustness/状态文件 + 流式闸（逐帧放行、扣住终止帧、违规中断、藏在终止帧里的 routing、取消不许算成违规、块边界逐字节保真）+ 经真 fetch(undici) 打本地 server 的集成
-node test-settings.mjs      # 配置面（含已删除选项）、profile 登记与修复、档位迁移
-node test-usage.mjs         # 用量：响应收窄、网关读取、路由处理器（缓存/去重/失败分类/key 不外泄）、apply 接线、client bundle 契约
-node test-install.mjs       # 安装器/卸载器往返测试（幂等、注释不丢、逐字节还原）
-node smoke-test.mjs         # 冒烟：读状态文件确认活着的 dsh 挂着钩子 + 经真网关跑一轮（按 profile 自己的钉选形状断言：渠道钉看 finalProvider，provider 钉看顶层 provider 字段；strict 拒绝外来渠道/provider 也是合法结局）+ 用错配的允许列表证明闸真的会拒
-node smoke-test.mjs --negative   # 追加反向对照：不可能渠道必须被拒绝（网关已不执行 only，这条**预期 FAIL**）
+```bash
+npm test          # test-package → test-fetch → test-settings → test-usage → test-install，都不需要外网
+node checks/dsh-clinepass-buffering-repro.mjs
+node checks/dsh-clinepass-streaming-gate-check.mjs
+node smoke-test.mjs [--negative]     # 活体：检查状态文件 + 真实网关往返
 ```
 
-没有测试框架，全是自带断言的 Node 脚本（零依赖）。`npm test` 跑前五个，**五个都不需要网络**；
-不过 `test-package.mjs` 和 `test-install.mjs` 只在源码检出里成立，所以**安装副本**里应该跑
-`npm run test:installed`（就是不依赖检出布局的那三个：fetch / settings / usage）。
-`test-fetch.mjs` 用一个本地 HTTP server 冒充网关（它自己的文件头也是这么写的），走真
-undici、但只连 `127.0.0.1`；`test-usage.mjs` 连那个都不需要 —— 它把网关换成一个返回固定
-`Response` 的桩函数，连 `127.0.0.1` 都不连。唯一会真的打网关的是 `smoke-test.mjs`，它另外还
-要求**正在运行**的 dsh。
+- 两个 `checks/` 脚本与 `smoke-test.mjs` 用的都是**安装副本**
+  （`<profile>/node_modules/dsh-clinepass/index.js`；手工安装路线是 `plugins/dsh-clinepass/`）——
+  所以**部署之后**才能跑，在源码仓里直接跑会红。
+- `checks/dsh-clinepass-buffering-repro.mjs` 钉「逐帧转发」：观察者一旦退化成整包缓冲，分片节奏
+  就变了（dsh 的 TPS 测量正是从它来的）。
+- `checks/dsh-clinepass-streaming-gate-check.mjs` 用**真实 OpenAI SDK** 走一遍安装后的观察者：
+  请求原样到达、流仍能装配出完整消息、同一个响应里的上游仍被读出来。
+- `smoke-test.mjs --negative` 会故意要一个不存在的渠道，用来复述「请求侧钉选为什么在 0.12.0 被删」：
+  网关无视那个字段。
 
+### 状态文件
 
-`hook` 字段就是「静默失效」的报警器：`installed` = 钩子在全局 fetch 上；`uninstalled` = 被卸载了；`unavailable` = 装不进去（有东西先替换了 fetch，日志里会报，这种情况现在没有备用 transport 可切，要先找出是哪个插件抢了全局 fetch）；`foreign` = 装好之后有别的代码把全局 fetch 换掉了（插件每 30 秒自查一次，所以最迟半分钟内可见；换掉之后请求就不再被钉）。`counters.seen` 是落到本网关的 chat 请求数，`pinned` 是真正注入了渠道钉选的请求数，`providerPinned` 是 provider 级钉选的请求数（`providerPins` 模型：请求线上带 `provider.order`、响应由 provider 字段裁决，`lastProviderPin` 记 `{at, url, model, expect, order}`）—— **`seen` 涨而 `pinned`/`providerPinned` 都不涨**才说明有请求被跳过了 —— 原因在 `lastSkipped`（`{at, url, reason}`；日志里另有一行）。`counters.blocked` 是被本地闸拦下的响应数；`counters.unverified` 是**没能校验**的流数（用户按停止、socket 断 —— 裁决根本没发生，见下面「已知边界」），配上 `lastUnverified` 一个都不该被读成「一切正常」；`lastVerified` 记最后一次校验通过时**网关说它交给了谁**，`lastViolation` 记最后一次拦截（含 `finalProvider` 与实际列出的 fallback），而 `violations` 是**最近 20 条拦截历史**（每条 `{at, url, allowed, reason, finalProvider, fallbacksAvailable}`，按时间正序）—— 单槽的 `lastViolation` 只能回答「最近一次是谁」，答不了「今天被拦的那几次各自路由去哪」；`violations` 的 `at` 就是拿去和 dsh 会话日志里那条 `turn/end` 错误对时间用的字段 —— 这几个字段就是「有没有偷偷换渠道」的直接证据。状态文件里**不含任何凭据**，并且只有当前持有全局 fetch 的那个插件实例会写它。
-
-`smoke-test.mjs` 会先读状态文件确认**正在运行的 dsh** 里钩子是 `installed`、且计数器在动（pid 已退出/`hook: uninstalled` 时会明确说明它只能验到哪一步；记录里的 pid 存活才作数），确认本插件没有监听任何本地端口，再用同一份插件代码在测试进程里注入一次、打真网关断言 `finalProvider: "deepseek"` 且这条响应确实通过了本地闸；最后用一份**故意错配**的允许列表（允许 `alibaba`、实际由 `deepseek` 服务）证明闸真的会拒 —— 拒绝时必须是 HTTP 400 + `PROVIDER_PIN_VIOLATION`，且响应体里一个 `data:` 帧都没有（模型输出没被放出去）。
-
-`provision` 记的是 provider 卡片的登记结果：`created`（新建）/ `present`（已存在）/ `repaired`（地址过期已修正）
-/ `mismatch`（那张卡片不是本插件建的，未改动；请求会绕过钉选，需要你手动改地址）/ `failed`（settings 写入失败）/
-`off`（`provision: false`）/ `unavailable`（拿不到 settings 服务）。**`failed` / `mismatch` / `repaired` 时，`provisionReason`
-里就是那句话**（`present` / `created` 时为 `null`）—— 它和日志行同源，但一定落盘。**登记压根没跑时
-`provision` 是 `null`**（dsh 0.1.7 冷启动就是这样，见上面那一节）：`null` ≠ `present`，这个区别就是
-「跑没跑」。`provision` 在**三个地方**都能看到：
-状态文件、插件启动日志那一行（`… pin deepseek (profile present); prompt shows …`）、以及 `smoke-test.mjs` 读到的内存态。
-
-**关于日志。** 插件把请求、拦截、登记结果打成 dsh 的插件日志（`ctx.logger`）—— 但**这份 composition 里没有
-任何 logger exporter**，`ctx.logger` 的输出于是**根本不离开进程，哪里都不落**：这不是配置写错了，也没有开关可
-打开。对照很直接：同一个 `dsh web` 里，邻居插件（自己用 `console.log` 打印的那种）的行会出现在
-`~/Library/Logs/dsh-web.log`，本插件的 `ctx.logger` 行**一行都没有** —— `console` 走 launchd 捕获的
-stdout/stderr，`ctx.logger` 走那个不存在的 exporter。所以排查请以**状态文件为准**：`hook`、`counters`、
-`provision`、`provisionReason`、`lastVerified`、`lastViolation`、`violations`、`lastUnverified`、`lastSkipped` 里都有答案；
-下面凡提到「日志」的地方，都是这条的补充，而不是前提。
-
-## 实战记录：一次真实的拦截（2026-09-28）
-
-第一份**线上**样本（不是测试）：0.7.2 的流式闸在真网关、真会话里拦下了一条由
-`alibaba` 提供的响应，并且是在工具执行**之前**拦下的。环境是 dsh 0.1.7-rc.2 +
-本插件 0.7.2，配置为 `pin: [deepseek]`、`enforcement: strict`。证据是同一台机器上
-两处互不相干的记录。
-
-**一、正在运行的 dsh 写的状态文件**（`~/.dsh/dsh-clinepass-status.json`；`pid` 与
-当时的 `dsh web` 进程一致）：
-
-```json
-"counters": { "seen": 696, "pinned": 696, "skipped": 0, "blocked": 1, "unverified": 0 },
-"enforcement": "strict",
-"lastViolation": {
-  "at": "2026-09-27T21:51:44.865Z",
-  "allowed": ["deepseek"],
-  "reason": "finalProvider=alibaba，允许的是 deepseek",
-  "finalProvider": "alibaba",
-  "fallbacksAvailable": ["alibaba", "baseten", "fireworks", "runware", "relace",
-                         "particle", "novita", "togetherai", "deepinfra", "wafer",
-                         "parasail", "gmicloud", "modal", "morph", "boundless"]
-},
-"lastVerified": { "at": "2026-09-27T22:02:01.405Z", "provider": "deepseek", "attempts": 1 }
+```bash
+cat ~/.dsh/dsh-clinepass-status.json
 ```
 
-`seen` 与 `pinned` 相等（696/696）说明这段时间里每个落到本网关的 chat 请求都注入了
-钉选；`blocked: 1` 是这唯一一条违规；`unverified: 0` 说明**没有**流是「没来得及裁决」的
-—— 这一条是判出来的，不是猜的，也不是取消留下的噪声。
+| 字段 | 含义 |
+|---|---|
+| `hook` | `installed` / `absent` / `replaced-by-us` —— 观察者是否真的挂在 `globalThis.fetch` 上 |
+| `counters.seen` | 观察到的聊天请求数 |
+| `counters.verified` | 读出了真实 provider 的数量 |
+| `counters.anonymized` | 结论是匿名标签 `openai-compatible-private` 的数量 |
+| `counters.unknown` | 响应里根本没有 provider 元数据的数量 |
+| `lastVerified` / `lastAnonymized` | 最近一条结论：`{at, url, provider, model, sessionId, anonymized}` |
+| `provision` / `provisionReason` | provider 卡片的登记结果与原因（`created` / `present` / `repaired` / `mismatch` / `off` / `pending` / `failed` / `unavailable`） |
+| `ignoredOptions` | 被忽略的遗留配置键 |
+| `pid` / `at` | 进程号 / 落盘时间 |
 
-**二、同一轮的会话日志**（dsh 的 `session.v4.jsonl`）：`turn/end` 落在
-`2026-09-27T21:51:44.879Z` —— 比裁决落盘晚 **14 ms** —— 文案正是流式路径那条固定文案
-（**当年的**：0.9.0 起同一句会点名渠道，写成「本次响应由 alibaba 提供，允许列表是
-deepseek」；原始名与时间也进了状态文件的 `violations`）：
-
-> cline-pass 渠道校验未通过：响应不是由允许的渠道提供……这次调用已作废：内容没有进入模型
-> 上下文、工具也不会执行（可能已在窗口里闪现）。enforcement=strict；想只告警就设
-> enforcement: "warn"。
-
-这一步（step 6）在会话里只留下一条 `assistant/attempt`：它的流里已经有 517 字的
-reasoning、**两个 `bash` 工具调用**的完整参数，最后是 `usage` 与 `finish` 两帧 —— 而
-`[DONE]` 那一帧从未到达消费者（它在闸手里）。然后就报了上面那个错。整轮**没有**
-`assistant/message`，也**没有** `tool/result`：那两个 bash 一次都没跑。10 分 17 秒之后的
-下一次调用（22:02:01Z）`lastVerified` 又记到 `provider: deepseek` —— 所以这是一次**间歇性
-回退**，不是渠道被整体换掉。
-
-这份样本确认了三件事：闸在线上会拒；拒发生在工具执行之前；`unverified` 全程为 0，即没有
-误判成违规。它**不**确认的也要写清：
-
-- **n = 1**。它证明闸会拒，不证明网关的回退频率；`blocked / seen` = 1/696 只描述这段时间。
-- **代价也真实发生了**：那条响应的内容 —— 连那两个工具调用的参数 —— 在裁决之前已经流进
-  窗口。这就是 0.7.2 用「扣住终止帧」换流式时写下的代价，`assistant/attempt` 里留下的
-  reasoning / tool-call 帧是它的实证，不是推测。
-- **裁决依据仍是网关自报的 `routing`**（`finalProvider`）。这一条没有被改变：说谎的网关
-  仍然骗得过它（见上面「钉选现在由本地兑现」一节里的边界）。
-
-## 常见问题
-
-| 现象 | 原因 / 处理 |
-| --- | --- |
-| 设置 → 模型里没有 Cline Pass 卡片 | 先确认**重启过 dsh**（卡片是随包声明在 profile patch 里的，只在启动时读）。还没有就看状态文件：`hook` 要是 `installed`；`provision: pending` = settings 服务还没到位；`mismatch` = 卡片被人改过地址。**如果你自己声明过 `- id: llm-pi-ai`**，卡片在你自己那一行里，按「如果你自己声明了 `llm-pi-ai`」把 `cline-pass:` 段带上 |
-| 卡片里 API 地址不是 `https://api.cline.bot/api/v1` | 那张卡片不是本插件建的（`provision: mismatch`），插件不去改它。改成网关地址，否则请求绕过钉选 |
-| 状态文件里 `hook: unavailable` | 有别的插件先替换了 `globalThis.fetch`。找出是哪个插件；现在没有备用 transport，钩子装不进去时请求会不带钉选 |
-| 状态文件里 `hook: foreign` | 装好之后全局 fetch 被别的代码换掉了（插件每 30 秒自查）。换掉之后的请求不再被钉，排查是哪个插件 |
-| 状态文件里 `seen` 在涨、`pinned` 不涨 | 有请求被跳过，**原因就在 `lastSkipped.reason`**（非 JSON 体、流式体、无 body，或该模型的 `pins` 被配成了 `[]`）。`reason` 以 `nothing to pin` 开头的那种是**配置如此**（`pin: []` = 纯透传），不是故障；日志里另有一行同样的说明 |
-| `reasoningEffort: max` 能用吗 | 能，而且是两个档位里的最高档。卡片里声明 `high` / `max`：线上分别发 `reasoning_effort: "high"` / `"max"`。旧卡片里多出来的 `xhigh` 会被清掉；settings 里存的 `xhigh` 会被改成 `max` |
-| 状态文件里 `seen: 0` 但你刚聊过 | 那条路由没走本网关（地址被改过 / 选了别的 provider），或 dsh 里跑的不是这份插件 |
-| `UNKNOWN_MODEL` | profile 里的 `models[].id` 与 dsh 选择的模型不一致。id 必须是 `cline-pass/deepseek-v4.1-flash` 这种带前缀形式 |
-| `UNSUPPORTED_REASONING_EFFORT` | 存的档位不在卡片声明的档位里（只有 `high` / `max`）。插件启动时会把默认模型的那个值对齐（`xhigh` → `max`，其它 → `high`）；**若某个已存会话仍报错**，在输入框的档位选择里重选一次即可 |
-| `MISSING_CREDENTIAL` | 还没在设置页填 key，或填到了别的引用名 |
-| 启动日志说 `"listen" is no longer used` | 旧配置里还留着已删除的反代选项；删掉那个字段即可（不影响运行） |
-| 严格钉选的代价 | 网关自 2026-09-22 起忽略 `only`，所以 `fallbacksAvailable` 里列出另外 15 个渠道是**正常现象**，不代表钉选失效。真正的「钉死」由本地闸兑现：不是允许渠道提供的响应会被拦下。代价是偶发的一次整轮作废 —— 内容已经显示过，但进不了上下文、工具也不会执行（见上面的「钉选现在由本地兑现」） |
-
-## 安全说明
-
-- **不监听任何端口**：插件只包一层 `globalThis.fetch`，且只改写发往 `upstream` 的 `chat/completions`。用量功能加的是 dsh **自己那台 HTTP 服务**上的一条路径（`/api/clinepass.usage`，见上），插件进程里没有 `listen`，也没有第二个 socket。
-- 插件**不持有** API key —— key 由 dsh 从凭据库取出、写进请求头，插件只加一个路由字段。状态文件里只有服务与钩子状态、上游与 profile 地址、计数与时间、模型名、钉选渠道、**违规历史（渠道名与 URL，两者都是网关/本机数据，不是凭据）**和 pid：**没有任何密钥**，`test-fetch.mjs` 里有一条断言专门守着这一点。
-- **用量读取里的 key 也不外泄**：宿主用 `Authorization: Bearer <key>` 问网关，然后把响应收窄成三个数字再返回。浏览器拿到的 JSON 里没有 key，DOM 里也没有；`test-usage.mjs` 有两条断言守着（key 不出现在任何返回值里、只出现在那一个请求头里）。这条路在 dsh 自己的 Host/Origin 信任栅栏与浏览器 cookie 认证之后才派发。
-- 日志只打印请求方法/URL/模型/钉选渠道（形如 `[clinepass] → #004 POST https://api.cline.bot/api/v1/chat/completions pinned to deepseek (model …, in-process)`），以及配置/登记结果与「没钉上的原因」。**请求头从不进日志** —— `authorization` 没有被打印的机会，也就不存在"脱敏"这一步。用量那一路同理：只记「注册了哪条路径」和「读取意外失败」，不记 key、不记响应体。**这些行是否落到文件里取决于 composition 里有没有 logger exporter**（这一份没有 —— 见「验证」里的「关于日志」），所以同一个结论也写进了状态文件。
-- 旧版的 `captureDir` 会把请求/响应原文（含对话内容）落盘，该功能已随反代一起删除。
-
-## 与 npm 上 `dsh-cline-pass` 的区别
-
-npm 上另有一个名字很像的包 **`dsh-cline-pass`**（作者 yhshzh），解决的问题有重叠，路线不同：
-它**自带** provider 适配器、渠道枚举与账户池，走 npm 发布；本插件（`dsh-clinepass`，**没有连字符**）
-刻意反过来 —— 不自带适配器，复用 dsh 内置的 pi-ai 路由，只往出站请求体里注入渠道钉选字段，
-所以不存在第二套会随上游漂移的流式适配器。
-
-两者都会注册 provider 路由，**不要同时挂载**。装之前看清楚名字。
+读法：`seen` 在涨而 `verified` 不涨 = 响应里没有 provider 元数据（网关形状变了）；
+`hook` 不是 `installed` = 有别的插件先占了 `globalThis.fetch`。
 
 ## 卸载
 
-**方式 A（bundle）装的：**
+- **方式 A（bundle）**：从安装目录跑 `node <profile>/node_modules/dsh-clinepass/uninstall.mjs`
+  （连同它写的 provider 卡片一起撤），再 `dsh plugin --profile web remove dsh-clinepass`。
+- **方式 B（安装器）**：`node uninstall.mjs`（`--keep-provider` 保留卡片）。
 
-```sh
-dsh plugin --profile web remove dsh-clinepass
-```
+两种都要**重启 dsh**，卡片才会从设置页消失。
 
-插件行和卡片都来自包自己的 `cordis.patch.yml`：包一摘掉（同时自动从 `dsh.profile.bundles` 摘掉）
-两样都没了，**你自己的 profile patch 全程没被碰过**。只有一种收尾情况：老版本用手工/安装器装的
-profile，patch 里留着指向本插件的行，那就先跑一次安装器自带的卸载器再删包 ——
+## 安全与边界
 
-```sh
-DSH_HOME=~/.dsh node ~/.dsh/profiles/web/plugins/dsh-clinepass/uninstall.mjs --profile web
-```
-
-它会删掉 `clinepass` 行、插件目录，以及**它自己逐字写下的那种** provider 卡片；你在
-`llm-pi-ai` 行里自己写的 provider 不会被动（想留着卡片就加 `--keep-provider`）。
-
-**方式 B（安装器）装的：**
-
-```sh
-node uninstall.mjs                  # 移除 loader 行 + 插件目录 + 它自己写的 provider 卡片
-node uninstall.mjs --keep-provider  # 保留设置页那张卡片
-```
-
-两种方式卸载后都要**重启 dsh**，「Cline Pass」卡片才会从设置页消失。
-
----
+- **不开任何端口**。用量功能是 dsh **已经在跑**的 HTTP 服务上的一条*路径*
+  （`/api/clinepass.usage`），走 dsh 自己的 Host/Origin 信任栅栏与浏览器 cookie 认证。
+- 观察者只匹配配置的 `upstream` origin 下的聊天请求；其它请求原样透传。
+- 状态文件里只有结论与计数，**没有密钥**；插件也不记录请求头。
+- 一个内部依赖：pi-ai 每次请求新建 client 且不传 `options.fetch`，所以真实传输就是全局 `fetch`。
+  这条要是变了，观察会**静默失效** —— 状态文件的 `hook` 字段就是为暴露这件事存在的（用 `console`
+  打印的其它插件会进宿主日志，而插件的 `ctx.logger` 行不一定落盘）。
 
 ## English
 
-**dsh-clinepass** connects Cline Pass to DeepSeek Harness with every request **pinned to the DeepSeek upstream channel** (strict, no fallback), and its API key entered on **Settings → Models**.
+**dsh-clinepass** brings Cline Pass into DeepSeek Harness: it registers an OpenAI-compatible pi-ai
+route (`cline-pass`) and does exactly two things — it **observes** the real upstream provider in the
+gateway's chat responses (shown in a composer pill, persisted to a status file), and it **draws the
+Cline Pass usage card** on Settings → Models.
 
-**Architecture.** The route is an ordinary **pi-ai provider profile** (`llm-pi-ai.providers.cline-pass`, OpenAI-compatible, key from the credential store) — which is exactly why dsh renders a native provider card with a key field for it. The plugin only adds `providerOptions.gateway.only` to outgoing requests, leaving streaming, tool calls, reasoning, usage and images on pi-ai's proven path. The pin is injected **in-process**: the plugin wraps `globalThis.fetch` for the life of the process and rewrites **only** this gateway's chat-completions bodies — **no listener, no port, nothing to configure for transport**. (0.5.0 removed the optional loopback reverse proxy; a config still naming `transport` / `listen` / `captureDir` is reported once and ignored.) Only requests to the configured `upstream` origin are ever touched, and unrelated calls are passed through as the exact same arguments. On start the plugin also **provisions** the profile (repairing only a recognisably-own stale address, never overwriting a foreign one) and aligns an unsupported stored reasoning level. Since 0.6.2 it also keeps the gateway's `type/` prefix out of the **prompt**: a prepended `system-prompt/assemble` listener rewrites the `{{model}}` reference in the two persona sections, so the persona reads `deepseek-v4.1-flash` while the wire, the session records and the model picker keep `cline-pass/deepseek-v4.1-flash` (`plainModelId: false` turns this off). Since **0.7.0** the Cline Pass card on Settings → Models also shows **usage**: the 5-hour, weekly and monthly windows as progress bars of what is **left**, with the remaining percent, the reset countdown and the read time (the gateway only reports `percentUsed`, so remaining is `100 − percentUsed`, computed in the browser half and rounded to one decimal so `100 − 82.4` cannot print `17.599999999999994`). `client.js` is the browser half — a hand-written bundle (no build step, like `dsh-notify-ping`) that registers into dsh's documented `settings.models.provider-card` slot; the **host** half reads `GET https://api.cline.bot/api/v1/users/me/plan/usage-limits` with the stored key and publishes only the resulting numbers at `/api/clinepass.usage`, an exact Fetch route on the HTTP server dsh **already runs** — a new *path*, still no listener of ours. The browser cannot read the key by design (dsh's credential seam is write-only), which is exactly why the card needs a host half.
+**It never rewrites a request.** No body, no headers, no retries, no extra calls; SSE bodies are
+forwarded frame by frame, never buffered. 0.12.0 removed the request-side channel pin, enforcement,
+retries and violation bookkeeping, because the subscription route's `deepseek` is served first-party
+(same upstream `system_fingerprint` as `api.deepseek.com`, 64-token-aligned prefix-cache accounting).
+Legacy keys (`pin`, `pins`, `providerPins`, `enforcement`, `retries`, `alignReasoningEffort`,
+`plainModelId`) still load — they are ignored and listed in the status file's `ignoredOptions`.
 
-**Install.** `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1` — the package declares `dsh.bundle.patch`, so `dsh plugin` (a pnpm forwarder) installs it and appends it to `dsh.profile.bundles` on its own: no clone, no hand-edited patch. Append `#v0.11.0` to pin a tag. Without pnpm, `node install.mjs` copies the plugin into the profile and appends the loader row instead (idempotent + backed up) — use one route or the other, never both. Restart dsh either way, then set the key on Settings → Models. Configuration defaults are complete — `upstream`, `pin`, `pins`, `provider`, `model`, `apiKeyEnv`, `provision`, `alignReasoningEffort`, `plainModelId`, `usage`, `usageRoute`, `usageTimeoutMs`, `usageCacheMs`, `statusFile`. **No third-party dependencies**: the host half imports only Node built-ins and the browser half only asks for React from the shell's static module table.
+**Install** with `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1` (the
+package declares `dsh.bundle.patch`, so its two config rows come along automatically), with
+`node install.mjs` where pnpm is not available, or by hand (`patch.example.yml`). Restart dsh, then
+paste your key into the card on Settings → Models (stored as `CLINE_PASS_API_KEY` in the credential
+store; the browser cannot read it by design, which is why the host half fetches the usage numbers).
 
-**Verify.** `cat ~/.dsh/dsh-clinepass-status.json` — the running dsh writes its hook state and counters there (`hook`, `provision`, `seen`/`pinned`/`skipped`, `lastSkipped`, `lastVerified`/`lastViolation`, and the `violations` history — the last 20 blocked calls with the channel each was actually served by), which is how a silently bypassed hook becomes visible — and that file, not the log, is what to rely on: whether this plugin's `ctx.logger` lines reach a file at all depends on how the host was started (on the development machine, other plugins that print via `console` land in the launchd log while these do not); `node test-package.mjs` (packaging invariants: the bundle declaration is installable, no lifecycle scripts, the bundle and installer rows cannot drift, and the client-half declaration is loadable), `node test-fetch.mjs` (URL scoping, pass-through fidelity, install/uninstall and reload semantics, body shapes, robustness, status file, integration through the real fetch), `node test-settings.mjs` (the option surface, provisioning and the effort migration), `node test-usage.mjs` (response narrowing, the gateway read, the route handler's caching/dedupe/failure classification and key containment, the `apply` wiring), `node test-install.mjs` (install/uninstall round trips), `node smoke-test.mjs [--negative]` (checks the live process's status file, then runs a real gateway round trip asserting the response satisfies the profile's own pin — `finalProvider: "deepseek"` for a channel-pinned model, the wire's top-level `provider` field for a provider-pinned one — and that the local gate accepted it; a strict refusal of a foreign provider is asserted as the legitimate outcome). To check the usage half against the live process, open the page with its token and GET `/api/clinepass.usage` — it should answer `{"ok":true,"limits":[…]}`.
+**Configuration**: `upstream`, `provider`, `model`, `displayName`, `contextWindow`, `maxTokens`,
+`apiKeyEnv`, `provision`, `usage`, `usageRoute`, `usageTimeoutMs`, `usageCacheMs`, `statusFile`. If
+you declare the `llm-pi-ai` row yourself, include `reasoningEfforts` — the runtime provisioner only
+aligns `contextWindow`/`maxTokens` and never touches the levels.
 
-**Uninstall.** Bundle install: run `uninstall.mjs` from the installed package (`node <profile>/node_modules/dsh-clinepass/uninstall.mjs` — it drops the provisioned provider profile), then `dsh plugin --profile web remove dsh-clinepass`. Installer install: `node uninstall.mjs [--keep-provider]`. Restart dsh afterwards.
+**Verify**: `npm test`, the two `checks/` scripts (they import the *installed* copy, so deploy
+first), `smoke-test.mjs`, and `cat ~/.dsh/dsh-clinepass-status.json` (`hook`, `counters.seen` /
+`verified` / `anonymized` / `unknown`, `lastVerified`, `provision`, `ignoredOptions`).
 
-**Status.** Shared as-is for others to use, **not a maintained project**: no support promise, no commitment to track upstream dsh changes. The plugin leans on an internal dsh/pi-ai detail (pi-ai builds a fresh client per request and passes no `options.fetch`, so the real transport is the global `fetch`); if that ever changes the pin fails **silently**, which is exactly what the status file's `hook` field exists to expose.
-
-**See also.** A related package named `dsh-cline-pass` (npm, by yhshzh) solves overlapping problems with a self-contained provider adapter and account pool; this one (`dsh-clinepass`, no hyphen) deliberately reuses dsh's built-in pi-ai route and only injects the pin field. Both register provider routes — do not mount both.
-
-**Security.** The plugin opens no socket at all — the usage feature adds one *path* on the HTTP server dsh already runs, behind dsh's own Host/Origin trust fence and browser-cookie authentication — and the hook only rewrites requests aimed at the configured gateway origin. It holds no credential of its own (the key travels in the request header dsh sets; the usage read sends it once, to the same gateway, and never returns it), its status file contains no secrets (a test asserts this), and **no request header is ever logged** — the log carries only method, URL, model and pin channel, so there is nothing to redact.
+**Status**: shared as-is, not a maintained project — no support promise, and no commitment to track
+upstream dsh changes. MIT.
 
 ## License
 

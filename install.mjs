@@ -7,15 +7,16 @@
  * backed up, comments preserved). Re-running upgrades the row to the current
  * canonical form.
  *
- * There is one transport: the pin is injected in-process by wrapping
- * `globalThis.fetch`, so this plugin never opens a listener. `--transport` and
- * `--port` were removed in 0.5.0 and are now refused with a pointer to the
- * status file, which is how a running install is checked.
+ * The plugin is an **observer**: it wraps `globalThis.fetch` in-process and
+ * reads the provider out of the gateway's own responses without touching a
+ * request — no listener, no port, no rewrite. `--transport` and `--port` were
+ * removed in 0.5.0 and are now refused with a pointer to the status file, which
+ * is how a running install is checked.
  *
  * The provider itself — including its API-key field on Settings → Models — is
  * provisioned by the plugin on the next dsh start.
  *
- *   node install.mjs                        # ~/.dsh, profile web, in-process pin
+ *   node install.mjs                        # ~/.dsh, profile web, in-process observer
  *   node install.mjs --dsh-home /tmp/dsh --profile headless
  *   node install.mjs --dry-run
  */
@@ -58,7 +59,7 @@ keep a hand-edited row.
 // plugin exists to avoid.
 for (const removed of ['transport', 'port']) {
   if (has(removed)) {
-    console.error(`dsh-clinepass: --${removed} was removed in 0.5.0 — the loopback proxy transport is gone and the pin is injected in-process, with no listener.`)
+    console.error(`dsh-clinepass: --${removed} was removed in 0.5.0 — the loopback proxy transport is gone and the plugin observes in-process, listening on nothing.`)
     console.error('Drop the flag; the installer writes the portless row. Check a running install with:')
     console.error(`  cat ${path.join(String(option('dsh-home', process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'))), 'dsh-clinepass-status.json')}`)
     process.exit(1)
@@ -85,25 +86,19 @@ const stamp = new Date().toISOString().replace(/[:.]/g, '-')
 // ships a manifest that points at a file the directory does not contain.
 const files = ['index.js', 'client.js', 'package.json', 'cordis.patch.yml', 'test-fetch.mjs', 'test-settings.mjs', 'test-usage.mjs', 'smoke-test.mjs']
 
-/** The loader row: the pin is injected in-process, so nothing listens. */
+/** The loader row: the observer runs in-process, so nothing listens. */
 const FETCH_BLOCK = `# ── dsh-clinepass ─────────────────────────────────────────────────────────
-# A pin-injecting hook in front of the Cline Pass gateway. The provider itself
+# A provider observer in front of the Cline Pass gateway. The provider itself
 # is a normal pi-ai profile (llm-pi-ai.providers.cline-pass, provisioned by the
 # plugin on start), which is what puts its API-key field on Settings → Models.
-# Requests to the gateway have their body pinned to one upstream channel on the
-# way out, in this process — no listener, no port.
+# The hook reads the real upstream out of the gateway's own chat responses and
+# does not rewrite a request; it is entirely in this process — no listener, no
+# port.
 - insert:
     - id: clinepass
       name: './plugins/${name}/index.js'
       config:
         upstream: https://api.cline.bot
-        # 0.11.1: the second entry is the gateway's anonymized label for the
-        # fallback-net shape (real channel names are no longer written into the
-        # routing metadata since 2026-10-14). Keeping deepseek listed means
-        # verification resumes automatically if the gateway un-anonymizes.
-        pin:
-          - deepseek
-          - openai-compatible-private
 `
 
 const BLOCK = FETCH_BLOCK
@@ -143,7 +138,7 @@ console.log(`dsh-clinepass installer
   profile   : ${profile}
   plugin    : ${targetDir}
   patch     : ${patchPath}
-  transport : in-process fetch hook (no listener)${dryRun ? '\n  mode      : dry run' : ''}
+  observer  : in-process fetch observer (no listener)${dryRun ? '\n  mode      : dry run' : ''}
 `)
 
 /** Write a file with a backup beside it; returns the backup's basename. */
@@ -196,7 +191,7 @@ if (has('no-patch')) {
     if (existing === canonical) {
       console.log('  loader row already canonical — left as is')
     } else {
-      console.log(`  ${dryRun ? 'would refresh' : 'refresh'} the existing loader row (upstream/pin/comments)`)
+      console.log(`  ${dryRun ? 'would refresh' : 'refresh'} the existing loader row (upstream/comments)`)
       if (!dryRun) {
         parsed.entries[at] = { lines: blockLines, text: blockLines.join('\n') }
         console.log(`    backup: ${writeWithBackup(patchPath, rebuildPatch(parsed, eol))}`)
@@ -260,10 +255,11 @@ Next steps
   3. Pick "Cline Pass / DeepSeek V4.1 Flash" in the model selector.
 
 Verify
-  # the running dsh writes its hook state and counters here (no listener to curl):
+  # the running dsh writes its observer state and counters here (no listener to curl):
   cat ${path.join(dshHome, 'dsh-clinepass-status.json')}
-  # hook=installed + pinned climbing = the pin is live; seen climbing without
-  # pinned means requests are being skipped (the dsh log says why)
-  node ${path.join(targetDir, 'test-fetch.mjs')}    # pin hook, no dsh needed
+  # hook=installed + verified climbing = the observer is reading responses;
+  # seen climbing without verified means responses carried no provider metadata
+  # (lastVerified says who was seen last)
+  node ${path.join(targetDir, 'test-fetch.mjs')}    # observer, no dsh needed
   DSH_HOME=${dshHome} node smoke-test.mjs  # from this package dir: real gateway round trip
 `)

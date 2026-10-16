@@ -24,6 +24,11 @@
  * 刻意不做的事：不缓存密钥、不把密钥写进 DOM、不引入任何第三方依赖、不改动
  * 卡片本身的结构（只在卡片内部追加一段只读信息）。
  *
+ * 另有一个挂载点：composer 底部的 `conversation.composer.dock` 胶囊，显示宿主
+ * 观察到**真实**上游 provider（`?status=1`，走同一条同源路径）—— 它同样只读，
+ * 不判断、不告警、不改任何请求；匿名渠道（`openai-compatible-private`）只换配色
+ * 与 tooltip。
+ *
  * @module dsh-clinepass/client
  */
 
@@ -721,7 +726,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         var lang = useLanguage(ctx)
         var t = TEXT[lang] || TEXT.zh
 
-        var statePair = React.useState({ provider: null, anonymized: false, warn: false, reason: null, loading: false })
+        var statePair = React.useState({ provider: null, anonymized: false, model: null, at: null, loading: false })
         var status = statePair[0]
         var setStatus = statePair[1]
 
@@ -742,8 +747,6 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                 setStatus({
                   provider: data.provider,
                   anonymized: data.anonymized === true,
-                  warn: data.warn === true,
-                  reason: data.reason || null,
                   model: data.model,
                   at: data.at,
                   loading: false,
@@ -783,14 +786,12 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           }
         }, [isClinepass, running, refresh])
 
-        var isWarning = status.anonymized || status.warn
+        var isAnonymized = status.anonymized === true
         var providerName = status.provider
-        var displayText = providerName ? ('Provider: ' + providerName + (status.warn ? ' ⚠️' : '')) : 'Provider: --'
-        var tooltip = status.warn
-          ? (providerName + ' — ' + (status.reason ? status.reason : '非预期提供方（已放行）'))
-          : (status.anonymized
-            ? (providerName + ' — ' + t.providerAnonymizedTooltip)
-            : (providerName ? ('网关返回提供方: ' + providerName) : t.providerAwaiting))
+        var displayText = providerName ? ('Provider: ' + providerName) : 'Provider: --'
+        var tooltip = providerName
+          ? (isAnonymized ? (providerName + ' — ' + t.providerAnonymizedTooltip) : ('网关返回提供方: ' + providerName))
+          : t.providerAwaiting
 
         var hoverPair = React.useState(false)
         var hovered = hoverPair[0]
@@ -799,7 +800,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         // 全部 hook 到此为止；下面才是「非本路由的卡片原样放过」。
         if (!isClinepass) return null
 
-        var icon = isWarning
+        var icon = isAnonymized
           ? React.createElement(AnonymizedIcon, null)
           : React.createElement(ServerIcon, null)
 
@@ -823,7 +824,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           style: {
             boxSizing: 'border-box',
             maxWidth: '100%',
-            color: hovered ? LABEL_PRIMARY : (isWarning ? WARN : LABEL_TERTIARY),
+            color: hovered ? LABEL_PRIMARY : (isAnonymized ? WARN : LABEL_TERTIARY),
             font: 'inherit',
             fontVariantNumeric: 'tabular-nums',
             lineHeight: 'inherit',

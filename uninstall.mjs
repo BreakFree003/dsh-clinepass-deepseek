@@ -5,8 +5,8 @@
  * Removes the loader row from `cordis.patch.yml` (backed up), deletes the plugin
  * directory, and — unless `--keep-provider` — removes the
  * `llm-pi-ai.providers.cline-pass` profile the plugin provisioned. Leaving that
- * profile behind would leave a route nobody injects the pin into any more, so
- * removing it is the default.
+ * profile behind would leave a route nobody observes any more, so removing it is
+ * the default.
  *
  * Both edits are line surgery, not parse-and-dump: every comment and unrelated
  * key keeps its exact place. Two normalizations are possible and documented:

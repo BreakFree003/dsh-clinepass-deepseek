@@ -5,19 +5,20 @@
  * Drives the real gateway through the route the Models page configures and
  * checks the things that can silently break:
  *
- *   1. the pin is injected in-process — the profile points straight at the
+ *   1. the observer runs in-process — the profile points straight at the
  *      gateway, this plugin opens no listener, and the running dsh's
  *      `dsh-clinepass-status.json` confirms the hook is installed and has been
- *      pinning requests
- *   2. the profile's model is actually served by what its pin demands — the
- *      evidence follows the model's pin shape: routing metadata (`finalProvider`)
- *      for a channel pin, the wire's top-level `provider` field for a provider
- *      pin (0.10.0); a strict refusal is a legitimate outcome and is asserted as one
+ *      reading responses
+ *   2. a real turn completes through the gateway, the observer sees the actual
+ *      upstream that served it (a first-party name, or the anonymous
+ *      `openai-compatible-private` label), and the response is delivered to the
+ *      caller unmodified
  *   3. the credential the Models page stored is the one the route resolves
  *
  * Run it from the installed plugin directory (so `js-yaml` resolves alongside
- * dsh) or from the package directory. `--negative` additionally proves the pin
- * field is load-bearing by asking for a channel that cannot exist.
+ * dsh) or from the package directory. `--negative` additionally asks the
+ * gateway for a channel that cannot exist, which documents why the request-side
+ * pin was removed in 0.12.0: the gateway ignores that field.
  *
  *   node smoke-test.mjs
  *   node smoke-test.mjs --negative
@@ -110,9 +111,10 @@ const credentials = readYaml(path.join(DSH_HOME, '.credentials.yaml')) ?? {}
 const { profile, source: settingsSource } = readProviderProfile()
 
 /**
- * The clinepass loader row's own config (pins / providerPins / enforcement) —
- * §2 的证据面按它分派：渠道钉看 routing 元数据，provider 钉看 wire 顶层 provider
- * 字段。行缺席时落到插件默认（pin=deepseek），与插件自身行为一致。
+ * The clinepass loader row's own config. 0.12.0 removed every request-side
+ * option, so nothing here selects behaviour any more — but a row written by an
+ * older version still carries them, and the plugin lists them in the status
+ * file's `ignoredOptions`. This script reports that rather than failing it.
  */
 const pluginRows = readYaml(path.join(DSH_HOME, 'profiles', PROFILE, 'cordis.patch.yml'))
 const pluginConfig = (Array.isArray(pluginRows) ? pluginRows.find((row) => row?.id === 'clinepass') : undefined)?.config ?? {}
@@ -147,7 +149,7 @@ console.log(`  key ref      : ${keyRef} (${key === undefined ? 'MISSING' : `stor
 console.log('')
 
 // ── 1. the transport ────────────────────────────────────────────────────────
-console.log('── 1. pin transport ──────────────────────────────────────')
+console.log('── 1. observer transport ─────────────────────────────────')
 
 /** The port a loader row would listen on, if it carries one at all. */
 function configuredPort() {
@@ -185,14 +187,6 @@ if (loopback) {
   check('the card points at the gateway, not at a local listener', false, `${baseURL} — the loopback transport was removed in 0.5.0; restart dsh so the card is repaired`)
 }
 
-/**
- * The fetch this process has not wrapped.
- *
- * The pin lives in the running dsh process, so this script installs the
- * plugin's own hook to exercise the installed code — and the negative control
- * below needs the unwrapped one.
- */
-const nativeFetch = globalThis.fetch
 let hook = null
 
 {
@@ -210,67 +204,82 @@ let hook = null
     oldPortClosed ? 'no listener (the plugin opens none)' : 'something is still listening, from an older install — stop it or free the port',
   )
 
-  // The running dsh writes this file: it is the proof that the hook is in its
-  // process and that requests actually reach it.
+  // The running dsh writes this file: it is the proof that the observer is in
+  // its process and that responses actually reach it.
   const statusPath = path.join(DSH_HOME, 'dsh-clinepass-status.json')
-  let pinned = null
+  let record = null
   try {
-    pinned = JSON.parse(fs.readFileSync(statusPath, 'utf8'))
+    record = JSON.parse(fs.readFileSync(statusPath, 'utf8'))
   } catch {
-    pinned = null
+    record = null
   }
-  if (pinned === null) {
+  if (record === null) {
     check(
-      'the running dsh reports its pin state',
+      'the running dsh reports its observer state',
       false,
       `${statusPath} is missing — restart dsh with the plugin mounted, or set statusFile in the loader row`,
     )
   } else {
     console.log(`       ${statusPath}`)
-    console.log(`       hook=${pinned.hook} transport=${pinned.transport} pid=${pinned.pid} seen=${pinned.counters?.seen} pinned=${pinned.counters?.pinned} skipped=${pinned.counters?.skipped}`)
-    check('the running dsh uses the fetch transport', pinned.transport === 'fetch', String(pinned.transport))
+    console.log(`       hook=${record.hook} transport=${record.transport} pid=${record.pid} seen=${record.counters?.seen} verified=${record.counters?.verified} unknown=${record.counters?.unknown}`)
+    check('the running dsh uses the fetch transport', record.transport === 'fetch', String(record.transport))
+    if (Array.isArray(record.ignoredOptions) && record.ignoredOptions.length > 0) {
+      console.log(`       ignored options from an older install: ${record.ignoredOptions.join(', ')}`)
+    }
     // A record outlives the process that wrote it, so only a live pid can
     // support a claim about the live hook.
     let alive = false
-    if (Number.isInteger(pinned.pid) && pinned.pid > 0) {
+    if (Number.isInteger(record.pid) && record.pid > 0) {
       try {
-        process.kill(pinned.pid, 0)
+        process.kill(record.pid, 0)
         alive = true
       } catch {
         alive = false
       }
     }
     if (!alive) {
-      console.log(`       (dsh pid ${pinned.pid} is not running — this record is from a finished run, so the live hook could not be checked)`)
+      console.log(`       (dsh pid ${record.pid} is not running — this record is from a finished run, so the live hook could not be checked)`)
       console.log('       (start dsh, send one message, and re-run to verify the hook in the live process)')
     } else {
-      check('the hook is installed in the running dsh', pinned.hook === 'installed', String(pinned.hook))
+      check('the observer is installed in the running dsh', record.hook === 'installed', String(record.hook))
+      // The record is written by whichever build is running. A pre-0.12.0 build
+      // reports the pin-era counter set, and that is not a pass: the live hook
+      // would then be a different one from the code under test.
+      const observerCounters = record.counters?.verified !== undefined || record.counters?.unknown !== undefined
       check(
-        'requests are actually reaching the hook',
-        (pinned.counters?.seen ?? 0) === 0 || (pinned.counters?.pinned ?? 0) > 0 || (pinned.counters?.providerPinned ?? 0) > 0,
-        `${pinned.counters?.pinned ?? 0} pinned + ${pinned.counters?.providerPinned ?? 0} provider-pinned of ${pinned.counters?.seen ?? 0} gateway requests — the rest were skipped (see the dsh log)`,
+        'responses are actually reaching the observer',
+        observerCounters &&
+          ((record.counters?.seen ?? 0) === 0 || (record.counters?.verified ?? 0) > 0 || (record.counters?.unknown ?? 0) > 0),
+        observerCounters
+          ? `${record.counters?.verified ?? 0} verified + ${record.counters?.unknown ?? 0} unknown of ${record.counters?.seen ?? 0} gateway requests`
+          : `this record has no verified/unknown counters (seen=${record.counters?.seen ?? '?'}): the running dsh still serves the pre-observer build — deploy 0.12.0, restart, and re-run`,
       )
-      if ((pinned.counters?.seen ?? 0) === 0) console.log('       (no gateway request since boot; send one and re-run to see the counters move)')
-      if (pinned.lastPin !== undefined && pinned.lastPin !== null) console.log(`       last pin: ${pinned.lastPin.at} ${pinned.lastPin.model} -> ${pinned.lastPin.only?.join(', ')}`)
-      if (pinned.lastProviderPin !== undefined && pinned.lastProviderPin !== null) console.log(`       last provider pin: ${pinned.lastProviderPin.at} ${pinned.lastProviderPin.model} -> ${pinned.lastProviderPin.expect?.join(', ')}${pinned.lastProviderPin.order?.length ? ` (wire order: ${pinned.lastProviderPin.order.join(', ')})` : ''}`)
+      if ((record.counters?.seen ?? 0) === 0) console.log('       (no gateway request since boot; send one and re-run to see the counters move)')
+      if (record.lastVerified !== undefined && record.lastVerified !== null) {
+        console.log(`       last observed: ${record.lastVerified.at} ${record.lastVerified.provider} (${record.lastVerified.model ?? 'model unknown'})`)
+      }
+      if (record.lastAnonymized !== undefined && record.lastAnonymized !== null) {
+        console.log(`       last anonymized channel: ${record.lastAnonymized.at} ${record.lastAnonymized.provider}`)
+      }
     }
+  }
+
+  if (pluginConfig.pin !== undefined || pluginConfig.enforcement !== undefined || pluginConfig.retries !== undefined) {
+    console.log('       note: the loader row still carries pin/enforcement/retries — harmless (the observer ignores them), but they can be deleted')
   }
 
   // Exercise the installed code end to end; its own status file is off so the
   // running dsh's record above is not overwritten.
-  const { createFetchPin } = await import('./index.js')
-  // The hook must judge this turn with the plugin's REAL pin configuration — a
-  // default-pinned hook would fail closed on a provider-pinned pass-through
-  // model (2026-10-14: glm-5.3-flash carries no routing metadata at all).
-  hook = createFetchPin(
-    { upstream: origin, statusFile: false, pin: pluginConfig.pin, pins: pluginConfig.pins, providerPins: pluginConfig.providerPins, enforcement: pluginConfig.enforcement },
+  const { createFetchObserver } = await import('./index.js')
+  hook = createFetchObserver(
+    { upstream: origin, statusFile: false },
     { info: () => {}, warn: (line, ...rest) => console.log(`       ${String(line).replace(/%s/g, () => String(rest.shift() ?? ''))}`), error: () => {} },
   )
-  check('the installed pin hook can be installed', hook.install() === 'installed', 'this process only; dsh installs its own at boot')
+  check('the installed observer can be installed', hook.install() === 'installed', 'this process only; dsh installs its own at boot')
 }
 
-// ── 2. a real pinned turn ───────────────────────────────────────────────────
-console.log('\n── 2. pinned turn through the gateway ────────────────────')
+// ── 2. a real turn ──────────────────────────────────────────────────────────
+console.log('\n── 2. a real turn through the gateway ────────────────────')
 
 /** Collect every routing record in a parsed SSE frame. */
 function findRouting(node, out = []) {
@@ -286,7 +295,7 @@ function findRouting(node, out = []) {
 
 /**
  * Collect every **top-level** `provider` field in a parsed SSE frame — the
- * provider-pin evidence. No recursion on purpose: nested `provider` keys
+ * pass-through evidence shape. No recursion on purpose: nested `provider` keys
  * (routing attempts, delta fields) are not direct-route evidence.
  */
 function findProvider(node, out = []) {
@@ -297,17 +306,15 @@ function findProvider(node, out = []) {
 let routing = null
 let content = ''
 let streamError = null
-let gateError = null
 let providersSeen = []
 if (key === undefined) {
   check('credential stored', false, `${keyRef} is missing — type it on Settings → Models`)
 } else {
+  const body = JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'Reply with exactly: OK' }], stream: true, max_tokens: 384000 })
   const response = await fetch(`${baseURL}/chat/completions`, {
     method: 'POST',
     headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'text/event-stream' },
-    // 0.11.2：首条的判定是「流式 + 无 assistant 历史 + max_tokens > 8192」—— 这份请求
-    // 模拟会话首条，预算必须带足，否则提示帧不垫。
-    body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'Reply with exactly: OK' }], stream: true, max_tokens: 384000 }),
+    body,
   })
   let text = ''
   try {
@@ -324,10 +331,7 @@ if (key === undefined) {
       }
     }
   } catch (error) {
-    // strict 闸拒绝时流会以 ClinePassPinViolation 中断 —— 这是**预期结局之一**，不是
-    // 脚本故障（2026-10-14 实测网关把 glm-5.3-flash 轮转给 Z.AI / InferenceNet /
-    // Together；providerPins 撞上不允许的 provider 就是这条路径）。下面按证据分支断言。
-    gateError = error
+    streamError = error
   }
   for (const line of text.split('\n')) {
     if (!line.startsWith('data:')) continue
@@ -344,165 +348,103 @@ if (key === undefined) {
     }
   }
   check('gateway answered 200', response.status === 200, String(response.status))
-  const providerPinList = (pluginConfig.providerPins?.[modelId] ?? []).map((entry) => String(entry).toLowerCase())
-  const channelPinList = Array.isArray(pluginConfig.pins?.[modelId]) ? pluginConfig.pins[modelId] : (pluginConfig.pin ?? [])
-  if (gateError !== null) {
-    // 闸把这次调用作废了：断言它确实以「违规」收场，且记录里说得出是谁服务的。
-    const violation = hook.state().lastViolation
-    check(
-      'the gate refused this turn (the pin held)',
-      String(gateError.code) === 'PROVIDER_PIN_VIOLATION' && violation !== null,
-      `${gateError.code ?? gateError.name}: ${String(gateError.message ?? '').slice(0, 110)}`,
-    )
-    check(
-      '…and the refusal is explained',
-      String(violation?.reason ?? '').length > 0,
-      String(violation?.reason ?? '').slice(0, 140),
-    )
-  } else {
-    check('no stream error', streamError === null, String(streamError).slice(0, 120))
-    check('model answered', content.trim().length > 0, JSON.stringify(content.trim().slice(0, 40)))
-    if (providerPinList.length > 0 && channelPinList.length === 0) {
-      // provider 级钉选（0.10.0）：证据是每帧顶层的 provider 字段。
-      const unique = [...new Set(providersSeen)]
-      check(
-        'served by an allowed provider (wire provider field)',
-        unique.length > 0 && unique.every((name) => providerPinList.includes(name.toLowerCase())),
-        JSON.stringify(unique),
-      )
-      const gateSawIt = hook.state().lastVerified
-      check(
-        'the local gate verified this response',
-        gateSawIt !== null && gateSawIt.provider === unique[0]?.toLowerCase(),
-        JSON.stringify(gateSawIt ?? null).slice(0, 140),
-      )
-    } else {
-      // 0.11.1：渠道名自 2026-10-14 起被网关匿名化为 `openai-compatible-private`（允许
-      // 列表已放行它，并保留 deepseek —— 哪天改回真名校验自动恢复）。断言改成「由允许
-      // 列表里的渠道服务」，而不是点名 deepseek。
-      check('served by an allowed channel', channelPinList.includes(routing?.finalProvider), String(routing?.finalProvider))
-      // 2026-09-22 起 api.cline.bot **不再执行** providerOptions.gateway.only：钉真渠道、钉假
-      // 渠道、完全不钉，routing 元数据逐字相同，fallbacksAvailable 永远列出全部渠道。所以这里
-      // 不再断言网关的钉选行为（那个行为已经不存在，断言它只会永远红），而是把事实打出来，
-      // 并断言「这条响应确实通过了本地闸」—— 闸的拒绝行为由第 3 节证明。
-      if (Array.isArray(routing?.fallbacksAvailable) && routing.fallbacksAvailable.length > 0) {
-        console.log(`       注意：网关的 routing 仍列出 ${routing.fallbacksAvailable.length} 个 fallback 渠道 —— only 已不被执行，钉选由本地闸兑现`)
-      }
-      const gateSawIt = hook.state().lastVerified
-      check(
-        'the local gate verified this response',
-        gateSawIt !== null && channelPinList.includes(gateSawIt.provider),
-        JSON.stringify(gateSawIt ?? null).slice(0, 140),
-      )
-      // 0.11.3：0.11.1/0.11.2 曾在会话首条消息的回复前垫一条匿名渠道提示帧，现在删了
-      // —— 合成帧会进模型上下文。这条断言因此**反过来**：内容必须逐字来自网关。
-      // （和 test-fetch.mjs §13 的「without synthetic notice」是同一个契约。）
-      // 判据是那条提示本身的形状（以 ⚠️ 开头 + 点名被匿名化的渠道名）。不用
-      // `!content.includes('⚠️')`：那是活体测试（真问模型），模型自己在正文里打出
-      // ⚠️ 不该判失败。原来的 `'clinepass-anonymized-notice'` 是合成帧的 id、不在
-      // content 里，那一半恒真，是死条款。
-      check(
-        'the first message carries no synthetic notice frame',
-        !(content.startsWith('⚠️') && content.includes('openai-compatible-private')),
-        JSON.stringify(content.slice(0, 60)),
-      )
-      if (routing?.planningReasoning !== undefined) console.log(`       planningReasoning: ${String(routing.planningReasoning).slice(0, 110)}`)
+  check('the stream ended without an error', streamError === null, String(streamError).slice(0, 120))
+  check('model answered', content.trim().length > 0, JSON.stringify(content.trim().slice(0, 40)))
+  check('the observer saw exactly one request', hook.counters.seen === 1, JSON.stringify(hook.counters))
+
+  // The observer's own conclusion, from the same response the caller just read.
+  const observed = hook.status().lastVerified
+  const expectedProvider = (routing?.finalProvider ?? providersSeen[0] ?? null)
+  check(
+    'the observer read the real upstream from the response',
+    observed !== null && typeof observed.provider === 'string' && observed.provider.length > 0,
+    JSON.stringify(observed ?? null).slice(0, 160),
+  )
+  check(
+    '…and it agrees with the routing metadata on the wire',
+    observed !== null && (expectedProvider === null || observed.provider === String(expectedProvider).trim().toLowerCase()),
+    `observed=${observed?.provider ?? '(none)'} wire=${String(expectedProvider ?? '(none)')}`,
+  )
+  // The wire model is the one part of an observation that lands a moment later
+  // (it needs the request body), so it gets its own wait and its own assertion —
+  // never a wait on the whole `lastVerified`.
+  if (observed !== null && observed.model !== modelId) {
+    let followed = observed.model
+    for (let i = 0; i < 20 && (followed === null || followed === undefined); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      followed = hook.status().lastVerified?.model ?? null
     }
+    check('the wire model follows on the same record', followed === modelId, `${String(followed)} vs ${String(modelId)}`)
   }
+  if (observed?.anonymized === true) {
+    console.log(`       the channel is anonymized as ${observed.provider} — the contributor-tier fallback net (see clinepass-deepseek-audit/)`)
+  } else if (observed !== null) {
+    console.log(`       served first-party-ish by: ${observed.provider}`)
+  }
+  if (Array.isArray(routing?.fallbacksAvailable) && routing.fallbacksAvailable.length > 0) {
+    console.log(`       note: the routing metadata still lists ${routing.fallbacksAvailable.length} fallback channels (this is a fact about the gateway, not a decision this plugin makes)`)
+  }
+  // 0.11.3：0.11.1/0.11.2 曾在会话首条消息的回复前垫一条匿名渠道提示帧，现在删了
+  // —— 合成帧会进模型上下文。这条断言因此**反过来**：内容必须逐字来自网关。
+  check(
+    'the first message carries no synthetic notice frame',
+    !(content.startsWith('⚠️') && content.includes('openai-compatible-private')),
+    JSON.stringify(content.slice(0, 60)),
+  )
+  if (routing?.planningReasoning !== undefined) console.log(`       planningReasoning: ${String(routing.planningReasoning).slice(0, 110)}`)
 }
 
-// ── 3. the local gate ───────────────────────────────────────────────────────
+// ── 3. the observer is transparent ──────────────────────────────────────────
 //
-// 网关不再执行 providerOptions.gateway.only（见 README「网关不再执行 only」一节），
-// 所以「钉住官方渠道」现在由插件在本地兑现：边流边读 routing，读出真正服务它的渠道，
-// 不在允许列表里就让这条流在收尾前**中断**。这一节用一个**不可能存在**的渠道当允许
-// 列表来证明闸是活的：网关再怎么挑也挑不到它 → 必须拒。
-//
-// ⚠️ 2026-10-03 实测：拿一个**真渠道**当「必然错配」是错的 —— 网关自行挑渠道（routing 的
-// `fallbacksAvailable` 里就含 alibaba 等），有一次真的由 alibaba 服务，闸按契约放行、
-// 这一节却报红（`blocked=0`、流正常收尾）。所以改用 `__no_such_upstream__`，不留概率。
-console.log('\n── 3. the gate refuses a non-pinned response ─────────────')
+// The observer must not change what the caller receives. This sends a second,
+// deliberately tiny turn through a freshly installed observer and asserts that
+// the body arrives intact — frames and terminator included — while the observer
+// still records who served it.
+console.log('\n── 3. a second turn is relayed untouched ─────────────────')
 {
-  const { createFetchPin: makeHook } = await import('./index.js')
+  const { createFetchObserver: makeObserver } = await import('./index.js')
   hook?.uninstall()
-  const gate = makeHook(
-    { upstream: origin, statusFile: false, pin: ['__no_such_upstream__'] },
-    {
-      info: () => {},
-      warn: () => {},
-      error: (line, ...rest) => console.log(`       ${String(line).replace(/%s/g, () => String(rest.shift() ?? ''))}`),
-    },
-  )
-  gate.install()
-  const response = await fetch(`${baseURL}/chat/completions`, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'text/event-stream' },
-    body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'Reply with exactly: OK' }], stream: true, max_tokens: 64 }),
-  })
-  // SSE 的拒法是**中断响应体**：HTTP 状态在第一帧内容出去时就定死了，所以状态仍是 200；
-  // 内容边流边显示，但终止帧被扣住，消费端读到的是失败而不是一次正常收尾。
-  let refusal = null
+  const observer = makeObserver({ upstream: origin, statusFile: false }, { info: () => {}, warn: () => {}, error: () => {} })
+  observer.install()
   let received = ''
-  try {
-    const reader = response.body.getReader()
-    const dec = new TextDecoder()
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      received += dec.decode(value)
-    }
-  } catch (error) {
-    refusal = error
-  }
-  check('a streamed response from a channel we did not allow fails', refusal !== null, String(refusal?.message ?? '').slice(0, 120))
-  check(
-    'the failure is identifiable',
-    String(refusal?.code) === 'PROVIDER_PIN_VIOLATION' && /渠道校验未通过/.test(String(refusal?.message)),
-    `${refusal?.code}: ${String(refusal?.message ?? '').slice(0, 100)}`,
-  )
-  check('the refused stream never reaches a completion', !/\[DONE\]/.test(received), received.slice(-140))
-  check('the refusal is counted', gate.counters.blocked === 1, String(gate.counters.blocked))
-  const state = gate.state()
-  // 拒绝理由按 wire 形状分派：带 routing 元数据的形状（deepseek）能点名渠道；直通形状
-  // （glm-5.3-flash，2026-10-14 起）wire 上根本没有 routing 元数据，「无法证明」本身就是
-  // 拒绝理由 —— 闸照样 fail closed，只是没有渠道名可点名。
-  let receivedRouting = null
-  for (const line of received.split('\n')) {
-    if (!line.startsWith('data:')) continue
-    const data = line.slice(5).trim()
-    if (data.length === 0 || data === '[DONE]') continue
-    try {
-      for (const found of findRouting(JSON.parse(data))) receivedRouting = found
-    } catch {
-      /* partial frame */
-    }
-  }
-  const actualProvider = receivedRouting?.finalProvider ?? state.lastViolation?.finalProvider
-  if (actualProvider !== undefined && actualProvider !== null) {
-    check(
-      'the violation records who actually served it',
-      state.lastViolation !== null && state.lastViolation.finalProvider === actualProvider,
-      JSON.stringify(state.lastViolation ?? null).slice(0, 160),
-    )
-    check('the violation records why it was refused', /__no_such_upstream__/.test(String(state.lastViolation?.reason)), String(state.lastViolation?.reason ?? ''))
+  let streamFailure = null
+  if (key === undefined) {
+    check('a relayed turn is delivered intact', false, 'no credential — cannot drive the gateway')
   } else {
-    check(
-      'the violation records why it was refused (no routing metadata on the wire)',
-      state.lastViolation !== null && /没有 gateway\.routing 元数据/.test(String(state.lastViolation?.reason)),
-      String(state.lastViolation?.reason ?? ''),
-    )
+    const response = await fetch(`${baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'text/event-stream' },
+      body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'Reply with exactly: OK' }], stream: true, max_tokens: 64 }),
+    })
+    check('the gateway answered 200', response.status === 200, String(response.status))
+    try {
+      const reader = response.body.getReader()
+      const dec = new TextDecoder()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        received += dec.decode(value)
+      }
+    } catch (error) {
+      streamFailure = error
+    }
+    check('the relayed stream ends normally', streamFailure === null && received.includes('[DONE]'), String(streamFailure?.message ?? received.slice(-40)))
+    check('…with model content in it', /"delta"/.test(received) || /"content"/.test(received), JSON.stringify(received.slice(0, 80)))
+    check('…and the observer still counted it', observer.counters.seen === 1, JSON.stringify(observer.counters))
+    check('…and it came back with a provider', observer.status().lastVerified !== null, JSON.stringify(observer.status().lastVerified ?? null).slice(0, 140))
   }
-  gate.uninstall()
+  observer.uninstall()
   hook?.install()
 }
 
-// ── 4. the pin field itself (optional) ──────────────────────────────────────
+// ── 4. the request-side pin field (optional) ────────────────────────────────
 if (argv.includes('--negative')) {
-  console.log('\n── 4. negative control (impossible channel) ──────────────')
+  console.log('\n── 4. why the request field was removed ──────────────────')
   const gateway = String(profile.baseURL ?? '').replace(new RegExp(`^${origin}`), '')
   const upstream = process.env.CLINE_UPSTREAM ?? 'https://api.cline.bot'
-  // Deliberately through the unwrapped fetch: a hook would overwrite the
-  // impossible pin with the real one and prove nothing.
+  // Deliberately through the unwrapped fetch: this is about what the gateway
+  // does with the field, not about the plugin — which no longer writes one.
+  const nativeFetch = globalThis.fetch
   const response = await nativeFetch(`${upstream}${gateway}/chat/completions`, {
     method: 'POST',
     headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
@@ -511,21 +453,18 @@ if (argv.includes('--negative')) {
   const text = await response.text()
   // 这一节以前断言网关回 `No available providers match the 'only' filter`。那是 2026-09-22
   // **之前**的行为：网关此后整个忽略 provider 路由选项块（实测钉真渠道 / 钉假渠道 / 完全不钉，
-  // routing 元数据逐字相同 —— 见 README 那张表与 2026-09-30 复测）。所以这条负控制现在证明的
-  // 正好相反：**请求字段不再承担任何钉选**，唯一还在兑现的是本地闸（第 3 节）。
-  // 旧断言让 `--negative` 静默红了 8 天 —— 那比没有断言更糟，所以按事实改掉它。
+  // routing 元数据逐字相同）。所以这条负控制证明的正好相反：**请求字段不承担任何钉选** ——
+  // 这正是 0.12.0 把请求改写整块删掉的理由。
   const { routingsOfText } = await import('./index.js')
-  const routing = routingsOfText(text)[0] ?? null
+  const found = routingsOfText(text)[0] ?? null
   check(
-    'the gateway no longer refuses an impossible pin — the request field is dead',
-    response.status === 200 && routing !== null && routing.finalProvider !== '__no_such_upstream__',
-    `${response.status} finalProvider=${routing?.finalProvider ?? 'no routing metadata'}`,
+    'the gateway ignores an impossible pin — the request field is dead',
+    response.status === 200 && found !== null && found.finalProvider !== '__no_such_upstream__',
+    `${response.status} finalProvider=${found?.finalProvider ?? 'no routing metadata'}`,
   )
-  // 0.11.1：匿名化形状的 `fallbacksAvailable` 是**空列表**（不再列出渠道），旧断言
-  // 「fallbacks > 1」会永远红。请求字段已死这一点由上一条 check 证明；这里只把形状打出来。
   console.log(
-    routing !== null && Array.isArray(routing.fallbacksAvailable)
-      ? `       fallbacksAvailable=${routing.fallbacksAvailable.length === 0 ? '[]（0.11.1 匿名化形状：渠道名已隐藏）' : `${routing.fallbacksAvailable.length} 个`}`
+    found !== null && Array.isArray(found.fallbacksAvailable)
+      ? `       fallbacksAvailable=${found.fallbacksAvailable.length === 0 ? '[]（0.11.1 匿名化形状：渠道名已隐藏）' : `${found.fallbacksAvailable.length} 个`}`
       : '       no routing metadata on the wire',
   )
 }

@@ -1,10 +1,17 @@
 /**
- * Tests for the dsh-clinepass in-process pin hook (`transport: 'fetch'`).
+ * Tests for the dsh-clinepass in-process **observer** (`globalThis.fetch`).
  *
  * No dsh process and no gateway: `globalThis.fetch` is replaced by a recording
- * stub for the unit checks, and real local HTTP servers stand in for the gateway
- * for the integration checks — so the hook is exercised through undici exactly
- * as dsh exercises it, including uninstall restoring the original.
+ * stub, and responses are built by hand — SSE frames, single JSON documents,
+ * failing reads — so every branch of the observer is exercised without a
+ * network. The contract this file holds the observer to is narrow:
+ *
+ *   - a watched request is sent with the caller's own `input`/`init`, once,
+ *     byte for byte, and is never retried;
+ *   - everything else is passed through with the same arguments;
+ *   - the response is delivered unchanged, and an SSE body keeps its per-frame
+ *     arrival times (the reason the pass-through stream exists);
+ *   - what was seen lands in the status file and in `?status=1`.
  *
  * Run: node test-fetch.mjs
  */
@@ -12,13 +19,28 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { createFetchPin, createUsageHandler, installPromptDisplay, isGatewayChat, isTerminatorFrame, judgeProviders, nextFrameEnd, providerPinFor, providerSlug, providersOfText, provisionProfile, routingOfText, statusFileFor, withDefaults, withProviderOrder } from './index.js'
+import {
+  createFetchObserver,
+  createUsageHandler,
+  apply,
+  isGatewayChat,
+  isTerminatorFrame,
+  nextFrameEnd,
+  observedProviderOf,
+  providersOfText,
+  routingOfText,
+  routingsOfText,
+  statusFileFor,
+  withDefaults,
+} from './index.js'
 
-// The hook publishes a status file by default; keep every run's out of the
+// The observer publishes a status file by default; keep every run's out of the
 // user's real DSH_HOME (and let the default resolution be what is exercised).
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-clinepass-fetch-'))
 process.env.DSH_HOME = SCRATCH
-const STATUS = path.join(SCRATCH, 'dsh-clinepass-status.json')
+
+const GATEWAY = 'https://api.cline.bot'
+const CHAT = `${GATEWAY}/api/v1/chat/completions`
 
 const failures = []
 const check = (label, ok, detail) => {
@@ -36,2123 +58,816 @@ function recorder() {
   const record = (level) => (template, ...args) => lines[level].push(format(template, args))
   return { lines, info: record('info'), warn: record('warn'), error: record('error') }
 }
+const quiet = { info() {}, warn() {}, error() {} }
 
-/**
- * A host plugin-context double.
- *
- * `apply` also registers a prompt-assembly listener on the Cordis event bus, so
- * the double records the event names it was asked to listen for — that is how a
- * thrown-away ctx would otherwise hide a registration.
- */
-function ctxFor(logger, settings, effect = () => {}, { deferSettings = false, loader } = {}) {
-  const listeners = new Map()
-  const pending = []
-  const ctx = {
-    logger,
-    effect,
-    listeners,
-    // 真实宿主里 `ctx.root.loader` 是根上下文上的 loader 服务；给双替身留一个口子，
-    // 用来断言「树还没 settle 时 apply() 必须已经返回」（见 §10 的延后供给回归）。
-    ...(loader === undefined ? {} : { root: { loader } }),
-    on(event, listener, options) {
-      listeners.set(event, { listener, options })
-    },
-    // cordis: a service is reached through get()/inject(), and a bare property
-    // read of one the fiber never declared in `inject` throws. The double
-    // enforces both, so `ctx.settings` cannot quietly come back — that read is
-    // what aborted apply() on a cold boot (dsh 0.1.7).
-    // Only the `settings` seam is simulated here. It is reachable through
-    // get()/inject() and never as a property read — that is the cordis rule the
-    // cold-boot case is about; every other service reads as absent, as it does
-    // in this harness.
-    get(name, strict = true) {
-      if (name !== 'settings') return undefined
-      if (settings !== undefined && !deferSettings) return settings
-      if (strict) throw new Error(`cannot get property "${name}" without inject`)
-      return undefined
-    },
-    inject(names, callback) {
-      if (names.includes('settings') && settings !== undefined && deferSettings) pending.push({ names, run: () => callback({ ...ctx, settings }) })
-      else if (names.includes('settings') && settings !== undefined) callback({ ...ctx, settings })
-      return Promise.resolve()
-    },
-    /** Service names an injection is currently waiting on. */
-    queued() {
-      return pending.flatMap((entry) => entry.names)
-    },
-    /** Fire the injections cordis has not been able to run yet. */
-    deliver() {
-      const queued = pending.splice(0)
-      for (const entry of queued) entry.run()
-      return queued.length
-    },
-  }
-  Object.defineProperty(ctx, 'settings', {
-    get() {
-      throw new Error('cannot get property "settings" without inject')
+const enc = (text) => new TextEncoder().encode(text)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const frame = (payload) => `data: ${typeof payload === 'string' ? payload : JSON.stringify(payload)}\n\n`
+const contentFrame = (index = 0) => frame({ id: 'gen_1', object: 'chat.completion.chunk', model: 'cline-pass/deepseek-v4.1-flash', choices: [{ index: 0, delta: { content: `tok${index}` }, finish_reason: null }] })
+const routingFrame = (routing) => frame({ choices: [{ index: 0, delta: { provider_metadata: { gateway: { routing } } } }] })
+const DONE = 'data: [DONE]\n\n'
+
+/** The routing metadata the live gateway writes for a first-party DeepSeek turn. */
+const DEEPSEEK_ROUTING = {
+  finalProvider: 'deepseek',
+  resolvedProvider: 'deepseek',
+  affinity: { pinnedProvider: 'deepseek' },
+  fallbacksAvailable: ['fireworks', 'baseten'],
+  modelAttempts: [{ providerAttempts: [{ provider: 'deepseek', success: true, statusCode: 200 }] }],
+}
+
+/** A response whose body is the given SSE frames, streamed one pull at a time. */
+function sseResponse(frames, { gapMs = 0, keepOpen = false } = {}) {
+  let sent = 0
+  const stream = new ReadableStream({
+    async pull(controller) {
+      if (sent < frames.length) {
+        controller.enqueue(enc(frames[sent]))
+        sent += 1
+        if (gapMs > 0) await sleep(gapMs)
+        return
+      }
+      // A gateway that sent `[DONE]` and then simply never closes the socket is
+      // the shape the terminator check exists for.
+      if (keepOpen) return
+      controller.close()
     },
   })
-  return ctx
+  return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } })
 }
 
-const GATEWAY = 'https://api.cline.bot'
-const CHAT = `${GATEWAY}/api/v1/chat/completions`
-
-const CHAT_BODY = {
-  model: 'cline-pass/deepseek-v4.1-flash',
-  messages: [{ role: 'user', content: 'hi' }],
-  stream: true,
-  max_tokens: 512,
-  tools: [{ type: 'function', function: { name: 'x' } }],
+function readStatus(statusPath) {
+  try {
+    return JSON.parse(fs.readFileSync(statusPath, 'utf8'))
+  } catch {
+    return null
+  }
 }
 
-const jsonInit = (extra = {}) => ({
+const chatInit = (body = { model: 'cline-pass/deepseek-v4.1-flash', messages: [{ role: 'user', content: 'hi' }], stream: true }) => ({
   method: 'POST',
   headers: { 'content-type': 'application/json', authorization: 'Bearer sk_test' },
-  body: JSON.stringify(CHAT_BODY),
-  ...extra,
+  body: JSON.stringify(body),
 })
 
+let counter = 0
 /**
- * 一份「由 provider 服务」的网关响应。
+ * Run one scenario against a fresh observer.
  *
- * 本地闸（`enforcement: strict`，默认）拿到响应后会读 `gateway.routing` 判断真正服务
- * 这次请求的是谁，读不出允许的渠道就整条拒掉。所以假网关的响应必须带上这段元数据 ——
- * 不带的话这些「钉选/透传」用例全会撞在闸上（那本身是对的，见第 4b 节）。
+ * The stub is installed **before** `observer.install()` on purpose: the wrapper
+ * captures whatever `globalThis.fetch` is at install time, so this is the only
+ * order that proves the observer does not bypass the function it wrapped.
  *
- * @param provider - `finalProvider` 的值。
- * @param resolved - `resolvedProvider` 的值（默认与 `finalProvider` 相同）。
- * @returns 响应体 JSON 文本。
+ * @param handler - `(input, init) => Response | Promise<Response>`.
+ * @param options - `{ config, url, init, drive, consume }`. `drive(response)`
+ *   receives the response and may read it; `consume` (default true) drains the
+ *   body as text when no `drive` is given.
+ * @returns `{ response, text, driven, calls, observer, logger, statusPath, status }`.
  */
-function gatewayBody(provider = 'deepseek', resolved = provider) {
-  return JSON.stringify({
-    ok: true,
-    choices: [
-      {
-        message: {
-          provider_metadata: {
-            gateway: {
-              routing: {
-                finalProvider: provider,
-                resolvedProvider: resolved,
-                fallbacksAvailable: [],
-                modelAttempts: [{ providerAttempts: [{ provider, success: true }] }],
-              },
-            },
-          },
-        },
-      },
-    ],
-  })
-}
-
-const GATEWAY_BODY = gatewayBody('deepseek')
-
-/** Replace globalThis.fetch with a recording stub; returns the stub and a restore. */
-function stubFetch(handler) {
+async function runObserved(handler, { config = {}, url = CHAT, init = chatInit(), drive = null, consume = true } = {}) {
+  counter += 1
+  const statusPath = path.join(SCRATCH, `status-${String(counter).padStart(3, '0')}.json`)
+  const logger = recorder()
   const real = globalThis.fetch
   const calls = []
-  const fn = (input, init) => {
-    calls.push({ input, init })
-    return handler(input, init, calls.length)
+  globalThis.fetch = (input, second) => {
+    calls.push({ input, init: second })
+    return handler(input, second)
   }
-  globalThis.fetch = fn
-  return { calls, fn, restore: () => { globalThis.fetch = real } }
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: statusPath, ...config }, logger)
+  observer.install()
+  let response = null
+  let text = null
+  let driven = null
+  let status = null
+  try {
+    response = await globalThis.fetch(url, init === null ? undefined : init)
+    if (drive !== null) driven = await drive(response)
+    else if (consume) text = await response.text()
+    // Let the fire-and-forget record land, and read the file while the hook is
+    // still installed — `uninstall()` rewrites `hook` in the same file.
+    await sleep(5)
+    status = readStatus(statusPath)
+  } finally {
+    observer.uninstall()
+    globalThis.fetch = real
+  }
+  return { response, text, driven, calls, observer, logger, statusPath, status }
 }
 
-/** The JSON body of a recorded call whose input was a string/URL. */
-function bodyOf(call) {
-  const raw = typeof call.init?.body === 'string' ? call.init.body : Buffer.from(call.init?.body ?? '').toString('utf8')
-  return JSON.parse(raw)
-}
-
-const only = (call) => bodyOf(call).providerOptions?.gateway?.only
-
-// ── 1. URL scoping ──────────────────────────────────────────────────────────
-console.log('\n── 1. URL scoping ────────────────────────────────────────')
-check('the gateway chat endpoint matches', isGatewayChat(CHAT, GATEWAY) === true)
-check('a query string still matches', isGatewayChat(`${CHAT}?x=1`, GATEWAY) === true)
-check('a trailing slash still matches', isGatewayChat(`${CHAT}/`, GATEWAY) === true)
-check('another provider is not touched', isGatewayChat('https://api.deepseek.com/v1/chat/completions', GATEWAY) === false)
-check('another host on the same path is not touched', isGatewayChat('https://evil.test/api/v1/chat/completions', GATEWAY) === false)
-check('a same-host non-chat path is not touched', isGatewayChat(`${GATEWAY}/api/v1/models`, GATEWAY) === false)
-check('a lookalike path is not touched', isGatewayChat(`${GATEWAY}/api/v1/chat/completions-extra`, GATEWAY) === false)
-check('a relative URL is not touched', isGatewayChat('/api/v1/chat/completions', GATEWAY) === false)
-check('a non-URL is not touched', isGatewayChat('not a url', GATEWAY) === false)
-
-// ── 2. install / uninstall ──────────────────────────────────────────────────
-console.log('\n── 2. install and uninstall ──────────────────────────────')
+// ── 1. where the observer looks ─────────────────────────────────────────────
+console.log('\n── 1. scoping ────────────────────────────────────────────')
 {
-  const native = globalThis.fetch
+  check('the configured gateway chat endpoint is watched', isGatewayChat(CHAT, GATEWAY) === true)
+  check('a trailing slash is the same endpoint', isGatewayChat(`${CHAT}/`, GATEWAY) === true)
+  check('another path on the same origin is not', isGatewayChat(`${GATEWAY}/api/v1/models`, GATEWAY) === false)
+  check('another origin is not', isGatewayChat('https://api.deepseek.com/chat/completions', GATEWAY) === false)
+  check('an unparsable URL is not', isGatewayChat('not a url', GATEWAY) === false)
+  check('an unparsable upstream is not', isGatewayChat(CHAT, 'api.cline.bot') === false)
+}
 
-  const absent = createFetchPin({}, recorder())
-  check('uninstall before install is a no-op', absent.uninstall() === 'absent')
+// ── 2. the observer never changes a request ─────────────────────────────────
+console.log('\n── 2. pure observation ───────────────────────────────────')
+{
+  const init = chatInit()
+  const originalBody = init.body
+  const originalHeaders = init.headers
+  const frames = [contentFrame(), routingFrame(DEEPSEEK_ROUTING), DONE]
+  const result = await runObserved(() => sseResponse(frames), { init })
+  const call = result.calls[0]
+  check('the watched request is sent exactly once', result.calls.length === 1, String(result.calls.length))
+  check("…with the caller's own init object", call.init === init)
+  check("…and the caller's own input string", call.input === CHAT, String(call.input))
+  check('…an unchanged body, byte for byte', call.init.body === originalBody, String(call.init.body))
+  check('…and unchanged headers', call.init.headers === originalHeaders)
+  check('no routing field is ever written into the body', !call.init.body.includes('providerOptions') && !call.init.body.includes('"provider"'), call.init.body)
+  check('the response bytes are untouched', result.text === frames.join(''), JSON.stringify(result.text?.slice(0, 60)))
+}
+{
+  // Another origin: the stub sees the original arguments and nothing is counted.
+  const init = { method: 'GET' }
+  const result = await runObserved(
+    () => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } }),
+    { url: 'https://api.deepseek.com/models', init },
+  )
+  check('a non-gateway request is passed through untouched', result.calls[0].input === 'https://api.deepseek.com/models' && result.calls[0].init === init)
+  check('…and is not counted', result.observer.counters.seen === 0, JSON.stringify(result.observer.counters))
+  check('…and its body is readable as-is', result.text === '{"ok":true}', result.text)
+  check('…and it writes no observation', result.status?.lastVerified === null, JSON.stringify(result.status?.lastVerified))
+}
 
-  const installed = stubFetch(() => new Response('{}'))
-  const hook = createFetchPin({}, recorder())
-  check('install reports success', hook.install() === 'installed')
-  check('globalThis.fetch is the hook', globalThis.fetch !== installed.fn && globalThis.fetch !== native)
-  check('installing twice is still one hook', hook.install() === 'installed')
-  check('uninstall restores what was there before', hook.uninstall() === 'restored' && globalThis.fetch === installed.fn)
-  installed.restore()
+// ── 3. the provider is read out of a streamed response ──────────────────────
+console.log('\n── 3. streaming observation ──────────────────────────────')
+{
+  const result = await runObserved(() => sseResponse([contentFrame(), routingFrame(DEEPSEEK_ROUTING), DONE]))
+  const { observer, status } = result
+  check('the request is counted as seen', observer.counters.seen === 1, JSON.stringify(observer.counters))
+  check('…and as verified', observer.counters.verified === 1, JSON.stringify(observer.counters))
+  check('…with no unknown', observer.counters.unknown === 0, JSON.stringify(observer.counters))
+  check('the status file records the provider', status?.lastVerified?.provider === 'deepseek', JSON.stringify(status?.lastVerified))
+  check('…the wire model it answered for', status?.lastVerified?.model === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(status?.lastVerified))
+  check('…the URL', status?.lastVerified?.url === CHAT, String(status?.lastVerified?.url))
+  check('…and that it is not anonymized', status?.lastVerified?.anonymized === false, JSON.stringify(status?.lastVerified))
+  check('the counters are in the status file', status?.counters?.seen === 1 && status?.counters?.verified === 1, JSON.stringify(status?.counters))
+  check('the file names the service and transport', status?.service === 'dsh-clinepass' && status?.transport === 'fetch', JSON.stringify(status?.service))
+  check('…and reports the hook as installed', status?.hook === 'installed', String(status?.hook))
+  check('…with the profile address', status?.profileBaseURL === `${GATEWAY}/api/v1`, String(status?.profileBaseURL))
+  check('the model index answers a lookup', observer.verifiedByModel('cline-pass/deepseek-v4.1-flash')?.provider === 'deepseek')
+  check('an unknown model gets no answer', observer.verifiedByModel('cline-pass/glm-5.3-flash') === undefined)
+  check('the status() snapshot carries the counters', observer.status().counters.verified === 1, JSON.stringify(observer.status()))
+  check('state() is the same read surface', observer.state().counters.verified === 1)
+}
+{
+  // The anonymous fallback-net label: recorded as a fact, flagged, counted.
+  const routing = { finalProvider: 'openai-compatible-private', resolvedProvider: 'openai-compatible-private', affinity: { pinnedProvider: 'openai-compatible-private' } }
+  const result = await runObserved(() => sseResponse([contentFrame(), routingFrame(routing), DONE]))
+  check('the anonymous label is recorded as the provider', result.status?.lastVerified?.provider === 'openai-compatible-private', JSON.stringify(result.status?.lastVerified))
+  check('…and flagged anonymized', result.status?.lastVerified?.anonymized === true, JSON.stringify(result.status?.lastVerified))
+  check('…counted separately', result.observer.counters.anonymized === 1, JSON.stringify(result.observer.counters))
+  check('…and remembered as the last anonymized turn', result.status?.lastAnonymized?.provider === 'openai-compatible-private', JSON.stringify(result.status?.lastAnonymized))
+  check('the observer says so in the log', result.logger.lines.warn.some((line) => line.includes('openai-compatible-private')), JSON.stringify(result.logger.lines.warn))
+}
+{
+  // No provider metadata at all: say so rather than guess.
+  const result = await runObserved(() => sseResponse([contentFrame(), DONE]))
+  check('no evidence counts as unknown', result.observer.counters.unknown === 1, JSON.stringify(result.observer.counters))
+  check('…and no provider is invented', result.status?.lastVerified === null, JSON.stringify(result.status?.lastVerified))
+  check('…and the log says so', result.logger.lines.warn.some((line) => line.includes('no provider metadata')), JSON.stringify(result.logger.lines.warn))
+  check('the response is still delivered', result.text.endsWith(DONE), JSON.stringify(result.text?.slice(-20)))
+}
+{
+  // The wire's top-level `provider` field (the pass-through shape, no routing).
+  const topLevel = (provider) => frame({ id: 'gen_1', provider, choices: [{ index: 0, delta: { content: 'x' } }] })
+  const result = await runObserved(() => sseResponse([topLevel('Z.AI'), topLevel('Z.AI'), DONE]))
+  check('the top-level provider field is read', result.status?.lastVerified?.provider === 'z.ai', JSON.stringify(result.status?.lastVerified))
+}
+{
+  // `provider_metadata.<x>` is the last clue, and only when the others are absent.
+  const namespace = frame({ choices: [{ index: 0, delta: { provider_metadata: { kimi: { promptCacheHitTokens: 1 } } } }] })
+  const named = await runObserved(() => sseResponse([namespace, DONE]))
+  check('a provider namespace identifies the upstream', named.status?.lastVerified?.provider === 'kimi', JSON.stringify(named.status?.lastVerified))
 
-  // A reload in the same process must not leave a chain of wrappers behind.
-  const one = createFetchPin({}, recorder())
-  const two = createFetchPin({}, recorder())
-  one.install()
-  two.install()
-  const live = globalThis.fetch
-  check('a displaced instance refuses to unhook the live one', one.uninstall() === 'foreign' && globalThis.fetch === live)
-  check('the displaced instance leaves the live record alone', JSON.parse(fs.readFileSync(STATUS, 'utf8')).hook === 'installed', fs.readFileSync(STATUS, 'utf8'))
-  check('the live hook still uninstalls cleanly', two.uninstall() === 'restored' && globalThis.fetch === native)
+  const infraOnly = frame({ choices: [{ index: 0, delta: { provider_metadata: { gateway: { routing: {} }, 'openai-compat': [] } } }] })
+  const unnamed = await runObserved(() => sseResponse([infraOnly, DONE]))
+  check('infrastructure namespaces are not provider names', unnamed.observer.counters.unknown === 1, JSON.stringify(unnamed.observer.counters))
+}
+{
+  // Routing wins when both evidence shapes are present.
+  const mixed = frame({ provider: 'wafer', choices: [{ index: 0, delta: { content: 'x' } }] })
+  const result = await runObserved(() => sseResponse([mixed, routingFrame(DEEPSEEK_ROUTING), DONE]))
+  check('routing is preferred over the top-level provider field', result.status?.lastVerified?.provider === 'deepseek', JSON.stringify(result.status?.lastVerified))
+}
 
-  const third = createFetchPin({}, recorder())
-  third.install()
-  const foreign = () => 'someone else'
+// ── 4. non-streaming responses ──────────────────────────────────────────────
+console.log('\n── 4. non-streaming observation ──────────────────────────')
+{
+  const payload = JSON.stringify({ id: 'gen_2', choices: [{ index: 0, message: { role: 'assistant', content: 'hi', provider_metadata: { gateway: { routing: DEEPSEEK_ROUTING } } } }] })
+  const result = await runObserved(() => new Response(payload, { status: 200, headers: { 'content-type': 'application/json' } }))
+  check('a JSON response is returned to the caller unchanged', result.text === payload, JSON.stringify(result.text?.slice(0, 40)))
+  check('…and its routing metadata is still read', result.status?.lastVerified?.provider === 'deepseek', JSON.stringify(result.status?.lastVerified))
+  check("…with the model from the request's own body", result.status?.lastVerified?.model === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(result.status?.lastVerified))
+}
+{
+  // A `Request` carries its own body: the model comes from a clone, the request
+  // goes out as the caller's own object, and the body survives for the caller.
+  const request = new Request(CHAT, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'cline-pass/glm-5.3-flash', stream: false }) })
+  const text = JSON.stringify({ id: 'gen_3', provider: 'Wafer', choices: [] })
+  const result = await runObserved(
+    () => new Response(text, { status: 200, headers: { 'content-type': 'application/json' } }),
+    // `init: null` is "no second argument at all" — the helper's own default is a
+    // chat init, which would mask the Request-body path this case is about.
+    { url: request, init: null },
+  )
+  check('a Request object is forwarded as the caller passed it', result.calls[0].input === request)
+  check('…and its body is still readable afterwards', (await request.clone().text()).includes('glm-5.3-flash'))
+  check('…while the model is read from a clone', result.status?.lastVerified?.model === 'cline-pass/glm-5.3-flash', JSON.stringify(result.status?.lastVerified))
+  check('…and the provider comes with it', result.status?.lastVerified?.provider === 'wafer', JSON.stringify(result.status?.lastVerified))
+}
+
+// ── 5. pacing: frames are relayed as they arrive ────────────────────────────
+console.log('\n── 5. per-frame relay ────────────────────────────────────')
+{
+  const frames = []
+  for (let index = 0; index < 8; index += 1) frames.push(contentFrame(index))
+  frames.push(routingFrame(DEEPSEEK_ROUTING), DONE)
+  const gapMs = 20
+  const result = await runObserved(
+    () => sseResponse(frames, { gapMs }),
+    {
+      consume: false,
+      drive: async (response) => {
+        const t0 = Date.now()
+        const reader = response.body.getReader()
+        const arrivals = []
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          arrivals.push({ at: Date.now() - t0, bytes: value.byteLength })
+        }
+        return arrivals
+      },
+    },
+  )
+  const arrivals = result.driven
+  const span = arrivals.length > 1 ? arrivals[arrivals.length - 1].at - arrivals[0].at : 0
+  check('every frame arrives as its own chunk', arrivals.length === frames.length, `${arrivals.length} arrivals for ${frames.length} frames`)
+  check('…spread over the upstream timeline', span >= gapMs * (frames.length - 2), `span=${span}ms`)
+  check('…with the first frame not held back to the end', arrivals[0].at <= gapMs * 2, `first=${arrivals[0].at}ms`)
+  check('…and each frame carries exactly its own bytes', arrivals.slice(0, 8).every((entry) => entry.bytes === enc(frames[0]).length), JSON.stringify(arrivals.slice(0, 3)))
+  check('the observation still lands when the caller reads by hand', result.status?.lastVerified?.provider === 'deepseek', JSON.stringify(result.status?.lastVerified))
+}
+{
+  // `[DONE]` must end the downstream stream even when the upstream never closes.
+  const result = await runObserved(() => sseResponse([contentFrame(), routingFrame(DEEPSEEK_ROUTING), DONE], { keepOpen: true }))
+  check('a gateway that never closes the socket still ends its stream', result.text.endsWith(DONE), JSON.stringify(result.text?.slice(-20)))
+  check('…and the observation is recorded', result.status?.lastVerified?.provider === 'deepseek', JSON.stringify(result.status?.lastVerified))
+}
+{
+  // Cancelling the consumer records nothing: the response never finished, so
+  // there is no answer to attribute.
+  const result = await runObserved(
+    () => sseResponse([contentFrame(), contentFrame(), DONE], { gapMs: 5 }),
+    {
+      consume: false,
+      drive: async (response) => {
+        const reader = response.body.getReader()
+        await reader.read()
+        await reader.cancel('user stopped')
+        return 'cancelled'
+      },
+    },
+  )
+  check('a cancelled stream is counted as seen, not as unknown', result.observer.counters.seen === 1 && result.observer.counters.unknown === 0, JSON.stringify(result.observer.counters))
+  check('…and records no provider', result.status?.lastVerified === null, JSON.stringify(result.status?.lastVerified))
+}
+
+// ── 6. failures do not break the caller ─────────────────────────────────────
+console.log('\n── 6. robustness ─────────────────────────────────────────')
+{
+  // The upstream itself fails: the same rejection, nothing observed.
+  const failure = new Error('gateway exploded')
+  const real = globalThis.fetch
+  const statusPath = path.join(SCRATCH, 'status-reject.json')
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: statusPath }, quiet)
+  globalThis.fetch = () => Promise.reject(failure)
+  observer.install()
+  let thrown = null
+  try {
+    await globalThis.fetch(CHAT, chatInit())
+  } catch (error) {
+    thrown = error
+  }
+  observer.uninstall()
+  globalThis.fetch = real
+  check('a failing request rejects with the same error', thrown === failure, String(thrown))
+  check('…and is only counted as seen', observer.counters.seen === 1 && observer.counters.verified === 0 && observer.counters.unknown === 0, JSON.stringify(observer.counters))
+}
+{
+  // A synchronous throw from the wrapped fetch must stay a rejected promise.
+  const real = globalThis.fetch
+  const statusPath = path.join(SCRATCH, 'status-sync.json')
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: statusPath }, quiet)
+  globalThis.fetch = () => {
+    throw new Error('sync boom')
+  }
+  const install = observer.install()
+  let rejected = null
+  try {
+    await globalThis.fetch(CHAT, chatInit())
+  } catch (error) {
+    rejected = error
+  }
+  globalThis.fetch = real
+  check('a synchronous throw still surfaces as a rejection', install === 'installed' && rejected !== null && rejected.message === 'sync boom', String(rejected))
+}
+{
+  // A non-2xx response belongs to the upstream: passed through, not read, not
+  // reported as an unattributable success.
+  const body = '{"error":"rate limited"}'
+  const result = await runObserved(
+    () => new Response(body, { status: 429, headers: { 'content-type': 'application/json' } }),
+    { consume: false, drive: async (response) => ({ status: response.status, text: await response.text() }) },
+  )
+  check('a 429 reaches the caller with its body', result.driven.status === 429 && result.driven.text === body, JSON.stringify(result.driven))
+  check('…and is not reported as an unknown provider', result.observer.counters.unknown === 0, JSON.stringify(result.observer.counters))
+}
+{
+  // A body the observer cannot inspect must not damage the response. Locking the
+  // body before the observer sees it makes `clone()` throw; the caller's own
+  // reader is then still the one that gets the bytes.
+  let locked = null
+  const result = await runObserved(
+    () => {
+      const response = new Response('{"provider":"wafer"}', { status: 200, headers: { 'content-type': 'application/json' } })
+      locked = response.body.getReader()
+      return response
+    },
+    { consume: false, drive: async () => 'locked' },
+  )
+  const chunk = await locked.read()
+  check('an uninspectable response is still delivered', new TextDecoder().decode(chunk.value) === '{"provider":"wafer"}', String(new TextDecoder().decode(chunk.value)))
+  check('…and counts as unknown rather than crashing', result.observer.counters.unknown === 1, JSON.stringify(result.observer.counters))
+}
+{
+  // A status file that cannot be written must not break the request either.
+  const real = globalThis.fetch
+  const logger = recorder()
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: path.join(SCRATCH, 'nope', '\0bad') }, logger)
+  globalThis.fetch = () => sseResponse([contentFrame(), routingFrame(DEEPSEEK_ROUTING), DONE])
+  observer.install()
+  const text = await (await globalThis.fetch(CHAT, chatInit())).text()
+  observer.uninstall()
+  globalThis.fetch = real
+  check('an unwritable status file leaves the traffic alone', text.endsWith(DONE), JSON.stringify(text.slice(-20)))
+  check('…and warns once', logger.lines.warn.filter((line) => line.includes('could not write')).length === 1, JSON.stringify(logger.lines.warn))
+}
+{
+  // A body that is not JSON must not stop the response from being observed.
+  const result = await runObserved(() => sseResponse([contentFrame(), routingFrame(DEEPSEEK_ROUTING), DONE]), { init: { method: 'POST', headers: { 'content-type': 'application/json' }, body: 'not json' } })
+  check('a body that is not JSON still gets observed', result.status?.lastVerified?.provider === 'deepseek', JSON.stringify(result.status?.lastVerified))
+  check('…with no model recorded', result.status?.lastVerified?.model === null, JSON.stringify(result.status?.lastVerified))
+}
+
+// ── 7. install / uninstall / ownership ──────────────────────────────────────
+console.log('\n── 7. install and ownership ──────────────────────────────')
+{
+  const real = globalThis.fetch
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: false }, quiet)
+  check('uninstalling before installing is a no-op', observer.uninstall() === 'absent')
+  check('installing reports success', observer.install() === 'installed')
+  check('…and replaces the global fetch', globalThis.fetch !== real)
+  check('installing twice is idempotent', observer.install() === 'installed')
+  check('checkOwnership agrees', observer.checkOwnership() === 'installed')
+  check('uninstalling restores the original', observer.uninstall() === 'restored' && globalThis.fetch === real)
+}
+{
+  // A reload must not grow a chain of wrappers.
+  const real = globalThis.fetch
+  const first = createFetchObserver({ upstream: GATEWAY, statusFile: false }, quiet)
+  first.install()
+  const second = createFetchObserver({ upstream: GATEWAY, statusFile: false }, quiet)
+  second.install()
+  check('a second instance is the one holding the global fetch', second.checkOwnership() === 'installed')
+  check('…and the first instance knows it was displaced', first.checkOwnership() === 'replaced-by-us', first.checkOwnership())
+  second.uninstall()
+  check('unwinding the second restores the native fetch', globalThis.fetch === real, String(globalThis.fetch === real))
+}
+{
+  // A foreign replacement is reported once and left alone.
+  const real = globalThis.fetch
+  const logger = recorder()
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: false }, logger)
+  observer.install()
+  const foreign = async () => new Response('foreign')
   globalThis.fetch = foreign
-  check('a foreign replacement is left alone', third.uninstall() === 'foreign' && globalThis.fetch === foreign)
-  globalThis.fetch = native
-
-  globalThis.fetch = undefined
+  check('a foreign fetch is reported as foreign', observer.checkOwnership() === 'foreign', observer.checkOwnership())
+  check('…with one warning naming the observer', logger.lines.warn.some((line) => line.includes('no longer the observer hook')), JSON.stringify(logger.lines.warn))
+  check('…and the second check does not warn again', (observer.checkOwnership(), logger.lines.warn.length === 1), String(logger.lines.warn.length))
+  check('uninstall leaves a foreign fetch in place', observer.uninstall() === 'foreign' && globalThis.fetch === foreign)
+  globalThis.fetch = real
+}
+{
+  // A missing global fetch is reported, not thrown.
+  const real = globalThis.fetch
   const logger = recorder()
-  check('a missing global fetch is reported, not guessed at', createFetchPin({}, logger).install() === 'unavailable' && globalThis.fetch === undefined)
-  check('the failure reaches the log', logger.lines.error.some((line) => line.includes('no global fetch')))
-  globalThis.fetch = native
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: false }, logger)
+  delete globalThis.fetch
+  const result = observer.install()
+  globalThis.fetch = real
+  check('a runtime with no global fetch degrades', result === 'unavailable', result)
+  check('…with one error line', logger.lines.error.length === 1, JSON.stringify(logger.lines.error))
+}
+{
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: false }, quiet)
+  check('statusFile: false disables the file', observer.statusPath === null, String(observer.statusPath))
+  check('withDefaults resolves the default path under DSH_HOME', statusFileFor(withDefaults({})) === path.join(SCRATCH, 'dsh-clinepass-status.json'), statusFileFor(withDefaults({})))
+  const home = process.env.DSH_HOME
+  delete process.env.DSH_HOME
+  check('…and falls back to ~/.dsh', statusFileFor(withDefaults({})).endsWith(path.join('.dsh', 'dsh-clinepass-status.json')), statusFileFor(withDefaults({})))
+  process.env.DSH_HOME = home
 }
 
-// ── 3. pass-through fidelity ────────────────────────────────────────────────
-console.log('\n── 3. everything else goes out untouched ─────────────────')
+// ── 8. the status route reads the observer ──────────────────────────────────
+console.log('\n── 8. ?status=1 ──────────────────────────────────────────')
 {
-  const stub = stubFetch(() => new Response('{}'))
-  const hook = createFetchPin({}, recorder())
-  hook.install()
+  const real = globalThis.fetch
+  const statusPath = path.join(SCRATCH, 'status-route.json')
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: statusPath }, quiet)
+  const handler = createUsageHandler({}, withDefaults({ usageCacheMs: 0 }), quiet, { hook: observer })
 
-  const foreignInit = jsonInit()
-  await globalThis.fetch('https://api.deepseek.com/v1/chat/completions', foreignInit)
-  check('another provider keeps its exact init object', stub.calls[0].init === foreignInit)
-  check('another provider keeps its body byte-for-byte', stub.calls[0].init.body === foreignInit.body)
+  const before = await handler(new Request('http://127.0.0.1:3080/api/clinepass.usage?status=1&model=cline-pass/deepseek-v4.1-flash'))
+  const beforeBody = await before.json()
+  check('no observation answers ok:false', beforeBody.ok === false && beforeBody.reason === 'no-observation', JSON.stringify(beforeBody))
 
-  const modelsInit = { method: 'GET' }
-  await globalThis.fetch(`${GATEWAY}/api/v1/models`, modelsInit)
-  check('a non-chat path is untouched', stub.calls[1].init === modelsInit)
+  // Observe one turn through the same observer the route is holding.
+  globalThis.fetch = () => sseResponse([contentFrame(), routingFrame(DEEPSEEK_ROUTING), DONE])
+  observer.install()
+  await (await globalThis.fetch(CHAT, chatInit())).text()
+  await sleep(5)
+  observer.uninstall()
+  globalThis.fetch = real
 
-  const weird = { method: 'POST', body: '{}' }
-  await globalThis.fetch(42, weird)
-  check('an unreadable input is passed through', stub.calls[2].init === weird)
-
-  check('ignored requests are not counted as seen', hook.counters.seen === 0, JSON.stringify(hook.counters))
-  hook.uninstall()
-  stub.restore()
+  const hit = await handler(new Request('http://127.0.0.1:3080/api/clinepass.usage?status=1&model=cline-pass/deepseek-v4.1-flash'))
+  const hitBody = await hit.json()
+  check('the status route reports the observed provider', hitBody.ok === true && hitBody.provider === 'deepseek', JSON.stringify(hitBody))
+  check('…with the anonymous flag', hitBody.anonymized === false, JSON.stringify(hitBody))
+  check('…the model it belongs to', hitBody.model === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(hitBody))
+  check('…and when it was seen', typeof hitBody.at === 'string' && hitBody.at.length > 0, JSON.stringify(hitBody))
+  check('…and no gating fields leak in', !('warn' in hitBody) && !('allowed' in hitBody) && !('attempts' in hitBody), JSON.stringify(hitBody))
+}
+{
+  // An unknown session and model still answer honestly.
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: false }, quiet)
+  const handler = createUsageHandler({}, withDefaults({}), quiet, { hook: observer })
+  const response = await handler(new Request('http://127.0.0.1:3080/api/clinepass.usage?status=1&sessionId=sess-1&model=m'))
+  const body = await response.json()
+  check('an unknown session and model answer ok:false', body.ok === false && body.reason === 'no-observation', JSON.stringify(body))
 }
 
-// ── 4. the pin itself ───────────────────────────────────────────────────────
-console.log('\n── 4. the pin ────────────────────────────────────────────')
+// ── 9. helper units ────────────────────────────────────────────────────────
+console.log('\n── 9. parsing helpers ────────────────────────────────────')
 {
-  const expected = new Response(GATEWAY_BODY)
-  const stub = stubFetch(() => expected)
-  const logger = recorder()
-  const hook = createFetchPin({}, logger)
-  hook.install()
-
-  const init = jsonInit()
-  const response = await globalThis.fetch(CHAT, init)
-  const sent = stub.calls[0]
-  check('the gateway call was seen', hook.counters.seen === 1, JSON.stringify(hook.counters))
-  // 闸会读完整条响应再重建一个（body 换成缓冲后的那份），所以这里比内容、不比对象身份。
-  check('the verified response is passed through', (await response.text()) === GATEWAY_BODY, `HTTP ${response.status}`)
-  check('the body carries the pin', JSON.stringify(only(sent)) === '["deepseek"]', JSON.stringify(only(sent)))
-  check('the model is preserved', bodyOf(sent).model === CHAT_BODY.model)
-  check('the messages are preserved', JSON.stringify(bodyOf(sent).messages) === JSON.stringify(CHAT_BODY.messages))
-  check('the stream flag is preserved', bodyOf(sent).stream === true)
-  check('the tools are preserved', JSON.stringify(bodyOf(sent).tools) === JSON.stringify(CHAT_BODY.tools))
-  check('the max_tokens are preserved', bodyOf(sent).max_tokens === 512)
-  check('the method is preserved', sent.init.method === 'POST')
-  check('the headers are preserved', sent.init.headers.authorization === 'Bearer sk_test' && sent.init.headers['content-type'] === 'application/json')
-  check('the caller\'s init object is not mutated', init.body === JSON.stringify(CHAT_BODY))
-  check('the request has a plain string body', typeof sent.init.body === 'string')
-  check('the request URL is the original', sent.input === CHAT)
-  check('the pin is logged', logger.lines.info.some((line) => line.includes('pinned to deepseek')))
-
-  const urlObject = jsonInit()
-  await globalThis.fetch(new URL(CHAT), urlObject)
-  check('a URL object is pinned too', JSON.stringify(only(stub.calls[1])) === '["deepseek"]')
-  check('a URL object call keeps its URL argument', stub.calls[1].input instanceof URL)
-
-  // An existing gateway key must survive; only `only` is ours.
-  const kept = jsonInit()
-  kept.body = JSON.stringify({ ...CHAT_BODY, providerOptions: { gateway: { order: ['a'] }, other: 1 } })
-  await globalThis.fetch(CHAT, kept)
-  check(
-    'other providerOptions survive the pin',
-    JSON.stringify(bodyOf(stub.calls[2]).providerOptions) === '{"gateway":{"order":["a"],"only":["deepseek"]},"other":1}',
-    JSON.stringify(bodyOf(stub.calls[2]).providerOptions),
-  )
-
-  // A caller-supplied body length must not survive a body that grew.
-  const withLength = jsonInit({ headers: { 'content-type': 'application/json', 'content-length': '12', authorization: 'Bearer sk_test' } })
-  await globalThis.fetch(CHAT, withLength)
-  const sentLength = stub.calls[3]
-  check('a stale content-length is dropped', sentLength.init.headers['content-length'] === undefined, JSON.stringify(sentLength.init.headers))
-  check('the other headers are kept', sentLength.init.headers.authorization === 'Bearer sk_test' && sentLength.init.headers['content-type'] === 'application/json')
-  check("the caller's headers object is not mutated", withLength.headers['content-length'] === '12')
-
-  const headerBag = new Headers({ 'content-type': 'application/json', 'content-length': '12', authorization: 'Bearer sk_test' })
-  await globalThis.fetch(CHAT, { method: 'POST', headers: headerBag, body: JSON.stringify(CHAT_BODY) })
-  const sentBag = stub.calls[4]
-  check('a Headers instance is copied rather than mutated', headerBag.has('content-length') && !sentBag.init.headers.has('content-length'), String(sentBag.init.headers.get('content-length')))
-  check('the copied Headers keep the rest', sentBag.init.headers.get('authorization') === 'Bearer sk_test')
-
-  const clean = jsonInit()
-  await globalThis.fetch(CHAT, clean)
-  check('untouched headers keep their identity', stub.calls[5].init.headers === clean.headers)
-
-  hook.uninstall()
-  stub.restore()
+  check('a frame ends at a blank line', nextFrameEnd(enc('data: 1\n\n')) === 9, String(nextFrameEnd(enc('data: 1\n\n'))))
+  check('CRLF blank lines work', nextFrameEnd(enc('data: 1\r\n\r\n')) === 11, String(nextFrameEnd(enc('data: 1\r\n\r\n'))))
+  check('a lone CR CR ends a frame', nextFrameEnd(enc('data: 1\r\r')) === 9, String(nextFrameEnd(enc('data: 1\r\r'))))
+  check('an incomplete frame reports -1', nextFrameEnd(enc('data: 1\n')) === -1, String(nextFrameEnd(enc('data: 1\n'))))
+  check('a [DONE] frame is a terminator', isTerminatorFrame(enc('data: [DONE]\n\n')) === true)
+  check('a content frame is not', isTerminatorFrame(enc('data: {"a":1}\n\n')) === false)
+  check('a split [DONE] across data lines is not a terminator', isTerminatorFrame(enc('data: [DO\ndata: NE]\n\n')) === false)
+  check('a bare data line before [DONE] is not a terminator', isTerminatorFrame(enc('data\n\ndata: x\n\n')) === false)
+}
+{
+  const text = `data: ${JSON.stringify({ choices: [{ delta: { provider_metadata: { gateway: { routing: { finalProvider: 'deepseek' } } } } }] })}\n\n${DONE}`
+  check('routing is found in a stream', routingsOfText(text)[0]?.finalProvider === 'deepseek', JSON.stringify(routingsOfText(text)))
+  check('routingOfText returns the last one', routingOfText(text)?.finalProvider === 'deepseek')
+  check('top-level providers keep their spelling', providersOfText('data: {"provider":"Wafer"}\n\n').join(',') === 'Wafer', JSON.stringify(providersOfText('data: {"provider":"Wafer"}\n\n')))
+  check('duplicate providers collapse', providersOfText('data: {"provider":"a"}\n\ndata: {"provider":"a"}\n\n').length === 1)
+  check('a single JSON document is parsed too', routingsOfText(JSON.stringify({ routing: { finalProvider: 'x' } })).length === 1)
+  check('an empty body has no evidence', routingsOfText('').length === 0 && providersOfText('').length === 0)
+}
+{
+  check('routing wins over the top-level field', observedProviderOf({ routings: [{ finalProvider: 'DeepSeek' }], providers: ['wafer'], namespaces: ['kimi'] }) === 'deepseek')
+  check('the top-level field wins over a namespace', observedProviderOf({ routings: [], providers: ['Wafer'], namespaces: ['kimi'] }) === 'wafer')
+  check('resolvedProvider is used when finalProvider is absent', observedProviderOf({ routings: [{ resolvedProvider: 'Baseten' }] }) === 'baseten')
+  check('affinity.pinnedProvider is the next fallback', observedProviderOf({ routings: [{ affinity: { pinnedProvider: 'Fireworks' } }] }) === 'fireworks')
+  check('a successful attempt is the last routing fallback', observedProviderOf({ routings: [{ modelAttempts: [{ providerAttempts: [{ provider: 'Together', success: true }] }] }] }) === 'together')
+  check('a failed attempt is not evidence', observedProviderOf({ routings: [{ modelAttempts: [{ providerAttempts: [{ provider: 'Together', success: false }] }] }] }) === null)
+  check('nothing at all is null', observedProviderOf({}) === null && observedProviderOf() === null)
 }
 
-// ── 4b. the local gate ──────────────────────────────────────────────────────
-//
-// 网关自 2026-09-22 起不再执行 providerOptions.gateway.only，钉选改由插件在本地兑现：
-// 读完整条响应、从 routing 里读出真正服务它的渠道，不在允许列表里就整条丢掉。
-console.log('\n── 4b. the local gate ────────────────────────────────────')
+// ── 10. a real HTTP round trip, through undici ──────────────────────────────
+console.log('\n── 10. through a real server ─────────────────────────────')
 {
-  // 允许 deepseek，网关却说是 alibaba → 必须拒，而且响应体里不能有任何模型输出。
-  const stub = stubFetch(() => new Response(gatewayBody('alibaba')))
-  const logger = recorder()
-  const hook = createFetchPin({}, logger)
-  hook.install()
-  const response = await globalThis.fetch(CHAT, jsonInit())
-  const body = await response.text()
-  check('a foreign channel is refused with 400', response.status === 400, `HTTP ${response.status}`)
-  check('the refusal is machine-readable', /PROVIDER_PIN_VIOLATION/.test(body), body.slice(0, 100))
-  check('the model output is not handed over', !/"ok":true/.test(body), body.slice(0, 100))
-  check('the refusal is counted', hook.counters.blocked === 1, JSON.stringify(hook.counters))
-  check('the violation names the provider', hook.state().lastViolation?.finalProvider === 'alibaba', JSON.stringify(hook.state().lastViolation ?? null).slice(0, 120))
-  check('the violation is logged as an error', logger.lines.error.some((line) => line.includes('拦下')), JSON.stringify(logger.lines.error))
-  hook.uninstall()
-
-  // warn：同样判定，但放行，只记录。
-  const warnStub = stubFetch(() => new Response(gatewayBody('alibaba')))
-  const warnHook = createFetchPin({ enforcement: 'warn' }, recorder())
-  warnHook.install()
-  const warned = await globalThis.fetch(CHAT, jsonInit())
-  check('warn lets a foreign response through', warned.status === 200 && (await warned.text()) === gatewayBody('alibaba'), `HTTP ${warned.status}`)
-  check('warn still counts and records it', warnHook.counters.blocked === 1 && warnHook.state().lastViolation?.finalProvider === 'alibaba')
-  warnHook.uninstall()
-
-  // off：不校验、不缓冲 —— 响应对象原样返回。
-  const offExpected = new Response(gatewayBody('alibaba'))
-  const offStub = stubFetch(() => offExpected)
-  const offHook = createFetchPin({ enforcement: 'off' }, recorder())
-  offHook.install()
-  check('off returns the very same response', (await globalThis.fetch(CHAT, jsonInit())) === offExpected)
-  check('off blocks nothing', offHook.counters.blocked === 0 && offHook.state().lastViolation === null, JSON.stringify(offHook.counters))
-  offHook.uninstall()
-
-  // 没有 routing 元数据 = 无法证明 → strict 下按未通过处理（fail closed）。
-  const muteStub = stubFetch(() => new Response('{"ok":true}'))
-  const muteHook = createFetchPin({}, recorder())
-  muteHook.install()
-  const mute = await globalThis.fetch(CHAT, jsonInit())
-  check('a response with no routing metadata is refused', mute.status === 400 && /PROVIDER_PIN_VIOLATION/.test(await mute.text()), `HTTP ${mute.status}`)
-  muteHook.uninstall()
-
-  // 非 2xx 原样放行：那是失败的调用，改写它会掩盖配额/限流。
-  const errStub = stubFetch(() => new Response('{"error":"rate limited"}', { status: 429 }))
-  const errHook = createFetchPin({}, recorder())
-  errHook.install()
-  const err = await globalThis.fetch(CHAT, jsonInit())
-  check('an upstream error passes through untouched', err.status === 429 && errHook.counters.blocked === 0, `HTTP ${err.status}`)
-  errHook.uninstall()
-
-  // 两个「谁服务了它」的字段必须都指向允许的渠道：网关哪天开始让它们不一致，
-  // 就该停下来看，而不是挑好看的那个信。
-  const splitStub = stubFetch(() => new Response(gatewayBody('deepseek', 'alibaba')))
-  const splitHook = createFetchPin({}, recorder())
-  splitHook.install()
-  const split = await globalThis.fetch(CHAT, jsonInit())
-  check(
-    'a disagreeing resolvedProvider is refused',
-    split.status === 400 && /PROVIDER_PIN_VIOLATION/.test(await split.text()) && /resolvedProvider=alibaba/.test(String(splitHook.state().lastViolation?.reason)),
-    `HTTP ${split.status}: ${String(splitHook.state().lastViolation?.reason)}`,
-  )
-  splitHook.uninstall()
-
-  // 恢复顺序必须**逆序**：每个 stub 记下的 `real` 是它创建时的那个 fetch，
-  // 顺序恢复会把 globalThis.fetch 留在中间某个已经作废的 stub 上。
-  splitStub.restore(); errStub.restore(); muteStub.restore(); offStub.restore(); warnStub.restore(); stub.restore()
-}
-
-// ── 5. per-model pins and an empty pin ──────────────────────────────────────
-console.log('\n── 5. per-model pins, empty pin ──────────────────────────')
-{
-  // retries: 0 —— 本节断言 stub.calls 的**下标**；本节形状的响应（deepseek 渠道）在默认
-  // 配置下都会验证通过，不会触发重试，这里显式关掉只是把「重试是 §16 的事」说清楚，
-  // 免得将来 stub 换成不可验证的响应时下标悄悄平移。
-  const stub = stubFetch(() => new Response(GATEWAY_BODY))
-  const hook = createFetchPin({ pin: ['deepseek'], pins: { 'cline-pass/other': ['anthropic'] }, retries: 0 }, recorder())
-  hook.install()
-
-  await globalThis.fetch(CHAT, jsonInit())
-  check('an unlisted model uses the default pin', JSON.stringify(only(stub.calls[0])) === '["deepseek"]')
-
-  const other = jsonInit()
-  other.body = JSON.stringify({ ...CHAT_BODY, model: 'cline-pass/other' })
-  await globalThis.fetch(CHAT, other)
-  check('a listed model uses its own pin', JSON.stringify(only(stub.calls[1])) === '["anthropic"]')
-  hook.uninstall()
-
-  const off = createFetchPin({ pin: [] }, recorder())
-  off.install()
-  const untouched = jsonInit()
-  await globalThis.fetch(CHAT, untouched)
-  check('an empty pin leaves the request exactly as it was', stub.calls[2].init === untouched)
-  check('an empty pin counts as skipped', off.counters.skipped === 1, JSON.stringify(off.counters))
-  off.uninstall()
-  stub.restore()
-}
-
-// ── 6. body shapes ──────────────────────────────────────────────────────────
-console.log('\n── 6. body shapes ────────────────────────────────────────')
-{
-  // retries: 0 —— stub 的 '{}' 不可验证，默认配置下每个钉选请求会补发 2 次、把本节依赖的
-  // stub.calls 下标平移掉（重试行为是 §16 的事，本节只管 body 形状）。
-  const stub = stubFetch(() => new Response('{}'))
-  const logger = recorder()
-  const hook = createFetchPin({ retries: 0 }, logger)
-  hook.install()
-  const encoded = JSON.stringify(CHAT_BODY)
-
-  await globalThis.fetch(CHAT, { method: 'POST', body: Buffer.from(encoded) })
-  check('a Buffer body is pinned', JSON.stringify(only(stub.calls[0])) === '["deepseek"]')
-
-  await globalThis.fetch(CHAT, { method: 'POST', body: new TextEncoder().encode(encoded) })
-  check('a Uint8Array body is pinned', JSON.stringify(only(stub.calls[1])) === '["deepseek"]')
-
-  await globalThis.fetch(CHAT, { method: 'POST', body: new TextEncoder().encode(encoded).buffer })
-  check('an ArrayBuffer body is pinned', JSON.stringify(only(stub.calls[2])) === '["deepseek"]')
-
-  const stream = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{}')); controller.close() } })
-  const streamInit = { method: 'POST', duplex: 'half', body: stream }
-  await globalThis.fetch(CHAT, streamInit)
-  check('a stream body is left alone', stub.calls[3].init === streamInit)
-  check('the stream skip is explained', logger.lines.warn.some((line) => line.includes('ReadableStream')))
-
-  const notJson = { method: 'POST', body: 'not json at all' }
-  await globalThis.fetch(CHAT, notJson)
-  check('a non-JSON body is left alone', stub.calls[4].init === notJson)
-  check('the non-JSON skip is explained', logger.lines.warn.some((line) => line.includes('not JSON')))
-
-  const arrayBody = { method: 'POST', body: '[1,2,3]' }
-  await globalThis.fetch(CHAT, arrayBody)
-  check('a JSON array body is left alone', stub.calls[5].init === arrayBody)
-  check('the non-object skip is explained', logger.lines.warn.some((line) => line.includes('not a JSON object')))
-
-  // A Request carries its own body: it is rebuilt, not dropped.
-  const request = new Request(CHAT, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(encoded)) },
-    body: encoded,
+  let received = null
+  const server = http.createServer((request, response) => {
+    let body = ''
+    request.on('data', (chunk) => {
+      body += chunk
+    })
+    request.on('end', () => {
+      received = body
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'hello' } }] })}\n\n`)
+      response.write(`data: ${JSON.stringify({ choices: [{ delta: { provider_metadata: { gateway: { routing: DEEPSEEK_ROUTING } } } }] })}\n\n`)
+      response.write(DONE)
+      response.end()
+    })
   })
-  await globalThis.fetch(request)
-  const sent = stub.calls[6]
-  check('a Request is rebuilt rather than dropped', sent.input instanceof Request, String(sent.input?.constructor?.name))
-  check('the rebuilt Request keeps its method', sent.input.method === 'POST')
-  check('the rebuilt Request keeps its headers', sent.input.headers.get('content-type') === 'application/json')
-  check('the rebuilt Request drops the stale length', sent.input.headers.get('content-length') === null, String(sent.input.headers.get('content-length')))
-  check('the original Request is left alone', request.headers.get('content-length') !== null)
-  check('the rebuilt Request carries the pin', JSON.stringify(JSON.parse(await sent.input.text()).providerOptions) === '{"gateway":{"only":["deepseek"]}}')
-  check('the original is called with the rebuilt Request alone', sent.init === undefined, String(sent.init))
-
-  check('pinned requests are counted', hook.counters.pinned === 4, JSON.stringify(hook.counters))
-  check('unpinned requests are counted', hook.counters.skipped === 3, JSON.stringify(hook.counters))
-  check('every gateway request is counted', hook.counters.seen === 7, JSON.stringify(hook.counters))
-  hook.uninstall()
-  stub.restore()
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const origin = `http://127.0.0.1:${server.address().port}`
+  const statusPath = path.join(SCRATCH, 'status-http.json')
+  const observer = createFetchObserver({ upstream: origin, statusFile: statusPath }, quiet)
+  observer.install()
+  const body = JSON.stringify({ model: 'cline-pass/deepseek-v4.1-flash', messages: [{ role: 'user', content: 'hi' }], stream: true })
+  const text = await globalThis
+    .fetch(`${origin}/api/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body })
+    .then((response) => response.text())
+  observer.uninstall()
+  await new Promise((resolve) => server.close(resolve))
+  check('a real gateway round trip relays the stream', text.endsWith(DONE), JSON.stringify(text.slice(-20)))
+  check('…and the body reached the server byte for byte', received === body, JSON.stringify(received?.slice(0, 60)))
+  await sleep(5)
+  check('…and the observer recorded the provider', readStatus(statusPath)?.lastVerified?.provider === 'deepseek', JSON.stringify(readStatus(statusPath)?.lastVerified))
+  check('…and reported no unknown', readStatus(statusPath)?.counters?.unknown === 0, JSON.stringify(readStatus(statusPath)?.counters))
 }
 
-// ── 7. robustness: the hook must never break a request ──────────────────────
-console.log('\n── 7. robustness ─────────────────────────────────────────')
+// ── 11. apply(): the observer is what a mounted plugin installs ─────────────
+console.log('\n── 11. apply() ───────────────────────────────────────────')
 {
-  const native = globalThis.fetch
-
-  // A body that explodes on inspection.
-  const one = stubFetch(() => new Response('{}'))
-  const oneLog = recorder()
-  const oneHook = createFetchPin({}, oneLog)
-  oneHook.install()
-  const trapped = { method: 'POST', get body() { throw new Error('boom') } }
-  const response = await globalThis.fetch(CHAT, trapped)
-  check('a throwing init falls back to an unpinned request', one.calls[0].init === trapped && response.status === 200)
-  check('the hook failure is reported', oneLog.lines.warn.some((line) => line.includes('pin hook failed')))
-  oneHook.uninstall()
-  one.restore()
-
-  // An upstream failure must reach the caller unchanged.
-  const two = stubFetch(() => Promise.reject(new Error('upstream exploded')))
-  const twoHook = createFetchPin({}, recorder())
-  twoHook.install()
-  let caught = null
-  await globalThis.fetch(CHAT, jsonInit()).catch((error) => { caught = error })
-  check('an upstream rejection is not swallowed', caught?.message === 'upstream exploded')
-  twoHook.uninstall()
-  two.restore()
-
-  // A wrapped function that throws synchronously must still reject, like fetch.
-  const three = stubFetch(() => { throw new Error('sync') })
-  const threeHook = createFetchPin({}, recorder())
-  threeHook.install()
-  let syncCaught = null
-  const promise = globalThis.fetch('https://api.deepseek.com/v1/chat/completions', {})
-  check('a synchronous throw becomes a rejection, like fetch', promise instanceof Promise)
-  await promise.catch((error) => { syncCaught = error })
-  check('the synchronous error arrives intact', syncCaught?.message === 'sync')
-  threeHook.uninstall()
-  three.restore()
-  check('every case cleaned up', globalThis.fetch === native)
-
-  // Re-installing an installed hook must not re-wrap whatever it already
-  // wrapped — that is how a wrapper chain starts.
-  const four = stubFetch(() => new Response('{}'))
-  const fourHook = createFetchPin({ statusFile: false }, recorder())
-  fourHook.install()
-  const fourWrapper = globalThis.fetch
-  check('re-installing is a no-op', fourHook.install() === 'installed' && globalThis.fetch === fourWrapper)
-  fourHook.install()
-  fourHook.uninstall()
-  check('one uninstall fully restores', globalThis.fetch === four.fn, String(globalThis.fetch?.name))
-  four.restore()
-
-  // A wrapped function that calls the global fetch synchronously would recurse
-  // forever; it must fail loudly instead of starving the event loop.
-  const nativeTwo = globalThis.fetch
-  globalThis.fetch = (input, init) => globalThis.fetch(input, init)
-  const loopHook = createFetchPin({ statusFile: false }, recorder())
-  loopHook.install()
-  let recursive = null
-  await globalThis.fetch(CHAT, jsonInit()).catch((error) => { recursive = error })
-  check('a synchronous delegate is refused, not looped', /refusing to recurse/.test(String(recursive?.message)), String(recursive?.message).slice(0, 80))
-  await globalThis.fetch('https://api.deepseek.com/v1/chat/completions', {}).catch((error) => { recursive = error })
-  check('…including on non-gateway calls', /refusing to recurse/.test(String(recursive?.message)), String(recursive?.message).slice(0, 80))
-  loopHook.uninstall()
-  globalThis.fetch = nativeTwo
-}
-
-// ── 8. provisioning on the portless transport ───────────────────────────────
-console.log('\n── 8. provisioning ───────────────────────────────────────')
-{
-  const makeSettings = (value, { revision = 7, legacyGet = false } = {}) => {
-    const writes = []
-    const double = {
-      writes,
-      // 0.1.7's `SettingsForms` has no `get()`: the live value is on the descriptor.
-      // `legacyGet` models the host before that, to keep the fallback covered.
-      describe: () => [{ ns: 'llm-pi-ai', revision, value }],
-      mutate: async (ns, ops, expectedRevision) => {
-        writes.push({ ns, ops, expectedRevision })
-        return { kind: 'written' }
-      },
-    }
-    if (legacyGet) double.get = () => value
-    return double
-  }
-  const cfg = withDefaults({})
-  cfg.baseURL = `${cfg.upstream}/api/v1`
-
-  const legacyRead = makeSettings({ providers: { deepseek: {} } }, { legacyGet: true })
-  check('a host that only exposes get() still provisions', (await provisionProfile(legacyRead, cfg, recorder())) === 'created', JSON.stringify(legacyRead.writes))
-
-  const empty = makeSettings({ providers: { deepseek: {} } })
-  check('the profile is created without a local address', (await provisionProfile(empty, cfg, recorder())) === 'created')
-  check('the profile points at the gateway itself', empty.writes[0].ops[0].value.baseURL === 'https://api.cline.bot/api/v1', empty.writes[0].ops[0].value.baseURL)
-  check('no loopback address is written anywhere', JSON.stringify(empty.writes[0]).includes('127.0.0.1') === false)
-
-  const stale = makeSettings({
-    providers: {
-      'cline-pass': {
-        displayName: 'Cline Pass',
-        api: 'openai-completions',
-        apiKeyEnv: 'CLINE_PASS_API_KEY',
-        baseURL: 'http://127.0.0.1:8791/api/v1',
-        models: [{ id: 'cline-pass/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 921600, maxTokens: 131072, input: ['text', 'image'], reasoningEfforts: { high: 'high', xhigh: 'max' } }],
-      },
-    },
-  })
-  check('a profile left on the old proxy address is repaired', (await provisionProfile(stale, cfg, recorder())) === 'repaired')
-  check(
-    'the repair moves the address and retires the alias in one write',
-    JSON.stringify(stale.writes[0].ops.map((op) => op.path.join('.'))) === '["providers.cline-pass.baseURL","providers.cline-pass.models"]' &&
-      stale.writes[0].ops[0].value === 'https://api.cline.bot/api/v1' &&
-      JSON.stringify(stale.writes[0].ops[1].value[0].reasoningEfforts) === '{"high":"high","max":"max"}',
-    JSON.stringify(stale.writes[0].ops),
-  )
-
-  const upToDate = {
-    displayName: 'Cline Pass',
-    api: 'openai-completions',
-    apiKeyEnv: 'CLINE_PASS_API_KEY',
-    baseURL: 'https://api.cline.bot/api/v1',
-    models: [{ id: 'cline-pass/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 921600, maxTokens: 131072, input: ['text', 'image'], reasoningEfforts: { high: 'high', max: 'max' } }],
-  }
-  const present = makeSettings({ providers: { 'cline-pass': structuredClone(upToDate) } })
-  check('an already-correct profile is left alone', (await provisionProfile(present, cfg, recorder())) === 'present' && present.writes.length === 0, JSON.stringify(present.writes))
-
-  // An install that still declares the retired `xhigh` alias gets it dropped, and
-  // keeps a level the user added themselves.
-  const older = structuredClone(upToDate)
-  older.models[0].reasoningEfforts = { high: 'high', xhigh: 'max', medium: 'medium' }
-  const upgrading = makeSettings({ providers: { 'cline-pass': older } })
-  check('a profile that predates the two-level set is repaired', (await provisionProfile(upgrading, cfg, recorder())) === 'repaired', JSON.stringify(upgrading.writes))
-  check(
-    '…retiring the alias without dropping the user\'s own level',
-    JSON.stringify(upgrading.writes[0].ops[0].value[0].reasoningEfforts) === '{"high":"high","medium":"medium","max":"max"}',
-    JSON.stringify(upgrading.writes[0].ops[0].value[0].reasoningEfforts),
-  )
-  check('…and the address is untouched', upgrading.writes[0].ops.length === 1 && upgrading.writes[0].ops[0].path.join('.') === 'providers.cline-pass.models')
-
-  const customFetchProfile = makeSettings({ providers: { 'cline-pass': { api: 'openai-completions', apiKeyEnv: 'SOMEONE_ELSES_KEY', baseURL: 'https://api.cline.bot/api/v1' } } })
-  const mismatchNotes = []
-  check(
-    'a card this plugin did not write is never rewritten',
-    (await provisionProfile(customFetchProfile, cfg, recorder(), (reason) => mismatchNotes.push(reason))) === 'mismatch' && customFetchProfile.writes.length === 0,
-  )
-  check(
-    '…and the reason travels beside the verdict, not only into the log',
-    mismatchNotes.length === 1 && mismatchNotes[0].includes('not the one this plugin wrote') && mismatchNotes[0].includes('SOMEONE_ELSES_KEY') === false,
-    JSON.stringify(mismatchNotes),
-  )
-
-  // A settings service that refuses the write: the verdict alone ("failed") says
-  // nothing an operator can act on, and the log line may land nowhere.
-  const refusing = {
-    get: () => ({}),
-    describe: () => [{ ns: 'llm-pi-ai', revision: 7 }],
-    mutate: async () => {
-      throw new Error('No configurable plugin entry "llm-pi-ai"')
-    },
-  }
-  const failureNotes = []
-  check(
-    'a refused settings write is reported as failed',
-    (await provisionProfile(refusing, cfg, recorder(), (reason) => failureNotes.push(reason))) === 'failed',
-  )
-  check(
-    '…carrying the message that explains it',
-    failureNotes.length === 1 && failureNotes[0].includes('No configurable plugin entry') && failureNotes[0].startsWith('could not provision'),
-    JSON.stringify(failureNotes),
-  )
-
-  // An install written for the removed loopback transport still boots: the
-  // options are reported and ignored (never fatal), and the card is repaired to
-  // the gateway in the same write.
-  const legacyLogs = recorder()
-  const stillFine = makeSettings({ providers: {} })
-  const legacyCfg = withDefaults({ transport: 'proxy', listen: '127.0.0.1:8791' }, legacyLogs)
-  check('a removed transport option does not break provisioning', (await provisionProfile(stillFine, legacyCfg, legacyLogs)) === 'created', JSON.stringify(legacyLogs.lines.warn))
-  check('…and the card it writes has no port', stillFine.writes[0].ops[0].value.baseURL === 'https://api.cline.bot/api/v1', stillFine.writes[0].ops[0].value.baseURL)
-  check('…while the removed option is reported', legacyLogs.lines.warn.some((line) => line.includes('"transport"')) && legacyLogs.lines.warn.some((line) => line.includes('"listen"')), JSON.stringify(legacyLogs.lines.warn))
-
-  const legacyAddress = makeSettings({ providers: { 'cline-pass': { api: 'openai-completions', apiKeyEnv: 'CLINE_PASS_API_KEY', baseURL: 'http://127.0.0.1:8791/api/v1', models: [{ id: 'cline-pass/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 921600, maxTokens: 131072, input: ['text', 'image'], reasoningEfforts: { high: 'high', max: 'max' } }] } } })
-  check('a card left on a loopback address is moved to the gateway', (await provisionProfile(legacyAddress, withDefaults({ listen: '127.0.0.1:8791' }, { warn: () => {} }), recorder())) === 'repaired' && legacyAddress.writes[0].ops[0].value === 'https://api.cline.bot/api/v1', JSON.stringify(legacyAddress.writes[0]?.ops))
-}
-
-// ── 9. the status file: a silent bypass has to be visible ───────────────────
-console.log('\n── 9. status file ────────────────────────────────────────')
-{
-  const read = (file = STATUS) => JSON.parse(fs.readFileSync(file, 'utf8'))
-  fs.rmSync(STATUS, { force: true })
-
-  const stub = stubFetch(() => new Response('{}'))
-  const hook = createFetchPin({ upstream: GATEWAY }, recorder())
-  check('the default path lands under DSH_HOME', statusFileFor(withDefaults({})) === STATUS, statusFileFor(withDefaults({})))
-  hook.install()
-  check('install publishes the hook state', read().hook === 'installed' && read().transport === 'fetch', JSON.stringify(read().hook))
-  check('an install with no legacy options publishes an empty ignored list', JSON.stringify(read().ignoredOptions) === '[]', JSON.stringify(read().ignoredOptions))
-  check('the counters start at zero', read().counters.pinned === 0 && read().lastPin === null)
-  check(
-    'the provisioning result starts unrecorded',
-    read().provision === null && hook.state().provision === null,
-    JSON.stringify({ file: read().provision, state: hook.state().provision }),
-  )
-  hook.noteProvision('present')
-  check(
-    'the provisioning result reaches the status file, not only the log',
-    read().provision === 'present' && hook.state().provision === 'present',
-    JSON.stringify({ file: read().provision, state: hook.state().provision }),
-  )
-  check(
-    'a clean provisioning carries no reason',
-    read().provisionReason === null && hook.state().provisionReason === null,
-    JSON.stringify(read().provisionReason),
-  )
-  hook.noteProvision('failed', 'could not provision the "cline-pass" profile: No configurable plugin entry "llm-pi-ai"')
-  check(
-    'a failed provisioning carries the sentence that explains it',
-    read().provision === 'failed' && /No configurable plugin entry/.test(read().provisionReason ?? '') && hook.state().provisionReason === read().provisionReason,
-    JSON.stringify({ file: read().provisionReason, state: hook.state().provisionReason }),
-  )
-  check(
-    'nothing is recorded as skipped before anything is skipped',
-    read().lastSkipped === null && hook.state().lastSkipped === null,
-    JSON.stringify(read().lastSkipped),
-  )
-
-  await globalThis.fetch(CHAT, jsonInit())
-  const afterPin = read()
-  check('a pinned request is counted', afterPin.counters.pinned === 1 && afterPin.counters.seen === 1, JSON.stringify(afterPin.counters))
-  check('the last pin is described', afterPin.lastPin?.model === CHAT_BODY.model && JSON.stringify(afterPin.lastPin?.only) === '["deepseek"]', JSON.stringify(afterPin.lastPin))
-  await globalThis.fetch(CHAT, { method: 'POST', body: 'not json' })
-  check('a skipped request is counted too', read().counters.skipped === 1 && read().counters.seen === 2, JSON.stringify(read().counters))
-  // The reason used to live only in a `logger.warn` line, and whether those lines
-  // reach a file at all depends on the host (the README records a deployment where
-  // they do not). `seen` climbing while `pinned` does not has to be answerable from
-  // the status file alone.
-  const afterSkip = read()
-  check(
-    'a skipped request records why, and which request',
-    afterSkip.lastSkipped?.reason === 'the body is not JSON' && afterSkip.lastSkipped?.url === CHAT,
-    JSON.stringify(afterSkip.lastSkipped),
-  )
-  check(
-    '…with a timestamp, and in the in-process state too',
-    typeof afterSkip.lastSkipped?.at === 'string' && hook.state().lastSkipped?.reason === afterSkip.lastSkipped.reason,
-    JSON.stringify(hook.state().lastSkipped),
-  )
-  check('the status never carries a credential', !JSON.stringify(read()).includes('sk_test'))
-
-  hook.uninstall()
-  check('uninstall publishes the final state', read().hook === 'uninstalled')
-  stub.restore()
-
-  const custom = path.join(SCRATCH, 'nested', 'mine.json')
-  const customHook = createFetchPin({ statusFile: custom }, recorder())
-  customHook.install()
-  check('a custom path is honoured', fs.existsSync(custom) && customHook.statusPath === custom)
-  customHook.uninstall()
-
-  const offHook = createFetchPin({ statusFile: false }, recorder())
-  offHook.install()
-  check('statusFile: false writes nothing', statusFileFor(withDefaults({ statusFile: false })) === null && offHook.statusPath === null)
-  offHook.uninstall()
-
-  // A path that cannot be written must warn once, and must not stop the hook.
-  const blocked = path.join(SCRATCH, 'blocked.json')
-  fs.writeFileSync(blocked, 'x')
-  const blockedLogger = recorder()
-  const blockedStub = stubFetch(() => new Response('{}'))
-  const blockedHook = createFetchPin({ statusFile: path.join(blocked, 'child.json') }, blockedLogger)
-  check('an unwritable status path does not break install', blockedHook.install() === 'installed')
-  await globalThis.fetch(CHAT, jsonInit())
-  check('the hook still pins despite the status failure', JSON.stringify(only(blockedStub.calls[0])) === '["deepseek"]', JSON.stringify(only(blockedStub.calls[0])))
-  check('the write failure is reported once, not per request', blockedLogger.lines.warn.filter((line) => line.includes('could not write')).length === 1, JSON.stringify(blockedLogger.lines.warn))
-  blockedHook.uninstall()
-  blockedStub.restore()
-
-  // A replacement of the global fetch after install must become visible — once,
-  // not on every 30 s tick.
-  const bypassStub = stubFetch(() => new Response('{}'))
-  const watcherLogs = recorder()
-  const watched = createFetchPin({ upstream: GATEWAY }, watcherLogs)
-  watched.install()
-  check('the ownership check is happy while it owns the global', watched.checkOwnership() === 'installed')
-  const foreignFetch = () => new Response('{}')
-  globalThis.fetch = foreignFetch
-  check('a foreign replacement is reported', watched.checkOwnership() === 'foreign')
-  check('the status file says so', read().hook === 'foreign', JSON.stringify(read().hook))
-  const warningsAfterFirst = watcherLogs.lines.warn.filter((line) => line.includes('no longer the pin hook')).length
-  const mtime = fs.statSync(STATUS).mtimeMs
-  await new Promise((resolve) => setTimeout(resolve, 20))
-  for (let tick = 0; tick < 5; tick += 1) watched.checkOwnership()
-  check('…repeated ticks do not warn again', watcherLogs.lines.warn.filter((line) => line.includes('no longer the pin hook')).length === warningsAfterFirst, String(warningsAfterFirst))
-  check('…and do not rewrite the status file', fs.statSync(STATUS).mtimeMs === mtime)
-  globalThis.fetch = bypassStub.fn
-  check('a fetch restored to what this hook captured is not called foreign', watched.checkOwnership() === 'uninstalled', watched.checkOwnership())
-  check('…and the record follows it back', read().hook === 'uninstalled', JSON.stringify(read().hook))
-  globalThis.fetch = foreignFetch
-  watched.checkOwnership()
-  check('disposing a displaced hook leaves the foreign fetch alone', watched.uninstall() === 'foreign' && globalThis.fetch === foreignFetch)
-  bypassStub.restore()
-
-  // …but a *newer instance of ours* owns the record, so the older one must not
-  // claim the hook was replaced.
-  const older = createFetchPin({ upstream: GATEWAY }, recorder())
-  const newer = createFetchPin({ upstream: GATEWAY }, recorder())
-  older.install()
-  newer.install()
-  check('a newer instance is not mistaken for a foreign one', older.checkOwnership() === 'replaced-by-us', older.checkOwnership())
-  check('the newer instance owns the record', read().hook === 'installed', JSON.stringify(read().hook))
-  older.uninstall()
-  check('disposing the older instance leaves the record intact', read().hook === 'installed', JSON.stringify(read().hook))
-  newer.uninstall()
-}
-
-// ── 10. apply(): hooks the process, opens nothing ───────────────────────────
-console.log('\n── 10. apply() ───────────────────────────────────────────')
-{
-  const realFetch = globalThis.fetch
-  const makeSettings = (value, effort = 'max') => {
+  /** A minimal settings double (same shape as test-settings.mjs). */
+  const makeSettings = (value) => {
     const writes = []
     return {
       writes,
-      get: (ns) => (ns === 'llm-pi-ai' ? value : { provider: 'cline-pass', reasoningEffort: effort }),
-      describe: () => [{ ns: 'llm-pi-ai', revision: 1 }, { ns: 'agent-default-model', revision: 2 }],
-      mutate: async (ns, ops, expectedRevision) => {
-        writes.push({ ns, ops, expectedRevision })
+      describe: () => [{ ns: 'llm-pi-ai', revision: 3, value }],
+      mutate: async (ns, ops, revision) => {
+        writes.push({ ns, ops, revision })
         return { kind: 'written' }
       },
     }
   }
-
-  // A listener this plugin opened would show up as a live TCP server handle.
-  // `process.getActiveResourcesInfo()` sees *any* server, however it was
-  // created, unlike a patched `http.createServer` (which this module never
-  // imports). The control below proves the probe can see one.
-  const tcpServers = () => process.getActiveResourcesInfo().filter((kind) => kind.toLowerCase() === 'tcpserverwrap').length
-  const before = tcpServers()
-  const control = http.createServer(() => {})
-  await new Promise((resolve) => control.listen(0, '127.0.0.1', resolve))
-  check('the listener probe detects a real listener', tcpServers() === before + 1, `${before} -> ${tcpServers()}`)
-  // The control stays open across the apply() calls below, so the probe is
-  // proven sensitive at the moment it is used: a listener the plugin opened
-  // would show up as one more than this baseline. (Closing the control here
-  // would leave its handle in the resource list for a tick, which is exactly
-  // the kind of accounting artifact this check must not depend on.)
-  const baseline = tcpServers()
-
-  const { apply } = await import('./index.js')
-  const settings = makeSettings({ providers: {} })
-  const logger = recorder()
-  let disposer
-  const boot = ctxFor(logger, settings, (register) => { disposer = register() })
-  await apply(boot, {})
-  check('apply hooks the global fetch', globalThis.fetch !== realFetch)
-  check('apply opens no listener at all', tcpServers() === baseline, `tcp servers ${baseline} -> ${tcpServers()}`)
-  check('the profile is created against the gateway', settings.writes[0]?.ops[0]?.value?.baseURL === 'https://api.cline.bot/api/v1', JSON.stringify(settings.writes[0]?.ops[0]?.value?.baseURL))
-  check('a stored "max" effort is left alone', settings.writes.length === 1 && !settings.writes.some((write) => write.ns === 'agent-default-model'), JSON.stringify(settings.writes.map((write) => write.ns)))
-  check('apply reports the in-process hook', logger.lines.info.some((line) => line.includes('pin injected in-process, no listener')))
-  check('apply registers the prompt-display listener', boot.listeners.has('system-prompt/assemble'))
-  check('…and says which model id the prompt will show', logger.lines.info.some((line) => line.includes('prompt shows deepseek-v4.1-flash')), JSON.stringify(logger.lines.info))
-  disposer()
-  check('unloading restores the global fetch', globalThis.fetch === realFetch)
-
-  const oddEffort = makeSettings({ providers: {} }, 'turbo')
-  let oddDisposer
-  await apply(ctxFor(recorder(), oddEffort, (register) => { oddDisposer = register() }), {})
-  check('an unsupported stored effort is realigned to high', oddEffort.writes[1]?.ops[0]?.value === 'high', JSON.stringify(oddEffort.writes[1]?.ops[0]))
-  oddDisposer()
-  check('that hook is disposed again', globalThis.fetch === realFetch)
-
-  // 0.2.1-alpha.2 回归：`settings.mutate` 现在走 `configEditor.edit`，先拿 profile
-  // package.json 的写锁，再 `reconcileProfilePatches()` —— 那一步要等 loader **settle**。
-  // 在 apply() 里 await 它就成了自锁：本 fiber 停在 LOADING → 树永不 settle →
-  // `appReady` 不 commit → 客户端的 mux 升级路由根本不注册（页面永远 "Reconnecting"，
-  // 带 token 的启动横幅也不打），而同一时刻 `describe()` 只列已 ACTIVE 的条目，
-  // 还会把已有卡片误判成「缺失」而写盘。
-  // 断言两半：树没 settle 时 apply() 必须已经返回且**一次盘都没写**；放行之后才写。
-  {
-    const gated = makeSettings({ providers: {} })
-    let releaseGate
-    const gate = new Promise((resolve) => { releaseGate = resolve })
-    let gatedDisposer
-    const gatedApplied = apply(ctxFor(recorder(), gated, (register) => { gatedDisposer = register() }, { loader: { await: () => gate } }), {})
-    const raced = await Promise.race([
-      gatedApplied.then(() => 'returned'),
-      new Promise((resolve) => setTimeout(() => resolve('still waiting'), 50)),
-    ])
-    check('apply() returns while the tree is still loading', raced === 'returned', raced)
-    check('…and provisions nothing until the tree settles', gated.writes.length === 0, JSON.stringify(gated.writes))
-    releaseGate()
-    await gatedApplied
-    await new Promise((resolve) => setTimeout(resolve, 10))
-    check('…then provisions once the tree settles', gated.writes.length === 1 && gated.writes[0].ops[0].value.baseURL === 'https://api.cline.bot/api/v1', JSON.stringify(gated.writes.map((write) => write.ns)))
-    gatedDisposer()
-    check('the deferred hook is disposed again', globalThis.fetch === realFetch)
-  }
-
-  // A config still asking for the removed loopback transport must not open one.
-  const legacySettings = makeSettings({ providers: {} })
-  const legacyBoot = recorder()
-  let legacyDisposer
-  await apply(ctxFor(legacyBoot, legacySettings, (register) => { legacyDisposer = register() }), { transport: 'proxy', listen: '127.0.0.1:0' })
-  check('a legacy transport: proxy config opens no listener', tcpServers() === baseline, `tcp servers ${baseline} -> ${tcpServers()}`)
-  check('…and is reported, then served in-process', legacyBoot.lines.warn.some((line) => line.includes('"transport"')) && globalThis.fetch !== realFetch, JSON.stringify(legacyBoot.lines.warn))
-  check('…and its card still points at the gateway', legacySettings.writes[0].ops[0].value.baseURL === 'https://api.cline.bot/api/v1', legacySettings.writes[0].ops[0].value.baseURL)
-  legacyDisposer()
-  check('…and the hook is disposed again', globalThis.fetch === realFetch)
-
-  const badUrl = recorder()
-  const badUrlSettings = makeSettings({ providers: {} })
-  globalThis.fetch = realFetch
-  let badUrlEffects = 0
-  const badUrlCtx = ctxFor(badUrl, badUrlSettings, () => { badUrlEffects += 1 })
-  await apply(badUrlCtx, { upstream: 'api.cline.bot' })
-  check('an upstream that is not a URL is reported at boot', badUrl.lines.error.some((line) => line.includes('is not a URL')), JSON.stringify(badUrl.lines.error))
-  // …and nothing happens: no hook to dispose, no card written from a typo.
-  check('…nothing is hooked', globalThis.fetch === realFetch && badUrlEffects === 0, `effects=${badUrlEffects}`)
-  check('…and no card is written from it', badUrlSettings.writes.length === 0, JSON.stringify(badUrlSettings.writes))
-  check('…and not even the prompt listener is registered', badUrlCtx.listeners.size === 0, JSON.stringify([...badUrlCtx.listeners.keys()]))
-
-  const noFetch = recorder()
-  const savedFetch = globalThis.fetch
-  globalThis.fetch = undefined
-  await apply(ctxFor(noFetch, makeSettings({ providers: {} })), {})
-  globalThis.fetch = savedFetch
-  check('a hook that could not be installed says so', noFetch.lines.error.some((line) => line.includes('could not hook the global fetch')))
-  check('…and is not also announced as injected', !noFetch.lines.info.some((line) => line.includes('pin injected in-process')), JSON.stringify(noFetch.lines.info))
-
-  const shadowed = recorder()
-  await apply(ctxFor(shadowed, makeSettings({ providers: {} })), { pins: { 'cline-pass/deepseek-v4.1-flash': [] } })
-  check(
-    'an empty per-model pin that shadows a real one is reported',
-    shadowed.lines.warn.some((line) => line.includes('pins["cline-pass/deepseek-v4.1-flash"] is empty')),
-    JSON.stringify(shadowed.lines.warn),
-  )
-
-  const displayOff = recorder()
-  let displayOffDisposer
-  const displayOffCtx = ctxFor(displayOff, makeSettings({ providers: {} }), (register) => { displayOffDisposer = register() })
-  await apply(displayOffCtx, { plainModelId: false })
-  check('plainModelId: false registers no prompt listener', !displayOffCtx.listeners.has('system-prompt/assemble'), JSON.stringify([...displayOffCtx.listeners.keys()]))
-  check('…and the boot line says the configured id is what shows', displayOff.lines.info.some((line) => line.includes('prompt shows the configured model id')), JSON.stringify(displayOff.lines.info))
-  displayOffDisposer()
-
-  // A cold boot: the settings service was not registered yet. Reading
-  // `ctx.settings` here used to throw (`cannot get property "settings" without
-  // inject`) and abort apply() before provisioning ran — the state file then
-  // said `provision: null` and no provider card ever appeared. The double above
-  // refuses that property read outright, so this case cannot regress silently.
-  const coldStatus = path.join(SCRATCH, 'cold-boot-status.json')
-  const coldLogs = recorder()
-  const coldSettings = makeSettings({ providers: {} })
-  let coldDisposer
-  const coldCtx = ctxFor(coldLogs, coldSettings, (register) => { coldDisposer = register() }, { deferSettings: true })
-  await apply(coldCtx, { statusFile: coldStatus })
-  const coldRead = () => JSON.parse(fs.readFileSync(coldStatus, 'utf8'))
-  check('a cold boot survives a settings service that is not registered yet', coldRead().provision === 'pending', JSON.stringify(coldRead().provision))
-  check('…writes nothing yet', coldSettings.writes.length === 0, JSON.stringify(coldSettings.writes))
-  check('…and says it will provision when the service registers', coldLogs.lines.info.some((line) => line.includes('when it registers')), JSON.stringify(coldLogs.lines.info))
-  check('the injection waits on the settings service by name', coldCtx.queued().includes('settings'), JSON.stringify(coldCtx.queued()))
-  const delivered = coldCtx.deliver()
-  for (let tick = 0; tick < 20 && coldRead().provision === 'pending'; tick += 1) await new Promise((resolve) => setImmediate(resolve))
-  check('delivering the settings service runs the registration', delivered === 1 && coldRead().provision === 'created', `${delivered} injection(s) / ${JSON.stringify(coldRead().provision)}`)
-  check('…against the gateway, exactly as the eager path does', coldSettings.writes[0]?.ops[0]?.value?.baseURL === 'https://api.cline.bot/api/v1', JSON.stringify(coldSettings.writes[0]?.ops[0]?.value?.baseURL))
-  coldDisposer()
-  check('the cold-boot hook is disposed again', globalThis.fetch === realFetch)
-
-  globalThis.fetch = realFetch
-  await new Promise((resolve) => control.close(resolve))
-}
-
-// ── 11. integration: through undici, against real local servers ─────────────
-console.log('\n── 11. integration through the real fetch ─────────────────')
-{
-  const received = []
-  const record = (label) => async (req, res) => {
-    const chunks = []
-    for await (const chunk of req) chunks.push(chunk)
-    const text = Buffer.concat(chunks).toString('utf8')
-    received.push({ label, url: req.url, headers: req.headers, text, body: text.length === 0 ? null : JSON.parse(text) })
-    res.writeHead(200, { 'content-type': 'application/json' })
-    // 带 routing 元数据：本地闸要读它才放行（见 gatewayBody）。
-    res.end(GATEWAY_BODY)
-  }
-  const gateway = http.createServer(record('gateway'))
-  const elsewhere = http.createServer(record('elsewhere'))
-  await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve))
-  await new Promise((resolve) => elsewhere.listen(0, '127.0.0.1', resolve))
-  const origin = `http://127.0.0.1:${gateway.address().port}`
-  const otherOrigin = `http://127.0.0.1:${elsewhere.address().port}`
-
-  const realFetch = globalThis.fetch
-  const hook = createFetchPin({ upstream: origin }, recorder())
-  hook.install()
-
-  const response = await globalThis.fetch(`${origin}/api/v1/chat/completions`, jsonInit())
-  check('the gateway answered through the hook', response.status === 200)
-  check('the wire body is pinned', JSON.stringify(received[0].body.providerOptions) === '{"gateway":{"only":["deepseek"]}}', JSON.stringify(received[0].body.providerOptions))
-  check('the wire path is unchanged', received[0].url === '/api/v1/chat/completions', received[0].url)
-  check('the wire headers are unchanged', received[0].headers.authorization === 'Bearer sk_test')
-  check('the wire model is unchanged', received[0].body.model === CHAT_BODY.model)
-
-  await globalThis.fetch(`${otherOrigin}/api/v1/chat/completions`, jsonInit())
-  check('another origin on the same path is not rewritten', received[1].body.providerOptions === undefined, JSON.stringify(received[1].body.providerOptions))
-
-  hook.uninstall()
-  await globalThis.fetch(`${origin}/api/v1/chat/completions`, jsonInit())
-  check('after uninstall the wire body carries no pin', received[2].body.providerOptions === undefined, JSON.stringify(received[2].body.providerOptions))
-  check('uninstall restored the native fetch', globalThis.fetch === realFetch)
-
-  await new Promise((resolve) => gateway.close(resolve))
-  await new Promise((resolve) => elsewhere.close(resolve))
-}
-
-// ── 12. the prompt display ──────────────────────────────────────────────────
-console.log('\n── 12. the prompt display ────────────────────────────────')
-{
-  const cfg = withDefaults({})
-  const ctx = ctxFor(recorder(), undefined)
-  installPromptDisplay(ctx, cfg)
-  const registered = ctx.listeners.get('system-prompt/assemble')
-  check('the assembly listener is registered on the event bus', registered !== undefined)
-  // The whole reason the rewrite works: `installModelSelection` applies the
-  // session's live selection *after* every inner listener returns, and only a
-  // listener outside it ever sees the model the next request will use.
-  check('…prepended, so it sits outside the model-selection listener', registered?.options?.prepend === true, JSON.stringify(registered?.options))
-
-  /** An assembly as the loop leaves it, with the live selection already applied. */
-  const assembly = (variables = {}) => ({
-    sections: [
-      { name: 'harness:identity', text: 'You are an AI agent powered by DeepSeek Harness.' },
-      { name: 'deployment:persona-prefix', text: 'You are a coding agent powered by the {{model}} model.' },
-      { name: 'deployment:persona-suffix', text: 'Your working directory is {{cwd}}.' },
-      { name: 'tool:bash', text: 'Model {{model}}, literally.', interpolate: false },
-    ],
-    contexts: [],
-    tools: [],
-    variables: { provider: 'cline-pass', model: 'cline-pass/deepseek-v4.1-flash', cwd: '/tmp', ...variables },
-  })
-  const through = (input) => registered.listener(input, {}, () => Promise.resolve(input))
-  const textOf = (result, name) => result.sections.find((section) => section.name === name).text
-
-  const live = await through(assembly())
-  check(
-    'the persona shows the bare DeepSeek id',
-    textOf(live, 'deployment:persona-prefix') === 'You are a coding agent powered by the deepseek-v4.1-flash model.',
-    textOf(live, 'deployment:persona-prefix'),
-  )
-  check('…while the variables keep the wire id', live.variables.model === 'cline-pass/deepseek-v4.1-flash', live.variables.model)
-  check('a sibling variable in the same section still resolves later', textOf(live, 'deployment:persona-suffix') === 'Your working directory is {{cwd}}.')
-  check('a literal (interpolate: false) section is untouched', textOf(live, 'tool:bash') === 'Model {{model}}, literally.')
-  check('the harness identity is untouched', textOf(live, 'harness:identity') === 'You are an AI agent powered by DeepSeek Harness.')
-  check('the input assembly is not mutated', assembly().sections[1].text === 'You are a coding agent powered by the {{model}} model.')
-
-  const official = assembly({ provider: 'deepseek', model: 'deepseek-v4-flash' })
-  check('an official bare id is a no-op (same assembly)', (await through(official)) === official)
-  const otherRoute = assembly({ provider: 'other', model: 'other/glm-5.3-flash' })
-  check('another route’s prefixed id is not ours to rename', (await through(otherRoute)) === otherRoute)
-  const bareOnThisRoute = assembly({ model: 'glm-5.3-flash' })
-  check('a bare id on this route is a no-op', (await through(bareOnThisRoute)) === bareOnThisRoute)
-  const prefixOnly = assembly({ model: 'cline-pass/' })
-  check('a prefix with no model behind it is a no-op', (await through(prefixOnly)) === prefixOnly)
-  const noReference = { ...assembly(), sections: [{ name: 'deployment:persona-prefix', text: 'Be brief.' }] }
-  check('a persona without the reference is a no-op', (await through(noReference)) === noReference)
-  check('an assembly with no section list is passed straight through', (await through(undefined)) === undefined)
-
-  const renamed = ctxFor(recorder(), undefined)
-  installPromptDisplay(renamed, withDefaults({ provider: 'tunnel', model: 'tunnel/deepseek-v4.1-flash' }))
-  const renamedLive = await renamed.listeners.get('system-prompt/assemble').listener(assembly({ provider: 'tunnel', model: 'tunnel/deepseek-v4.1-flash' }), {}, () => Promise.resolve(assembly({ provider: 'tunnel', model: 'tunnel/deepseek-v4.1-flash' })))
-  check(
-    'a renamed route strips its own prefix, not a hardcoded one',
-    textOf(renamedLive, 'deployment:persona-prefix') === 'You are a coding agent powered by the deepseek-v4.1-flash model.',
-    textOf(renamedLive, 'deployment:persona-prefix'),
-  )
-}
-
-// ── 13. the streaming gate ──────────────────────────────────────────────────
-//
-// routing 元数据只在最后一帧出现，所以「校验」与「边流边显示」只能靠**扣住终止帧**
-// 共存：内容立即转发，裁决通过才放行 [DONE]；违规就中断响应体 —— 消费者的流异常会让
-// dsh 只落一条 assistant/attempt，绝不装配 assistant/message（于是工具不执行）。
-console.log('\n── 13. the streaming gate ────────────────────────────────')
-{
-  const enc = (text) => new TextEncoder().encode(text)
-  const delta = (index) => `data: ${JSON.stringify({ choices: [{ delta: { content: `tok${index}` } }] })}\n\n`
-  const routingFrame = (provider, resolved = provider) => `data: ${gatewayBody(provider, resolved)}\n\n`
-  const sse = (body) => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
-  const frames = (...parts) => sse(new ReadableStream({
-    start(controller) {
-      for (const part of parts) controller.enqueue(enc(part))
-      controller.close()
-    },
-  }))
-
-  /** 逐块读完一个响应体；出错时把错误一起带回来（流式中断是正常结局之一）。 */
-  async function drain(response) {
-    const parts = []
-    const reader = response.body.getReader()
-    for (;;) {
-      try {
-        const { done, value } = await reader.read()
-        if (done) return { text: parts.join(''), error: null }
-        parts.push(new TextDecoder().decode(value))
-      } catch (error) {
-        return { text: parts.join(''), error }
-      }
+  /** A plugin context double: `settings` is reachable only through get()/inject(). */
+  const applyCtx = ({ settings, logger = quiet, loader } = {}) => {
+    const effects = []
+    const listeners = new Map()
+    const ctx = {
+      logger,
+      effect: (register) => effects.push(register()),
+      on: (event, listener) => listeners.set(event, listener),
+      get: (name) => (name === 'settings' ? settings : undefined),
+      inject: () => Promise.resolve(),
+      ...(loader === undefined ? {} : { root: { loader } }),
     }
+    return { ctx, effects, listeners }
+  }
+  const MARK = Symbol.for('dsh-clinepass.fetch-hook')
+
+  {
+    // A healthy mount: the observer goes into the process, a disposer comes back,
+    // and the provisioning outcome lands in the status file.
+    const real = globalThis.fetch
+    const statusPath = path.join(SCRATCH, 'apply-status.json')
+    const settings = makeSettings({ providers: {} })
+    const { ctx, effects } = applyCtx({ settings })
+    await apply(ctx, { statusFile: statusPath, usage: false })
+    check('apply installs the observer into the process', globalThis.fetch !== real && typeof globalThis.fetch[MARK] === 'function')
+    check('…and registers exactly one disposer', effects.length === 1 && typeof effects[0] === 'function', String(effects.length))
+    check('…leaving the profile it provisioned', settings.writes.length === 1, JSON.stringify(settings.writes.length))
+    check('…with the outcome in the status file', readStatus(statusPath)?.provision === 'created', JSON.stringify(readStatus(statusPath)?.provision))
+    check('…and the hook reported installed', readStatus(statusPath)?.hook === 'installed', String(readStatus(statusPath)?.hook))
+    effects[0]()
+    check('the disposer restores the original fetch', globalThis.fetch === real)
+    check('…and the record says so', readStatus(statusPath)?.hook === 'uninstalled', String(readStatus(statusPath)?.hook))
   }
 
-  // 内容必须**在裁决之前**到达消费者：上游只发了一帧 delta 就停住，此刻就该能读到它。
-  // 缓冲路径下这次 read() 会一直等下去（这正是 TPS 被搞坏的那条路）。
   {
+    // A mistyped upstream must change nothing at all — no hook, no card.
+    const real = globalThis.fetch
+    const logger = recorder()
+    const settings = makeSettings({ providers: {} })
+    const { ctx, effects } = applyCtx({ settings, logger })
+    await apply(ctx, { upstream: 'api.cline.bot', statusFile: false })
+    check('a bad upstream installs nothing', globalThis.fetch === real && effects.length === 0)
+    check('…and provisions nothing', settings.writes.length === 0)
+    check('…saying why', logger.lines.error.some((line) => line.includes('is not a URL')), JSON.stringify(logger.lines.error))
+  }
+
+  {
+    // The self-lock contract: provisioning must wait for the loader tree to
+    // settle, and `apply()` must NOT await it (a fiber parked in LOADING keeps
+    // the tree from settling forever — see the comment on `afterSettle`).
+    const real = globalThis.fetch
+    const statusPath = path.join(SCRATCH, 'apply-loader.json')
+    const settings = makeSettings({ providers: {} })
     let release
-    const gate = new Promise((resolve) => { release = resolve })
-    const stub = stubFetch(() => sse(new ReadableStream({
-      async start(controller) {
-        controller.enqueue(enc(delta(0)))
-        await gate
-        controller.enqueue(enc(routingFrame('deepseek')))
-        controller.enqueue(enc('data: [DONE]\n\n'))
-        controller.close()
-      },
-    })))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const reader = (await globalThis.fetch(CHAT, jsonInit())).body.getReader()
-    const first = new TextDecoder().decode((await reader.read()).value)
-    check('strict streams content before the verdict', first.includes('tok0'), JSON.stringify(first))
-    release()
-    const tail = []
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      tail.push(new TextDecoder().decode(value))
-    }
-    check('the held terminator is released once the verdict passes', tail.join('').includes('[DONE]'), JSON.stringify(tail.join('')))
-    check('a verified stream is recorded', hook.state().lastVerified?.provider === 'deepseek', JSON.stringify(hook.state().lastVerified ?? null))
-    check('a verified stream blocks nothing', hook.counters.blocked === 0, JSON.stringify(hook.counters))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 违规：内容照常流出去（这是拿回 TPS 的代价），但终止帧永远不到，响应体在裁决处报错。
-  {
-    const stub = stubFetch(() => frames(delta(0), routingFrame('alibaba'), 'data: [DONE]\n\n'))
-    const logger = recorder()
-    const hook = createFetchPin({}, logger)
-    hook.install()
-    const { text, error } = await drain(await globalThis.fetch(CHAT, jsonInit()))
-    check('a foreign streamed channel still delivers the content frames', text.includes('tok0'), JSON.stringify(text))
-    check('…but never the terminator', !text.includes('[DONE]'), JSON.stringify(text))
-    check('…and the body fails instead of completing', error !== null && /渠道校验未通过/.test(error.message), String(error?.message))
-    check('the streamed refusal names no retryable keyword', error !== null && !/rate|timeout|network|fetch|5\d\d/.test(error.message), String(error?.message))
-    check('the streamed violation is counted', hook.counters.blocked === 1, JSON.stringify(hook.counters))
-    check('the streamed violation names the provider', hook.state().lastViolation?.finalProvider === 'alibaba', JSON.stringify(hook.state().lastViolation ?? null).slice(0, 120))
-    check('the streamed violation is logged as an error', logger.lines.error.some((line) => line.includes('拦下')), JSON.stringify(logger.lines.error))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 没有 routing 元数据 = 不可证明 → 同样 fail closed，终止帧也不放行。
-  {
-    const stub = stubFetch(() => frames(delta(0), 'data: [DONE]\n\n'))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const { text, error } = await drain(await globalThis.fetch(CHAT, jsonInit()))
-    check('a streamed response with no routing metadata is refused', error !== null && /没有 gateway\.routing 元数据/.test(String(error?.detail)), String(error?.message))
-    check('…and its terminator is withheld too', !text.includes('[DONE]'), JSON.stringify(text))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // warn 不扣终止帧、不中断，只记录 —— 于是 warn 也重获流式（旧实现里它同样缓冲）。
-  {
-    const stub = stubFetch(() => frames(delta(0), routingFrame('alibaba'), 'data: [DONE]\n\n'))
-    const hook = createFetchPin({ enforcement: 'warn' }, recorder())
-    hook.install()
-    const { text, error } = await drain(await globalThis.fetch(CHAT, jsonInit()))
-    check('warn streams a foreign response to the end', error === null && text.includes('tok0') && text.includes('[DONE]'), JSON.stringify(text))
-    check('warn still counts and records it', hook.counters.blocked === 1 && hook.state().lastViolation?.finalProvider === 'alibaba')
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 上游中途坏掉（用户按停止、socket 断）不是渠道违规：错误原样传下去，不计数。
-  {
-    const stub = stubFetch(() => sse(new ReadableStream({
-      start(controller) {
-        controller.enqueue(enc(delta(0)))
-        controller.error(new Error('socket broke'))
-      },
-    })))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const { error } = await drain(await globalThis.fetch(CHAT, jsonInit()))
-    check('an upstream stream failure is passed through', error !== null && error.message === 'socket broke', String(error?.message))
-    check('…and is not counted as a violation', hook.counters.blocked === 0 && hook.state().lastViolation === null, JSON.stringify(hook.counters))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // warn 下同一个失败的流也不该被算成违规（判定只在流正常收尾时发生）。
-  check('the frame splitter accepts LF blank lines', nextFrameEnd(enc('data: {}\n\nrest')) === 'data: {}\n\n'.length)
-  check('the frame splitter accepts CRLF blank lines', nextFrameEnd(enc('data: {}\r\n\r\nrest')) === 'data: {}\r\n\r\n'.length)
-  check('an incomplete frame yields -1', nextFrameEnd(enc('data: {}')) === -1)
-  check('a terminator is recognised among other frames', isTerminatorFrame(enc('data: [DONE]\n\n')) && isTerminatorFrame(enc('data:[DONE]\n\n')))
-  // 只认 `data:` 后最多一个空格 —— 多一格 openai 解码器就不认它是终止帧（它剥掉一个空格后
-  // 看 startsWith('[DONE]')），会把这一帧丢给 JSON.parse 让整条流报错。扣帧范围要和消费者一致。
-  check('…but only with the spacing the consumer accepts', !isTerminatorFrame(enc('data:  [DONE]\n\n')))
-  check('the frame splitter accepts CR-only blank lines', nextFrameEnd(enc('data: {}\r\rrest')) === 'data: {}\r\r'.length)
-  check('a terminator without a trailing blank line is still a terminator', isTerminatorFrame(enc('data: [DONE]')))
-  // 裸 `data` 行也会被拼进负载（消费者一样），于是拼接结果以 `\n[DONE]` 开头 —— 这一帧对
-  // 双方都不是终止帧。锁住这个方向，免得哪天「更严」悄悄变成「更松」。
-  check('a bare `data` line before it makes it not a terminator', !isTerminatorFrame(enc('data\rdata: [DONE]\r\r')))
-  check('content frames are never mistaken for a terminator', !isTerminatorFrame(enc('data: {"a":1}\n\n')))
-}
-
-// ── 14. the streamed gate, attacked ─────────────────────────────────────────
-//
-// 独立审查（2026-09-23，全新上下文的子代理）逐条攻过这个闸。下面是它真的攻破的那一处，
-// 加上几处只能靠回归测试守住的边界：routing 藏在**被扣住**的终止帧里、取消被误记成违规、
-// 块边界落在帧中间、上游不发空行就关流、对抗性的渠道名把错误文案带成「可重试」。
-console.log('\n── 14. the streamed gate, attacked ───────────────────────')
-{
-  const enc = (text) => new TextEncoder().encode(text)
-  const delta = (index) => `data: ${JSON.stringify({ choices: [{ delta: { content: `tok${index}` } }] })}\n\n`
-  const routingFrame = (provider) => `data: ${gatewayBody(provider)}\n\n`
-  const sse = (body) => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
-  const wire = (parts) => new ReadableStream({
-    start(controller) {
-      for (const part of parts) controller.enqueue(typeof part === 'string' ? enc(part) : part)
-      controller.close()
-    },
-  })
-  /** 把一段字节按给定切点分块：模拟真实的块边界（会落在帧中间）。 */
-  const sliced = (bytes, cuts) => {
-    const parts = []
-    let at = 0
-    for (const cut of [...cuts, bytes.length]) {
-      parts.push(bytes.slice(at, cut))
-      at = cut
-    }
-    return parts
-  }
-  const join = (parts) => {
-    const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0))
-    let at = 0
-    for (const part of parts) {
-      out.set(part, at)
-      at += part.length
-    }
-    return out
-  }
-  const same = (left, right) => left.length === right.length && left.every((byte, index) => byte === right[index])
-  const text = (bytes) => new TextDecoder().decode(bytes)
-  async function drainBytes(response) {
-    const parts = []
-    const reader = response.body.getReader()
-    for (;;) {
-      try {
-        const { done, value } = await reader.read()
-        if (done) return { bytes: join(parts), error: null }
-        parts.push(value)
-      } catch (error) {
-        return { bytes: join(parts), error }
-      }
-    }
-  }
-
-  // 审查里唯一能造出「别家的工具真的执行了」的洞：只扫转发出去的帧，于是藏在**被扣住**
-  // 的终止帧里的 routing 从未被读过，闸拿上一帧的旧结论（deepseek）替它背书。
-  {
-    const hidden = `data: [DONE]\ndata: ${gatewayBody('alibaba')}\n\n`
-    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('deepseek'), hidden])))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('routing inside the held terminator frame is judged too', error !== null && /finalProvider=alibaba/.test(String(error?.detail)), `${String(error?.message ?? '').slice(0, 60)} | ${String(error?.detail ?? '')}`)
-    check('…so a hidden channel blocks the call', hook.counters.blocked === 1, JSON.stringify(hook.counters))
-    check('…and an earlier allowed routing does not excuse it', !text(bytes).includes('[DONE]'), JSON.stringify(text(bytes)).slice(-70))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 反面：藏在终止帧里的 routing 是允许的 → 正常放行（别矫枉过正判成违规）。
-  {
-    const hidden = `data: [DONE]\ndata: ${gatewayBody('deepseek')}\n\n`
-    const stub = stubFetch(() => sse(wire([delta(0), hidden])))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('an allowed routing inside the terminator frame still passes', error === null && text(bytes).includes('[DONE]'), String(error?.message ?? ''))
-    check('…and is recorded as verified', hook.state().lastVerified?.provider === 'deepseek', JSON.stringify(hook.state().lastVerified ?? null))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 块边界落在帧中间：`data:` 中间、`[DONE]` 中间、以及最后一个字节单独一块。
-  // 转发必须与线上字节逐字节相同（今天只做了 includes 检查）。
-  {
-    const raw = delta(0) + delta(1) + routingFrame('deepseek') + 'data: [DONE]\n\n'
-    const bytes = enc(raw)
-    const cuts = [1, raw.indexOf('data: [DONE]') + 3, raw.indexOf('[DONE]') + 3, bytes.length - 1]
-    const stub = stubFetch(() => sse(wire(sliced(bytes, cuts))))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const { bytes: got, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('a frame split mid-`data:` is forwarded byte-for-byte', error === null && same(got, bytes), `${got.length}/${bytes.length} bytes, error=${String(error?.message ?? 'none')}`)
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // CRLF 帧，且正好切在空行的 `\r` 与 `\n` 之间 —— 切帧只看字节，不能在这里劈错。
-  {
-    const raw = `data: ${JSON.stringify({ choices: [{ delta: { content: 'hi' } }] })}\r\n\r\n`
-      + routingFrame('deepseek').replace(/\n/g, '\r\n')
-      + 'data: [DONE]\r\n\r\n'
-    const bytes = enc(raw)
-    const blank = raw.indexOf('\r\n\r\n') + 3
-    const stub = stubFetch(() => sse(wire(sliced(bytes, [blank]))))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const { bytes: got, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('a CRLF frame split between CR and LF stays byte-identical', error === null && same(got, bytes), `${got.length}/${bytes.length} bytes, error=${String(error?.message ?? 'none')}`)
-    check('…and the CRLF terminator is recognised', hook.state().lastVerified?.provider === 'deepseek')
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 上游不发最后的空行就关流：剩下的那一帧照样要判（两个分支此前都没被覆盖过）。
-  {
-    const stub = stubFetch(() => sse(wire([delta(0), `data: ${gatewayBody('deepseek')}`])))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const { error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('a final frame with no blank line before EOF is still judged', error === null && hook.state().lastVerified?.provider === 'deepseek', `error=${String(error?.message ?? 'none')}`)
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 上游发完 [DONE] 却不关连接：不能等到它关流才放行终止帧（实测客户端会一直等到空闲
-  // 超时）。第一帧 [DONE] 就是这次响应的结尾 —— 消费者也是这么认的。
-  {
-    let upstreamClosed = false
-    const stub = stubFetch(() => sse(new ReadableStream({
-      start(controller) {
-        controller.enqueue(enc(delta(0)))
-        controller.enqueue(enc(routingFrame('deepseek')))
-        controller.enqueue(enc('data: [DONE]\n\n'))
-        // 故意不 close：模拟「网关发完却不关连接」。
-        void (async () => { await new Promise((resolve) => setTimeout(resolve, 5000)); upstreamClosed = true; controller.close() })()
-      },
-    })))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const started = Date.now()
-    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    const took = Date.now() - started
-    check('the terminator is released without waiting for upstream EOF', error === null && text(bytes).includes('[DONE]') && took < 1000, `${took}ms, upstreamClosed=${upstreamClosed}, error=${String(error?.message ?? 'none')}`)
-    check('…and the verdict was still reached', hook.state().lastVerified?.provider === 'deepseek')
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 两帧 [DONE]：第一帧就收尾（不再读第二帧），消费者照样拿到一个完整的终止帧。
-  {
-    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('deepseek'), 'data: [DONE]\n\n', 'data: [DONE]\n\n'])))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    const doneCount = (text(bytes).match(/\[DONE\]/g) ?? []).length
-    check('a duplicated terminator yields exactly one [DONE] and nothing after it', error === null && doneCount === 1 && text(bytes).endsWith('data: [DONE]\n\n'), `count=${doneCount}, tail=${JSON.stringify(text(bytes)).slice(-40)}`)
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 声明了 SSE 却没有 body：没法边流边判 → 退回缓冲路径失败关闭（400），而不是抛异常。
-  {
-    const stub = stubFetch(() => new Response(null, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const response = await globalThis.fetch(CHAT, jsonInit())
-    check('an SSE response with no body fails closed with 400', response.status === 400 && /PROVIDER_PIN_VIOLATION/.test(await response.text()), `HTTP ${response.status}`)
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 取消（用户按停止）：裁决没发生 —— 记 unverified，**绝不能**算成违规。
-  {
-    const controller = new AbortController()
-    let release
-    const gate = new Promise((resolve) => { release = resolve })
-    const stub = stubFetch(() => sse(new ReadableStream({
-      async start(stream) {
-        stream.enqueue(enc(delta(0)))
-        await gate
-        stream.error(new DOMException('aborted', 'AbortError'))
-      },
-    })))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const pending = drainBytes(await globalThis.fetch(CHAT, { ...jsonInit(), signal: controller.signal }))
-    controller.abort()
-    release()
-    const { error } = await pending
-    check('an aborted stream is not counted as a violation', hook.counters.blocked === 0 && hook.counters.unverified === 1, JSON.stringify(hook.counters))
-    check('…and is recorded as unverified, with why', hook.state().lastUnverified?.reason === 'aborted', JSON.stringify(hook.state().lastUnverified ?? null).slice(0, 130))
-    check('…while the abort still reaches the caller', error !== null, String(error?.message))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 消费者自己取消（dsh 中止 / break）：同样不是违规，也不能在取消后补一次裁决。
-  {
-    const stub = stubFetch(() => sse(new ReadableStream({
-      start(stream) {
-        stream.enqueue(enc(delta(0)))
-      },
-    })))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const reader = (await globalThis.fetch(CHAT, jsonInit())).body.getReader()
-    await reader.read()
-    await reader.cancel('user stopped')
-    await new Promise((resolve) => setTimeout(resolve, 10))
-    check('a consumer cancel is not a violation either', hook.counters.blocked === 0 && hook.counters.unverified === 1, JSON.stringify(hook.counters))
-    check('…and never invents a verdict', hook.state().lastVerified === null && hook.state().lastViolation === null)
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 伪造的 routing 盖在真 routing **之后**：只信「最后一处」就等于把判决交给被审的一方 ——
-  // 服务这次请求的渠道控制着自己那部分帧，可以自称 deepseek 把真话盖掉。
-  {
-    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('alibaba'), routingFrame('deepseek'), 'data: [DONE]\n\n'])))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('a forged allowed routing cannot override a real foreign one', error !== null && hook.counters.blocked === 1, `blocked=${hook.counters.blocked}, detail=${String(error?.detail ?? 'none')}`)
-    check('…and its terminator is withheld', !text(bytes).includes('[DONE]'), JSON.stringify(text(bytes)).slice(-60))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // CR 单独作行分隔符（SSE 规范允许，消费者也认）：终止帧判定与 routing 提取都要跟上，
-  // 否则「我们以为转发了、它以为结束了」，或反过来漏读元数据。
-  {
-    check('a CR-separated terminator is recognised', isTerminatorFrame(enc('x\rdata: [DONE]\r\r')))
-    check('a CR-separated routing frame is read', routingOfText(`data: ${gatewayBody('deepseek')}\r\r`)?.finalProvider === 'deepseek')
-    const stub = stubFetch(() => sse(wire([delta(0), `data: ${gatewayBody('alibaba')}\r\r`, 'data: [DONE]\r\r'])))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('a CR-separated violation withholds its terminator too', error !== null && !text(bytes).includes('[DONE]'), `blocked=${hook.counters.blocked}, detail=${String(error?.detail ?? 'none')}`)
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 状态文件里记的必须是**被拒的那一处** routing：伪造者把一个自称「由允许渠道提供」的
-  // routing 放在最后，不能连「谁服务了这次请求」这个诊断也一起改掉。
-  {
-    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('alibaba'), routingFrame('deepseek'), 'data: [DONE]\n\n'])))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('the recorded culprit is the rejected routing, not the last one', hook.state().lastViolation?.finalProvider === 'alibaba', JSON.stringify(hook.state().lastViolation ?? null).slice(0, 110))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 缓冲（非 SSE）路径同样逐处判，并记下被拒的那一处。
-  {
-    const wireText = `data: ${gatewayBody('alibaba')}\n\ndata: ${gatewayBody('deepseek')}\n\n`
-    const stub = stubFetch(() => new Response(wireText, { status: 200, headers: { 'content-type': 'application/json' } }))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const response = await globalThis.fetch(CHAT, jsonInit())
-    const body = await response.text()
-    check('the buffered path judges every routing too', response.status === 400 && /PROVIDER_PIN_VIOLATION/.test(body), `HTTP ${response.status}`)
-    check('…and records the rejected one', hook.state().lastViolation?.finalProvider === 'alibaba', JSON.stringify(hook.state().lastViolation ?? null).slice(0, 110))
-    check(
-      '…and its 400 body names the offending channel',
-      /由 alibaba 提供/.test(JSON.parse(body).error.message) && JSON.parse(body).error.allowed.join() === 'deepseek',
-      JSON.parse(body).error.message.slice(0, 120),
-    )
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 一个 JSON 被拆到两行 `data:`：消费者拼接后能解析，插件也必须解析 —— 否则那一处 foreign
-  // routing 根本不会被看到（复审用真实适配器把整条路径跑通过）。
-  {
-    const full = gatewayBody('alibaba')
-    const cut = full.indexOf(',') + 1
-    const splitFrame = `data: ${full.slice(0, cut)}\ndata: ${full.slice(cut)}\n\n`
-    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('deepseek'), splitFrame, 'data: [DONE]\n\n'])))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const { bytes, error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('a routing split across two data: lines is judged', error !== null && hook.counters.blocked === 1, `blocked=${hook.counters.blocked}, detail=${String(error?.detail ?? 'none')}`)
-    check('…and its terminator is withheld', !text(bytes).includes('[DONE]'))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 终止帧一到就收尾 —— 上游 body 该被放掉，别让 socket 挂着。
-  {
-    let cancelled = false
-    const stub = stubFetch(() => sse(new ReadableStream({
-      start(controller) {
-        controller.enqueue(enc(delta(0)))
-        controller.enqueue(enc(routingFrame('deepseek')))
-        controller.enqueue(enc('data: [DONE]\n\n'))
-      },
-      cancel() {
-        cancelled = true
-      },
-    })))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    check('the upstream body is released once the verdict is in', cancelled)
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 违规文案要**点名**被拦下的渠道 —— 否则用户拿到的信息量为零（这正是它被改掉的原因）。
-  // 但渠道名来自网关，而 dsh 会在文案上跑好几套判定（重试分类、上下文溢出 → **会话压缩**、
-  // 配额）。所以契约是两面的：**安全形状的名字必须出现，危险形状的名字一个字都不许出现**，
-  // 并且后者彼此逐字相同 —— 换任何危险名都不能改变文案，等于夺走被审方选判词的能力。
-  {
-    const safe = ['alibaba', 'baseten']
-    const hostile = ['channel-500', 'context_length_exceeded', 'insufficient-balance', 'rate_limit', 'not a slug', 'x'.repeat(64)]
-    const messages = new Map()
-    for (const slug of [...safe, ...hostile]) {
-      const stub = stubFetch(() => sse(wire([delta(0), routingFrame(slug)])))
-      const hook = createFetchPin({}, recorder())
-      hook.install()
-      const { error } = await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-      messages.set(slug, { message: error?.message ?? '', detail: error?.detail ?? '', recorded: hook.state().lastViolation?.finalProvider ?? null })
-      hook.uninstall()
-      stub.restore()
-    }
-    check(
-      'a normal channel name is named in the refusal message',
-      safe.every((slug) => messages.get(slug).message.includes(`由 ${slug} 提供`)),
-      safe.map((slug) => `${slug}: ${messages.get(slug).message.slice(0, 60)}`).join(' | '),
-    )
-    const hostileMessages = hostile.map((slug) => messages.get(slug).message)
-    check(
-      'a hostile channel name never reaches the message',
-      hostile.every((slug) => !messages.get(slug).message.includes(slug)),
-      hostileMessages[0].slice(0, 120),
-    )
-    check(
-      '…and every hostile name yields the same message (no steering)',
-      new Set(hostileMessages).size === 1,
-      `${new Set(hostileMessages).size} distinct messages`,
-    )
-    check(
-      '…while the culprit still reaches the diagnostic channels',
-      [...messages.entries()].every(([slug, entry]) => entry.detail.includes(slug) && entry.recorded === slug),
-      JSON.stringify([...messages.entries()].map(([slug, entry]) => [slug, entry.recorded])).slice(0, 140),
-    )
-  }
-
-  // 违规历史：单槽 `lastViolation` 只能回答「最近一次」。用户问的是「今天被拦的那几次各自
-  // 路由去哪」，所以每一条都得留下（`at` 是唯一能把它和 dsh 会话日志里那条 `turn/end`
-  // 错误对上的字段），并且**有界** —— 网关抽风时不能把状态文件撑爆。
-  {
-    const stub = stubFetch(() => sse(wire([delta(0), routingFrame('alibaba')])))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    const after = hook.state()
-    const kept = after.violations ?? []
-    check(
-      'every violation is kept, in order, not just the last one',
-      kept.length === 2 &&
-        kept.every((entry) => entry.finalProvider === 'alibaba') &&
-        kept[0].at <= kept[1].at &&
-        kept[1].at === after.lastViolation.at,
-      JSON.stringify(kept).slice(0, 160),
-    )
-    check(
-      '…each entry says when and where it happened',
-      kept.length === 2 &&
-        kept.every(
-          (entry) => typeof entry.at === 'string' && entry.url === CHAT && Array.isArray(entry.allowed) && typeof entry.reason === 'string',
-        ),
-      JSON.stringify(kept[0] ?? null).slice(0, 160),
-    )
-    check(
-      '…and the same history reaches the status file on disk',
-      (JSON.parse(fs.readFileSync(STATUS, 'utf8')).violations ?? []).length === 2,
-      JSON.stringify(JSON.parse(fs.readFileSync(STATUS, 'utf8')).violations ?? null).slice(0, 120),
-    )
-    for (let index = 0; index < 20; index += 1) await drainBytes(await globalThis.fetch(CHAT, jsonInit()))
-    const bounded = hook.state().violations ?? []
-    check(
-      'the history is bounded (the status file cannot grow without limit)',
-      bounded.length === 20 && hook.counters.blocked === 22,
-      `violations=${bounded.length}, blocked=${hook.counters.blocked}`,
-    )
-    check(
-      '…and the bound drops the oldest, keeping the newest',
-      bounded.length > 0 && bounded[bounded.length - 1].at === hook.state().lastViolation.at,
-      JSON.stringify(bounded[bounded.length - 1] ?? null).slice(0, 120),
-    )
-    hook.uninstall()
-    stub.restore()
-  }
-}
-
-// ── 15. the provider pin ────────────────────────────────────────────────────
-//
-// 2026-10-14 实测（api.cline.bot，模型回显恒为 z-ai/glm-5.3-flash）：网关对 glm-5.3-flash
-// 在 Z.AI / InferenceNet / Together 之间轮转（一小时内实测到三家），且请求侧 gateway.only
-// 被无视（带 only:["z-ai"] 的 3/9 样本仍由 Together 服务）。直通形状的**每帧**都带顶层
-// `provider` 字段；回退网形状（model 回显 vmc/…-contributor-fallbacks）没有该字段、只有
-// routing 元数据。于是对 `pins: []` 的直通模型提供第二种钉选（providerPins）：响应必须用
-// 顶层 provider 字段自证，证据缺失与越界同样 fail closed，处理方式与渠道钉那套完全一致
-// （记录 + strict 拒绝/流中断，warn 只记录放行）。
-//
-// 0.11.0 追加（同日第三次实测，各 5 发）：网关**执行** OpenRouter 协议的顶层
-// `provider.order`（带 ["z-ai"] 5/5 = Z.AI，不带 2/5；显示名拼法 "z.ai" 会让网关摈断
-// 连接 —— 请求线只认 slug）。于是 provider 钉也上请求线：显示名经 providerSlug 换成
-// slug 写进顶层 provider.order；响应侧闸门照旧（轮转被钉死后，它只剩兑底价值）。
-console.log('\n── 15. the provider pin ──────────────────────────────────')
-{
-  const enc = (text) => new TextEncoder().encode(text)
-  const sse = (body) => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
-  const frames = (...parts) => sse(new ReadableStream({
-    start(controller) {
-      for (const part of parts) controller.enqueue(enc(part))
-      controller.close()
-    },
-  }))
-  const providerFrame = (provider) => `data: ${JSON.stringify({ provider, choices: [{ delta: { content: 'tok' } }] })}\n\n`
-  /** 一份同时带顶层 provider 与 routing 元数据的响应体（两种钉选并存的形状）。 */
-  const bothBody = (routingProvider, wireProvider) => JSON.stringify({ provider: wireProvider, ...JSON.parse(gatewayBody(routingProvider)) })
-  const CONFIG = { pin: [], providerPins: { 'cline-pass/glm-5.3-flash': ['z.ai'] } }
-  const BOTH = { pin: ['deepseek'], pins: { 'cline-pass/deepseek-v4.1-flash': ['deepseek'] }, providerPins: { 'cline-pass/deepseek-v4.1-flash': ['z.ai'] } }
-  const glmInit = () => {
-    const init = jsonInit()
-    init.body = JSON.stringify({ ...CHAT_BODY, model: 'cline-pass/glm-5.3-flash' })
-    return init
-  }
-  /** 逐块读完一个响应体；出错时把错误一起带回来（流式中断是正常结局之一）。 */
-  async function drain(response) {
-    const parts = []
-    const reader = response.body.getReader()
-    for (;;) {
-      try {
-        const { done, value } = await reader.read()
-        if (done) return { text: parts.join(''), error: null }
-        parts.push(new TextDecoder().decode(value))
-      } catch (error) {
-        return { text: parts.join(''), error }
-      }
-    }
-  }
-
-  // 单元层：providerPins 的解析与两个提取/判定函数。
-  {
-    const hook = createFetchPin({ pin: [], providerPins: { m: ['Z.AI', ' z.ai ', 42, '', null] } }, recorder())
-    check('providerPins entries are lower-cased, trimmed, deduped and filtered to strings', JSON.stringify(hook.config.providerPins) === '{"m":["z.ai"]}', JSON.stringify(hook.config.providerPins))
-    const none = createFetchPin({ pin: ['deepseek'] }, recorder())
-    check('an absent providerPins is an empty map', JSON.stringify(none.config.providerPins) === '{}', JSON.stringify(none.config.providerPins))
-    check('providerPinFor is empty for unlisted models', JSON.stringify(providerPinFor(none.config, 'any/model')) === '[]')
-
-    check('providersOfText reads a plain JSON document', JSON.stringify(providersOfText('{"provider":"Z.AI"}')) === '["Z.AI"]', JSON.stringify(providersOfText('{"provider":"Z.AI"}')))
-    check('providersOfText reads SSE frames and skips [DONE]', JSON.stringify(providersOfText(`data: {"provider":"Z.AI"}\n\ndata: [DONE]\n\n`)) === '["Z.AI"]')
-    // 只认**顶层**字段：routing 元数据与嵌套的 provider 键不是证据，否则回退网形状里的
-    // attempt 名字会被当成直通证据。
-    const nested = JSON.stringify({ provider: 'Z.AI', routing: { finalProvider: 'x', providerAttempts: [{ provider: 'y', success: true }] }, choices: [{ delta: { provider: 'nested' } }] })
-    check('providersOfText ignores nested provider keys', JSON.stringify(providersOfText(nested)) === '["Z.AI"]', JSON.stringify(providersOfText(nested)))
-    check('providersOfText assembles a JSON split across two data lines', JSON.stringify(providersOfText('data: {"provider":\ndata: "Z.AI"}\n\n')) === '["Z.AI"]')
-    check('providersOfText falls back to whole-text JSON for non-SSE', JSON.stringify(providersOfText('{"provider":"Together"}')) === '["Together"]')
-
-    const pass = judgeProviders(['Z.AI'], ['z.ai'])
-    check('judgeProviders passes the expected provider case-insensitively', pass.ok === true && pass.provider === 'z.ai', JSON.stringify(pass))
-    const fail = judgeProviders(['Together'], ['z.ai'])
-    check('judgeProviders rejects a foreign provider keeping the wire spelling', fail.ok === false && /provider=Together/.test(fail.reason) && fail.culprit?.finalProvider === 'Together', JSON.stringify(fail))
-    const missing = judgeProviders([], ['z.ai'], [JSON.parse(gatewayBody('openai-compatible-private')).choices[0].message.provider_metadata.gateway.routing])
-    check('judgeProviders fails closed on no evidence and names the routing channel', missing.ok === false && /没有顶层 provider 字段/.test(missing.reason) && missing.culprit?.finalProvider === 'openai-compatible-private', JSON.stringify(missing))
-    check('judgeProviders fails closed on no evidence with no routing either', judgeProviders([], ['z.ai']).culprit === null)
-
-    // 0.11.0：请求线钉法（显示名 → slug）。
-    check('providerSlug renders the display name as the wire slug', providerSlug('Z.AI') === 'z-ai' && providerSlug(' z.ai ') === 'z-ai', providerSlug('z.ai'))
-    check('providerSlug keeps hyphenated names intact', providerSlug('openai-compatible-private') === 'openai-compatible-private', providerSlug('openai-compatible-private'))
-    check('providerSlug collapses punctuation runs and trims edges', providerSlug('--a..b--') === 'a-b', providerSlug('--a..b--'))
-    check('providerSlug is empty for punctuation-only names', providerSlug('!!!') === '', JSON.stringify(providerSlug('!!!')))
-    const bare = withProviderOrder({ model: 'm' }, ['z.ai'])
-    check('withProviderOrder writes the slug and kills fallbacks on a bare body', JSON.stringify(bare.body.provider) === '{"order":["z-ai"],"allow_fallbacks":false}' && bare.order.join() === 'z-ai', JSON.stringify(bare))
-    const kept = withProviderOrder({ model: 'm', provider: { order: ['x'] } }, ['z.ai'])
-    check('withProviderOrder respects an existing order', kept.body.provider.order.join() === 'x' && kept.order.length === 0, JSON.stringify(kept))
-    const merged = withProviderOrder({ model: 'm', provider: { quantize: 'fp8' } }, ['z.ai'])
-    check('withProviderOrder merges into an existing provider object', merged.body.provider.quantize === 'fp8' && JSON.stringify(merged.body.provider.order) === '["z-ai"]' && merged.body.provider.allow_fallbacks === false && merged.order.join() === 'z-ai', JSON.stringify(merged))
-    const slugless = withProviderOrder({ model: 'm' }, ['!!!'])
-    check('withProviderOrder no-ops on names that render no slug', slugless.order.length === 0 && slugless.body.provider === undefined, JSON.stringify(slugless))
-    const emptyList = withProviderOrder({ model: 'm' }, [])
-    check('withProviderOrder no-ops on an empty allow list', emptyList.order.length === 0 && emptyList.body.provider === undefined, JSON.stringify(emptyList))
-  }
-
-  // 请求侧：0.11.0 起连请求线一起钉（顶层 provider.order，slug 化）、单列计数、状态文件可读。
-  {
-    const stub = stubFetch(() => new Response(JSON.stringify({ provider: 'Z.AI', choices: [] })))
-    const hook = createFetchPin(CONFIG, recorder())
-    hook.install()
-    const init = glmInit()
-    await globalThis.fetch(CHAT, init)
-    const sent = bodyOf(stub.calls[0])
-    check('a provider-pinned request now carries the wire order', JSON.stringify(sent.provider?.order) === '["z-ai"]' && sent.provider?.allow_fallbacks === false, JSON.stringify(sent.provider ?? null))
-    check('…leaving the rest of the body untouched', sent.model === 'cline-pass/glm-5.3-flash' && sent.providerOptions === undefined && Array.isArray(sent.tools), JSON.stringify(sent))
-    check('…without mutating the original init', JSON.parse(init.body).provider === undefined, String(init.body).slice(0, 120))
-    check('…counted as provider-pinned, not pinned or skipped', hook.counters.providerPinned === 1 && hook.counters.pinned === 0 && hook.counters.skipped === 0, JSON.stringify(hook.counters))
-    check('…and lastProviderPin carries model, expectation and the wire order', hook.state().lastProviderPin?.model === 'cline-pass/glm-5.3-flash' && hook.state().lastProviderPin?.expect?.[0] === 'z.ai' && JSON.stringify(hook.state().lastProviderPin?.order) === '["z-ai"]', JSON.stringify(hook.state().lastProviderPin ?? null))
-    const disk = JSON.parse(fs.readFileSync(STATUS, 'utf8'))
-    check('…and the status file shows the counter and the config', disk.counters?.providerPinned === 1 && disk.providerPins?.['cline-pass/glm-5.3-flash']?.[0] === 'z.ai', JSON.stringify(disk.counters ?? null))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 兕底：providerPins 配了但 slug 推不出 → 请求线没得注入，退回 0.10.0 的纯响应闸。
-  {
-    const stub = stubFetch(() => new Response(JSON.stringify({ provider: 'Together', choices: [] })))
-    const hook = createFetchPin({ pin: [], providerPins: { 'cline-pass/glm-5.3-flash': ['!!!'] } }, recorder())
-    hook.install()
-    const init = glmInit()
-    await globalThis.fetch(CHAT, init)
-    check('a slugless provider pin leaves the request untouched', stub.calls[0].init === init, JSON.stringify(bodyOf(stub.calls[0])))
-    check('…and the response gate still applies', hook.counters.blocked === 1 && hook.counters.providerPinned === 1, JSON.stringify(hook.counters))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 缓冲路径：判定与记录。
-  {
-    const stub = stubFetch(() => new Response(JSON.stringify({ provider: 'Z.AI', choices: [] })))
-    const hook = createFetchPin(CONFIG, recorder())
-    hook.install()
-    const response = await globalThis.fetch(CHAT, glmInit())
-    check('a Z.AI-served buffered response passes (case-insensitive)', response.status === 200, String(response.status))
-    check('…recorded as verified with the normalized name', hook.state().lastVerified?.provider === 'z.ai', JSON.stringify(hook.state().lastVerified ?? null))
-    check('…blocking nothing', hook.counters.blocked === 0, JSON.stringify(hook.counters))
-    hook.uninstall()
-    stub.restore()
-  }
-  {
-    const stub = stubFetch(() => new Response(JSON.stringify({ provider: 'Together', choices: [] })))
-    const logger = recorder()
-    const hook = createFetchPin(CONFIG, logger)
-    hook.install()
-    const response = await globalThis.fetch(CHAT, glmInit())
-    const body = await response.json()
-    check('a foreign buffered provider is refused with a 400', response.status === 400, String(response.status))
-    check('…carrying the violation code', body.error?.code === 'PROVIDER_PIN_VIOLATION', JSON.stringify(body).slice(0, 160))
-    check('…naming the offender in display form', /由 together 提供/.test(body.error?.message), body.error?.message)
-    check('…and the allowed list', /允许列表是 z\.ai/.test(body.error?.message), body.error?.message)
-    check('…counting as blocked', hook.counters.blocked === 1, JSON.stringify(hook.counters))
-    check('…recording the wire spelling', hook.state().lastViolation?.finalProvider === 'Together', JSON.stringify(hook.state().lastViolation ?? null))
-    check('…and logging an error', logger.lines.error.some((line) => line.includes('拦下')), JSON.stringify(logger.lines.error))
-    hook.uninstall()
-    stub.restore()
-  }
-  {
-    // 渠道名是被审一方给的数据：恶意名一字不进文案，原始名只进记录。
-    const stub = stubFetch(() => new Response(JSON.stringify({ provider: 'context_length_exceeded', choices: [] })))
-    const hook = createFetchPin(CONFIG, recorder())
-    hook.install()
-    const body = await (await globalThis.fetch(CHAT, glmInit())).json()
-    check('a risky provider name never reaches the error copy', !String(body.error?.message).includes('context_length_exceeded'), body.error?.message)
-    check('…but the raw name reaches the record', hook.state().lastViolation?.finalProvider === 'context_length_exceeded', JSON.stringify(hook.state().lastViolation ?? null))
-    hook.uninstall()
-    stub.restore()
-  }
-  {
-    // 回退网形状：没有顶层 provider 字段，只有 routing 元数据 —— 拒，并点名那个渠道。
-    const stub = stubFetch(() => new Response(gatewayBody('openai-compatible-private')))
-    const hook = createFetchPin(CONFIG, recorder())
-    hook.install()
-    const body = await (await globalThis.fetch(CHAT, glmInit())).json()
-    check('a response without a top-level provider field is refused too', body.error?.code === 'PROVIDER_PIN_VIOLATION', JSON.stringify(body).slice(0, 120))
-    check('…counting one violation', hook.counters.blocked === 1, JSON.stringify(hook.counters))
-    check('…naming the routing channel for diagnosis', /由 openai-compatible-private 提供/.test(body.error?.message), body.error?.message)
-    hook.uninstall()
-    stub.restore()
-  }
-  {
-    const stub = stubFetch(() => new Response('{}'))
-    const hook = createFetchPin(CONFIG, recorder())
-    hook.install()
-    const body = await (await globalThis.fetch(CHAT, glmInit())).json()
-    check('a response with no evidence at all is refused', body.error?.code === 'PROVIDER_PIN_VIOLATION', JSON.stringify(body).slice(0, 120))
-    check('…with the no-evidence wording', /没能证明来源/.test(body.error?.message), body.error?.message)
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 流式路径：判定方式与渠道钉相同（内容先出，终止帧扣到裁决后）。
-  {
-    const stub = stubFetch(() => frames(providerFrame('Z.AI'), providerFrame('Z.AI'), 'data: [DONE]\n\n'))
-    const hook = createFetchPin(CONFIG, recorder())
-    hook.install()
-    const reader = (await globalThis.fetch(CHAT, glmInit())).body.getReader()
-    const first = new TextDecoder().decode((await reader.read()).value)
-    check('strict provider-pinned streams content before the verdict', first.includes('tok'), JSON.stringify(first))
-    let tail = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      tail += new TextDecoder().decode(value)
-    }
-    check('…releasing the terminator once the provider verdict passes', tail.includes('[DONE]'), JSON.stringify(tail))
-    check('…recording the normalized provider', hook.state().lastVerified?.provider === 'z.ai', JSON.stringify(hook.state().lastVerified ?? null))
-    hook.uninstall()
-    stub.restore()
-  }
-  {
-    const stub = stubFetch(() => frames(providerFrame('InferenceNet'), providerFrame('Together'), 'data: [DONE]\n\n'))
-    const hook = createFetchPin(CONFIG, recorder())
-    hook.install()
-    const { text, error } = await drain(await globalThis.fetch(CHAT, glmInit()))
-    check('a foreign streamed provider still delivers content frames', text.includes('tok'), JSON.stringify(text))
-    check('…but never the terminator', !text.includes('[DONE]'), JSON.stringify(text))
-    check('…and the body fails instead of completing', error !== null && /渠道校验未通过/.test(error.message), String(error?.message))
-    check('…counting one violation naming the first foreign provider', hook.counters.blocked === 1 && hook.state().lastViolation?.finalProvider === 'InferenceNet', JSON.stringify(hook.state().lastViolation ?? null))
-    hook.uninstall()
-    stub.restore()
-  }
-  {
-    const routingOnly = `data: ${gatewayBody('openai-compatible-private')}\n\n`
-    const stub = stubFetch(() => frames(routingOnly, 'data: [DONE]\n\n'))
-    const hook = createFetchPin(CONFIG, recorder())
-    hook.install()
-    const response = await globalThis.fetch(CHAT, glmInit())
-    const { text, error } = await drain(response)
-    // 0.10.0 自动重试：回退形状没有 provider 字段，早期裁决始终悬而未决，取证会一路读到
-    // 终止帧 —— 但没有任何字节交付过，所以照样补发 2 次，最终以 400 拒绝收场（不再走
-    // 「流中断」：中断只在内容已经流出时才有意义，这里内容从未流出）。
-    check('a streamed response without provider fields fails closed', response.status === 400 && error === null && /openai-compatible-private/.test(text), `HTTP ${response.status}: ${text.slice(0, 140)}`)
-    check('…after exhausting the retry budget', hook.counters.retried === 2 && hook.counters.blocked === 1, JSON.stringify(hook.counters))
-    check('…naming the routing channel as the culprit', hook.state().lastViolation?.finalProvider === 'openai-compatible-private', JSON.stringify(hook.state().lastViolation ?? null))
-    check('…and the terminator is withheld too', !text.includes('[DONE]'), JSON.stringify(text))
-    hook.uninstall()
-    stub.restore()
-  }
-  {
-    const stub = stubFetch(() => frames(providerFrame('Together'), 'data: [DONE]\n\n'))
-    const hook = createFetchPin({ ...CONFIG, enforcement: 'warn' }, recorder())
-    hook.install()
-    const req = glmInit()
-    req.headers['x-dsh-session-id'] = 'sess-warn-prov-test'
-    const { text, error } = await drain(await globalThis.fetch(CHAT, req))
-    check('warn streams a foreign provider to the end', error === null && text.includes('tok') && text.includes('[DONE]'), JSON.stringify(text))
-    check('warn still counts and records it', hook.counters.blocked === 1 && hook.state().lastViolation?.finalProvider === 'Together', JSON.stringify(hook.state().lastViolation ?? null))
-    check('warn records foreign provider in lastVerified with warn: true', hook.state().lastVerified?.provider === 'together' && hook.state().lastVerified?.warn === true, JSON.stringify(hook.state().lastVerified))
-    check('warn records foreign provider in verifiedBySession with warn: true', hook.verifiedBySession('sess-warn-prov-test')?.provider === 'together' && hook.verifiedBySession('sess-warn-prov-test')?.warn === true, JSON.stringify(hook.verifiedBySession('sess-warn-prov-test')))
-    hook.uninstall()
-    stub.restore()
-  }
-  {
-    const stub = stubFetch(() => new Response(JSON.stringify({ provider: 'Together', choices: [] })))
-    const hook = createFetchPin({ ...CONFIG, enforcement: 'off' }, recorder())
-    hook.install()
-    const response = await globalThis.fetch(CHAT, glmInit())
-    check('enforcement off passes a foreign provider through unverified', response.status === 200 && hook.counters.blocked === 0 && hook.counters.providerPinned === 1, `status=${response.status}, ${JSON.stringify(hook.counters)}`)
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 未列入 providerPins 的模型在 pin: [] 下仍是普通透传（skipped + NOTHING_TO_PIN）。
-  {
-    const stub = stubFetch(() => new Response('{}'))
-    const logger = recorder()
-    const hook = createFetchPin(CONFIG, logger)
-    hook.install()
-    await globalThis.fetch(CHAT, jsonInit())
-    check('a model without providerPins under an empty pin is still a plain skip', hook.counters.skipped === 1 && hook.counters.providerPinned === 0 && hook.counters.blocked === 0, JSON.stringify(hook.counters))
-    check('…with the pass-through wording', logger.lines.warn.some((line) => line.includes('nothing to pin')), JSON.stringify(logger.lines.warn))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // provider 模式的证据只有 provider 字段：routing 溢出与 routing 内容都不参与判决。
-  {
-    const many = Array.from({ length: 70 }, (_, index) => `data: ${JSON.stringify({ provider: 'Z.AI', routing: { finalProvider: `foreign-${index}` } })}\n\n`).join('')
-    const stub = stubFetch(() => frames(many, 'data: [DONE]\n\n'))
-    const hook = createFetchPin(CONFIG, recorder())
-    hook.install()
-    const response = await globalThis.fetch(CHAT, glmInit())
-    check('routing overflow is irrelevant to the provider verdict', response.status === 200 && hook.counters.blocked === 0, `status=${response.status}, ${JSON.stringify(hook.counters)}`)
-    hook.uninstall()
-    stub.restore()
-  }
-  {
-    const many = Array.from({ length: 70 }, (_, index) => providerFrame(`prov-${index}`)).join('')
-    const stub = stubFetch(() => frames(many, 'data: [DONE]\n\n'))
-    const hook = createFetchPin(CONFIG, recorder())
-    hook.install()
-    const { error } = await drain(await globalThis.fetch(CHAT, glmInit()))
-    check('a provider-field overflow fails closed', error !== null && /超过 64 个各不相同的顶层 provider 字段/.test(String(error?.detail ?? error?.message)), String(error?.message))
-    check('…and counts one violation', hook.counters.blocked === 1, JSON.stringify(hook.counters))
-    hook.uninstall()
-    stub.restore()
-  }
-
-  // 两种钉选并存：请求注入渠道钉，响应必须**两侧**都过关。
-  {
-    const stub = stubFetch(() => new Response(bothBody('deepseek', 'Z.AI')))
-    const hook = createFetchPin(BOTH, recorder())
-    hook.install()
-    const response = await globalThis.fetch(CHAT, jsonInit())
-    check('a model with both lists injects the channel pin', JSON.stringify(only(stub.calls[0])) === '["deepseek"]', JSON.stringify(only(stub.calls[0])))
-    check('…and the provider order rides along on the wire', JSON.stringify(bodyOf(stub.calls[0]).provider?.order) === '["z-ai"]', JSON.stringify(bodyOf(stub.calls[0]).provider ?? null))
-    check('…and counts as pinned, not provider-pinned', hook.counters.pinned === 1 && hook.counters.providerPinned === 0, JSON.stringify(hook.counters))
-    check('…and passes when both evidences agree', response.status === 200 && hook.state().lastVerified?.provider === 'z.ai', `status=${response.status}, ${JSON.stringify(hook.state().lastVerified ?? null)}`)
-    hook.uninstall()
-    stub.restore()
-  }
-  {
-    const stub = stubFetch(() => new Response(bothBody('deepseek', 'Together')))
-    const hook = createFetchPin(BOTH, recorder())
-    hook.install()
-    const refused = await globalThis.fetch(CHAT, jsonInit())
-    check('a foreign wire provider is refused even when routing agrees', refused.status === 400 && /together/.test((await refused.json()).error?.message), String(refused.status))
-    hook.uninstall()
-    stub.restore()
-  }
-  {
-    const stub = stubFetch(() => new Response(bothBody('alibaba', 'Z.AI')))
-    const hook = createFetchPin(BOTH, recorder())
-    hook.install()
-    const refused = await globalThis.fetch(CHAT, jsonInit())
-    check('a foreign routing is refused even when the wire provider agrees', refused.status === 400 && hook.state().lastViolation?.finalProvider === 'alibaba', String(refused.status))
-    hook.uninstall()
-    stub.restore()
-  }
-}
-
-// ── 17. the anonymized channel (0.11.1) ─────────────────────────────────────
-//
-// 2026-10-14 起网关把 VMC 回退网形状的 provider 元数据匿名化为
-// `openai-compatible-private`：渠道钉把它写进允许列表即放行（其余字段照常校验），
-// 并在**会话首条消息**的响应最前面垫一条提示帧。桩网关回放真实形状（routing 全
-// private），断言：放行、首条提示、后续消息不再提示、标题形状不提示、不在允许
-// 列表时照旧拒。
-console.log('\n── 17. the anonymized channel ────────────────────────────')
-{
-  const enc = (text) => new TextEncoder().encode(text)
-  const delta = (text) => `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`
-  const routing = `data: ${gatewayBody('openai-compatible-private')}\n\n`
-  const frames = (...parts) => new Response(new ReadableStream({
-    start(controller) {
-      for (const part of parts) controller.enqueue(enc(part))
-      controller.close()
-    },
-  }), { status: 200, headers: { 'content-type': 'text/event-stream' } })
-
-  async function drain(response) {
-    const parts = []
-    const reader = response.body.getReader()
-    for (;;) {
-      const { done: ended, value } = await reader.read()
-      if (ended) return parts.join('')
-      parts.push(new TextDecoder().decode(value))
-    }
-  }
-  const firstDelta = (text) => {
-    const frame = text.split('\n\n').find((line) => line.startsWith('data: ') && line !== 'data: [DONE]')
-    try { return JSON.parse(frame.slice(6)).choices?.[0]?.delta?.content ?? null } catch { return null }
-  }
-  const ALLOWED = { pin: ['deepseek', 'openai-compatible-private'] }
-  // dsh 真实首条请求的 wire 形状（2026-10-15 playground 实测）：上下文插件（time-context）
-  // 会把快照作为**额外的 user 消息**注进同一条请求 —— 0.11.1 数「非 system 恰 1 条」在它
-  // 面前漏报（真实计数是 2）。提示只在流式 + 无 assistant 历史 + max_tokens > 8192 时垫。
-  const firstTurnInit = (overrides = {}) =>
-    jsonInit({
-      body: JSON.stringify({
-        ...CHAT_BODY,
-        max_tokens: 384000,
-        messages: [
-          { role: 'system', content: 'sys' },
-          { role: 'user', content: 'hi' },
-          { role: 'user', content: 'Time sampled while preparing turn 1, step 1: …' },
-        ],
-        ...overrides,
-      }),
+    const gate = new Promise((resolve) => {
+      release = resolve
     })
+    const { ctx, effects } = applyCtx({ settings, loader: { await: () => gate } })
+    const applied = apply(ctx, { statusFile: statusPath, usage: false })
+    const raced = await Promise.race([applied.then(() => 'returned'), sleep(50).then(() => 'waiting')])
+    check('apply returns while the tree is still loading', raced === 'returned', raced)
+    check('…having written no provider card yet', settings.writes.length === 0, String(settings.writes.length))
+    check('…with provisioning recorded as pending', readStatus(statusPath)?.provision === 'pending', String(readStatus(statusPath)?.provision))
+    release()
+    await sleep(20)
+    check('…and provisioning runs once the tree settles', settings.writes.length === 1, String(settings.writes.length))
+    check('…recording the outcome', readStatus(statusPath)?.provision === 'created', String(readStatus(statusPath)?.provision))
+    for (const dispose of effects) dispose()
+    globalThis.fetch = real
+  }
 
-  // 放行 + 纯净流（不塞伪造 chunk 污染上下文）+ 计数/状态文件
   {
-    const stub = stubFetch(() => frames(delta('你好'), routing, 'data: [DONE]\n\n'))
-    const hook = createFetchPin(ALLOWED, recorder())
-    hook.install()
-    const text = await drain(await globalThis.fetch(CHAT, {
-      ...firstTurnInit(),
-      headers: { ...firstTurnInit().headers, 'x-session-id': 'sess-test-42' },
-    }))
-    check('a private-channel response is verified, not refused', hook.state().lastVerified?.provider === 'openai-compatible-private', JSON.stringify(hook.state().lastVerified))
-    check('counters.anonymized counts it', hook.state().counters.anonymized === 1, String(hook.state().counters.anonymized))
-    check('stream passes through pure gateway content without synthetic notice', !text.includes('⚠️') && firstDelta(text) === '你好', firstDelta(text) ?? '(none)')
-    check('status file records lastAnonymized', JSON.parse(fs.readFileSync(STATUS, 'utf8')).lastAnonymized?.provider === 'openai-compatible-private', 'lastAnonymized')
-    check('verifiedBySession records session provider', hook.verifiedBySession('sess-test-42')?.provider === 'openai-compatible-private', String(hook.verifiedBySession('sess-test-42')?.provider))
-    // 第二条消息（历史里已有 assistant）：内容同样纯净放行
-    const laterInit = jsonInit({ body: JSON.stringify({ ...CHAT_BODY, messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }, { role: 'user', content: 'c' }] }) })
-    const later = await drain(await globalThis.fetch(CHAT, laterInit))
-    check('a later message carries pure gateway content', !later.includes('⚠️') && firstDelta(later) === '你好', firstDelta(later) ?? '(none)')
-    hook.uninstall()
-    stub.restore()
-  }
-  // 0.11.3 回归：真实 wire 形状走 max_completion_tokens: 384000，且完全不带 max_tokens
-  // （@deepseek-ai/dsh-llm-pi-ai 运行时特征）。lastRequestShape 诊断字段在 hook.state() 与 status 文件中同步落盘。
-  {
-    const stub = stubFetch(() => frames(delta('你好'), routing, 'data: [DONE]\n\n'))
-    const hook = createFetchPin(ALLOWED, recorder())
-    hook.install()
-    const { max_tokens: _dropped, ...bodyWithoutMaxTokens } = CHAT_BODY
-    const piAiBody = {
-      ...bodyWithoutMaxTokens,
-      max_completion_tokens: 384000,
-      messages: [
-        { role: 'system', content: 'sys' },
-        { role: 'user', content: 'hi' },
-        { role: 'user', content: 'Time sampled while preparing turn 1, step 1: …' },
-      ],
-    }
-    const text = await drain(await globalThis.fetch(CHAT, jsonInit({ body: JSON.stringify(piAiBody) })))
-    check('0.11.3: max_completion_tokens passes gateway stream cleanly', !text.includes('⚠️') && firstDelta(text) === '你好', firstDelta(text) ?? '(none)')
-    const shape = hook.state().lastRequestShape
-    check('0.11.3: lastRequestShape is recorded in hook.state()', shape !== null && shape?.stream === true && shape?.maxTokens === null && shape?.maxCompletionTokens === 384000, JSON.stringify(shape))
-    check('0.11.3: lastRequestShape records roles sequence', shape?.roles === 'system,user,user', shape?.roles)
-    const disk = JSON.parse(fs.readFileSync(STATUS, 'utf8'))
-    check('0.11.3: status file records lastRequestShape', disk.lastRequestShape?.maxCompletionTokens === 384000, JSON.stringify(disk.lastRequestShape))
-    hook.uninstall()
-    stub.restore()
-  }
-  // 标题请求形状（dsh-base 组合 maxOutputTokens: 4096；流式、无 assistant 历史）
-  {
-    const stub = stubFetch(() => frames(delta('Greeting'), routing, 'data: [DONE]\n\n'))
-    const hook = createFetchPin(ALLOWED, recorder())
-    hook.install()
-    const text = await drain(await globalThis.fetch(CHAT, firstTurnInit({ max_tokens: 4096, messages: [{ role: 'system', content: 'Create a concise title for an AI coding-assistant session.' }, { role: 'user', content: 'hi' }] })))
-    check('a title-shaped request (4096 budget) carries no notice', !text.includes('⚠️') && firstDelta(text) === 'Greeting', firstDelta(text) ?? '(none)')
-    // 0.11.3: 同样验证用 max_completion_tokens: 4096 的标题形状
-    const { max_tokens: _dropped, ...bodyWithoutMaxTokens } = CHAT_BODY
-    const titleBody = {
-      ...bodyWithoutMaxTokens,
-      max_completion_tokens: 4096,
-      messages: [{ role: 'system', content: 'Create a concise title for an AI coding-assistant session.' }, { role: 'user', content: 'hi' }],
-    }
-    const titleText = await drain(await globalThis.fetch(CHAT, jsonInit({ body: JSON.stringify(titleBody) })))
-    check('0.11.3: title request with max_completion_tokens: 4096 carries no notice', !titleText.includes('⚠️') && firstDelta(titleText) === 'Greeting', firstDelta(titleText) ?? '(none)')
-    check('0.11.3: title request lastRequestShape has maxCompletionTokens: 4096', hook.state().lastRequestShape?.maxCompletionTokens === 4096, JSON.stringify(hook.state().lastRequestShape))
-    hook.uninstall()
-    stub.restore()
-  }
-  // 不在允许列表 → 照旧 fail closed（护栏：放行只属于配置显式的允许）。流式路径的
-  // 拒绝形状是**流中断**（HTTP 仍是 200，终止帧被扣），400 只属于缓冲路径 —— 断言错误面。
-  {
-    const stub = stubFetch(() => frames(delta('x'), routing, 'data: [DONE]\n\n'))
-    const hook = createFetchPin({}, recorder())
-    hook.install()
-    const parts = []
-    const reader = (await globalThis.fetch(CHAT, jsonInit())).body.getReader()
-    let streamError = null
-    for (;;) {
-      try {
-        const { done, value } = await reader.read()
-        if (done) break
-        parts.push(new TextDecoder().decode(value))
-      } catch (error) {
-        streamError = error
-        break
-      }
-    }
-    const text = parts.join('')
-    check(
-      'private stays refused when not allowlisted',
-      streamError !== null && !text.includes('[DONE]') && /openai-compatible-private/.test(String(streamError.message ?? streamError)),
-      `error=${String(streamError?.message ?? streamError).slice(0, 80)} delivered=${JSON.stringify(text.slice(0, 40))}`,
-    )
-    hook.uninstall()
-    stub.restore()
-  }
-  // 取消竞态（0.11.1 回归）：消费者（streamedVerification）读到终止帧就收尾并 **cancel**
-  // 提示流，而真网关的连接此时往往还开着 —— 泵的在途 read 回来后不得对已死的 controller
-  // 调 enqueue/close（实测：未处理拒绝能把宿主进程带走）。stub 复刻真网关形状：
-  // [DONE] 在中途 chunk 里到达，之后流**保持打开**一段时间再结束。
-  {
-    const stub = stubFetch(() => new Response(new ReadableStream({
-      start(controller) {
-        controller.enqueue(enc(delta('你好')))
-        controller.enqueue(enc(`${routing}data: [DONE]\n\n`))
-        setTimeout(() => {
-          controller.enqueue(enc(delta('迟到帧')))
-          controller.close()
-        }, 200)
-      },
-    }), { status: 200, headers: { 'content-type': 'text/event-stream' } }))
-    const hook = createFetchPin(ALLOWED, recorder())
-    hook.install()
-    const text = await drain(await globalThis.fetch(CHAT, firstTurnInit()))
-    check('cancel race: the drain still completes cleanly', text.includes('[DONE]') && text.startsWith('data: '), `len=${text.length}`)
-    check('cancel race: verified before the cancel', hook.state().lastVerified?.provider === 'openai-compatible-private' && hook.state().counters.anonymized === 1, JSON.stringify(hook.state().lastVerified ?? null))
-    hook.uninstall()
-    stub.restore()
+    // `provision: false` is reported as off, not as a failure.
+    const real = globalThis.fetch
+    const statusPath = path.join(SCRATCH, 'apply-off.json')
+    const { ctx, effects } = applyCtx({ settings: makeSettings({ providers: {} }) })
+    await apply(ctx, { provision: false, statusFile: statusPath, usage: false })
+    check('provision: false is recorded as off', readStatus(statusPath)?.provision === 'off', String(readStatus(statusPath)?.provision))
+    for (const dispose of effects) dispose()
+    globalThis.fetch = real
   }
 }
 
-// ── 18. warn 模式的告警必须活过状态查询（0.11.4 回归）──────────────────────
+// ── 12. when the observation lands ──────────────────────────────────────────
 //
-// `enforcement: warn` 下唯一的用户可见信号是底部胶囊，而胶囊读 `?status=1`。
-// 查询侧的优先级是 session → **model** → 全局，而 session 级在本机永远是空的
-// （dsh 的上游请求只带 user-agent，见下面那条"记录现状"断言）。于是 warn 分支
-// 只写 session 索引、漏写 model 索引时，这个模型**上一次通过**的记录会盖住新鲜
-// 的告警 —— 胶囊显示"正常"，告警静默。
-//
-// 这个用例的形状就是那个顺序：先让模型 M 通过一次（把 model 索引填上），再让同一个
-// M 走一条违规响应（warn 分支），然后问状态查询要结论。修复前它读到的是旧的通过
-// 记录（warn=false / provider=deepseek），因此**先红后绿**。
-console.log('\n── 18. warn mode survives the status query ───────────────')
-{
-  const enc = (text) => new TextEncoder().encode(text)
-  const delta = (text) => `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`
-  const routingFrame = (provider) => `data: ${gatewayBody(provider)}\n\n`
-  const frames = (...parts) => new Response(new ReadableStream({
-    start(controller) {
-      for (const part of parts) controller.enqueue(enc(part))
+// The provider is known the moment the response is read; the wire model needs a
+// promise over the request body, which can settle much later (a streamed body,
+// or a slow reader). These two blocks hold that split to its contract: the
+// provider is readable at `[DONE]`, the model is patched into the *same* record
+// afterwards, and a late model never lands on a newer observation.
+console.log('\n── 12. observation timing ────────────────────────────────')
+
+/** A request whose body stays open until `release()`, so `requestModel()` cannot settle. */
+function gatedRequest() {
+  let controller = null
+  const stream = new ReadableStream({
+    start(inner) {
+      controller = inner
+    },
+  })
+  const request = new Request(CHAT, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer sk_test' },
+    body: stream,
+    duplex: 'half',
+  })
+  return {
+    request,
+    /** Finish the body, letting the observer's model promise settle. */
+    release: (model) => {
+      controller.enqueue(enc(JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] })))
       controller.close()
     },
-  }), { status: 200, headers: { 'content-type': 'text/event-stream' } })
-  const drain = async (response) => {
-    const reader = response.body.getReader()
-    for (;;) {
-      const { done } = await reader.read()
-      if (done) return
-    }
+  }
+}
+
+/** Read an SSE response only as far as the `[DONE]` frame. */
+async function readToDone(response) {
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    text += decoder.decode(value)
+    if (text.includes('[DONE]')) break
+  }
+  return { text, cancel: () => reader.cancel().catch(() => {}) }
+}
+
+{
+  const statusPath = path.join(SCRATCH, 'status-timing.json')
+  const real = globalThis.fetch
+  const gated = gatedRequest()
+  globalThis.fetch = () => sseResponse([contentFrame(), routingFrame(DEEPSEEK_ROUTING), DONE])
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: statusPath }, recorder())
+  observer.install()
+  try {
+    const read = await readToDone(await globalThis.fetch(gated.request))
+    check(
+      'the provider is readable the moment [DONE] arrives',
+      observer.status().lastVerified?.provider === 'deepseek',
+      JSON.stringify(observer.status().lastVerified),
+    )
+    check(
+      '…and is already in the status file',
+      readStatus(statusPath)?.lastVerified?.provider === 'deepseek',
+      JSON.stringify(readStatus(statusPath)?.lastVerified),
+    )
+    check(
+      '…while the wire model is still unknown (its body is still open)',
+      observer.status().lastVerified?.model === null,
+      JSON.stringify(observer.status().lastVerified?.model),
+    )
+    gated.release('cline-pass/deepseek-v4.1-flash')
+    await sleep(5)
+    check(
+      '…and the model is filled into the same record',
+      observer.status().lastVerified?.provider === 'deepseek' && observer.status().lastVerified?.model === 'cline-pass/deepseek-v4.1-flash',
+      JSON.stringify(observer.status().lastVerified),
+    )
+    check('…which the model index then answers for', observer.verifiedByModel('cline-pass/deepseek-v4.1-flash')?.provider === 'deepseek')
+    read.cancel()
+  } finally {
+    observer.uninstall()
+    globalThis.fetch = real
+  }
+}
+
+{
+  // Two overlapping requests, the first one's body settling last: its late model
+  // must not be stitched onto the second request's observation.
+  const statusPath = path.join(SCRATCH, 'status-race.json')
+  const real = globalThis.fetch
+  const gated = gatedRequest()
+  const anonymous = { finalProvider: 'openai-compatible-private', resolvedProvider: 'openai-compatible-private' }
+  const responses = [() => sseResponse([contentFrame(), routingFrame(DEEPSEEK_ROUTING), DONE]), () => sseResponse([contentFrame(), routingFrame(anonymous), DONE])]
+  let served = 0
+  globalThis.fetch = () => responses[served++]()
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: statusPath }, quiet)
+  observer.install()
+  try {
+    const first = await readToDone(await globalThis.fetch(gated.request))
+    const second = await readToDone(await globalThis.fetch(CHAT, chatInit()))
+    await sleep(5)
+    check('the newest observation wins', observer.status().lastVerified?.provider === 'openai-compatible-private', JSON.stringify(observer.status().lastVerified))
+    check('…with its own model', observer.status().lastVerified?.model === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(observer.status().lastVerified?.model))
+    gated.release('cline-pass/model-of-the-first-request')
+    await sleep(5)
+    check(
+      'a late model does not overwrite the newer observation',
+      observer.status().lastVerified?.provider === 'openai-compatible-private',
+      JSON.stringify(observer.status().lastVerified),
+    )
+    check('…nor replace its model', observer.status().lastVerified?.model === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(observer.status().lastVerified?.model))
+    check('…and the stale model is not indexed', observer.verifiedByModel('cline-pass/model-of-the-first-request') === undefined)
+    first.cancel()
+    second.cancel()
+  } finally {
+    observer.uninstall()
+    globalThis.fetch = real
+  }
+}
+
+// ── 13. the status file carries no secret material ─────────────────────────
+//
+// The README promises the status file holds no key and no request headers, and
+// this is the assertion behind that sentence. The file is searched as *text*, so
+// any future change that starts copying headers, credentials or an options bag
+// into the payload turns it red without anyone having to list fields.
+//
+// (The one header value the contract does record is the session id, which is not
+// a secret and is indexed on purpose — this block sends none, so the claim can be
+// stated without exceptions.)
+console.log('\n── 13. no secret material ────────────────────────────────')
+{
+  const SECRET = 'sk-clinepass-DO-NOT-ECHO-9f3a2b7c4d5e6f'
+  const API_KEY = 'ck-api-key-DO-NOT-ECHO-1122334455'
+  const COOKIE = 'cookie-value-DO-NOT-ECHO-abcdef'
+  const BUILD = 'client-build-DO-NOT-ECHO-7c7c7c'
+  const statusPath = path.join(SCRATCH, 'status-secrets.json')
+  const real = globalThis.fetch
+  globalThis.fetch = () => sseResponse([contentFrame(), routingFrame(DEEPSEEK_ROUTING), DONE])
+  const observer = createFetchObserver({ upstream: GATEWAY, statusFile: statusPath }, quiet)
+  const handler = createUsageHandler({}, withDefaults({ usageCacheMs: 0 }), quiet, { hook: observer })
+  observer.install()
+  try {
+    const response = await globalThis.fetch(CHAT, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${SECRET}`,
+        'x-api-key': API_KEY,
+        cookie: `dsh=${COOKIE}`,
+        'x-client-build': BUILD,
+      },
+      body: JSON.stringify({ model: 'cline-pass/deepseek-v4.1-flash', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+    })
+    await response.text()
+    await sleep(5)
+  } finally {
+    observer.uninstall()
+    globalThis.fetch = real
   }
 
-  const MODEL = CHAT_BODY.model
-  const cfg = withDefaults({ pin: ['deepseek'], enforcement: 'warn' })
-  const hook = createFetchPin(cfg, recorder())
-  const handler = createUsageHandler({}, cfg, recorder(), { hook })
-  const status = async () =>
-    (await handler(new Request(`http://127.0.0.1:3080/api/clinepass.usage?status=1&model=${encodeURIComponent(MODEL)}`))).json()
-
-  // 同一个模型先通过、再违规 —— 渠道由这个变量切换，stub 与 hook 的安装顺序不动。
-  let provider = 'deepseek'
-  const stub = stubFetch(() => frames(delta('ok'), routingFrame(provider), 'data: [DONE]\n\n'))
-  hook.install()
-
-  await drain(await globalThis.fetch(CHAT, jsonInit()))
-  const passed = await status()
-  check('warn mode: a passing response is what the status query reports', passed.warn === false && passed.provider === 'deepseek', JSON.stringify(passed))
-
-  provider = 'together'
-  await drain(await globalThis.fetch(CHAT, jsonInit()))
-  const warned = await status()
+  const text = fs.readFileSync(statusPath, 'utf8')
+  const present = (needles) => needles.filter((needle) => text.includes(needle))
+  // Positive control first: searching an empty document for absent strings would
+  // pass while proving nothing.
+  check('the status file was written and describes the turn', text.includes('deepseek') && text.includes('cline-pass/deepseek-v4.1-flash'), JSON.stringify(text.slice(0, 80)))
+  check('…and carries none of the request credentials', present([SECRET, API_KEY, COOKIE]).length === 0, JSON.stringify(present([SECRET, API_KEY, COOKIE])))
   check(
-    'warn mode: the fresh warn entry is not shadowed by the earlier pass',
-    warned.warn === true && warned.provider === 'together',
-    JSON.stringify(warned),
+    '…nor any request header (name, prefix or value)',
+    present(['authorization', 'Authorization', 'Bearer', 'x-api-key', 'cookie', 'x-client-build', BUILD]).length === 0,
+    JSON.stringify(present(['authorization', 'Authorization', 'Bearer', 'x-api-key', 'cookie', 'x-client-build', BUILD])),
   )
-  check('warn mode: the per-model index carries the warn entry too', hook.verifiedByModel(MODEL)?.warn === true, JSON.stringify(hook.verifiedByModel(MODEL) ?? null))
-  check('warn mode: a non-anonymized violation leaves lastAnonymized alone', hook.state().lastAnonymized === null, JSON.stringify(hook.state().lastAnonymized ?? null))
-
-  // 记录现状（不是验证正确）：dsh 给上游的请求只带 `user-agent`（dsh-llm 的
-  // attributionHeaders() 只设它），没有任何会话头 —— 所以 session 索引在本机永远
-  // 是空的，`?status=1` 实际只能靠 model 索引或全局兜底。§17 里那条 `x-session-id`
-  // 断言测的是**提取逻辑本身**，不代表线上会走到那条分支。
-  check(
-    'recorded reality: dsh sends no session header, so the session index stays empty',
-    hook.state().lastVerified?.sessionId === null && hook.verifiedBySession('sess-test-42') === undefined,
-    JSON.stringify({ sessionId: hook.state().lastVerified?.sessionId ?? null, lookup: hook.verifiedBySession('sess-test-42') ?? null }),
-  )
-
-  hook.uninstall()
-  stub.restore()
+  // The browser half is served from the same state, so it gets the same search.
+  const bodyText = await (await handler(new Request('http://127.0.0.1:3080/api/clinepass.usage?status=1&model=cline-pass/deepseek-v4.1-flash'))).text()
+  const leakedInBody = [SECRET, API_KEY, COOKIE, BUILD, 'authorization', 'x-api-key'].filter((needle) => bodyText.includes(needle))
+  check('?status=1 still answers with the provider', JSON.parse(bodyText).provider === 'deepseek', bodyText)
+  check('…and its body carries no credential or header either', leakedInBody.length === 0, JSON.stringify(leakedInBody))
 }
 
 console.log(`\nRESULT: ${failures.length === 0 ? 'FETCH OK' : `FAILED (${failures.join(' | ')})`}`)

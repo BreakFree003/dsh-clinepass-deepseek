@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.12.0
+
+**插件只剩两件事：观察真实 Provider、画 Cline Pass 用量卡。** 这是一个删减版本，不是
+增量版本：请求侧的钉选/门禁/重试整块拿掉了，因为它们在 2026-10-16 已经无事可做 ——
+`cline-pass/deepseek-v4.1-flash` 由订阅路由**第一方**直连 deepseek 提供（
+`system_fingerprint` 与官方 `api.deepseek.com` 逐字相同、64 块对齐的 prefix cache 记账、
+UUID 形状的 provider id），本地钉选改变不了任何结果；剩下的只是每次请求多一段
+`providerOptions.gateway.only` 装饰，和一份需要维护的判定/重试代码。
+
+删了什么（以及为什么不再需要）：
+
+- **请求改写**：`withPin` / `pinnedBody` / `withProviderOrder` / `pinFor` /
+  `providerPinFor` / `providerSlug` / `NOTHING_TO_PIN`，以及 `rewrite()` 的整个 pin
+  分支。网关自 2026-09-22 起不执行 `providerOptions.gateway.only`；钉真渠道、钉假渠道、
+  完全不钉，响应体逐字相同。现在 wrapper 是**纯观察者**：input/init/headers/body 一个
+  字节都不改，不重试，不拦，不另发请求。
+- **裁决与门禁**：`judgeRouting(s)` / `judgeProviders` / `judgeEvidence` /
+  `earlyVerdict` / `offenderOf` / `displayableChannel` / `expectedList` /
+  `CHANNEL_SLUG` / `CHANNEL_RISKY`、`enforcement`（strict/warn/off）、自动重试
+  （`retries`）、`violations` / `lastViolation` / `lastUnverified` / `lastSkipped` /
+  `lastRequestShape`，以及 `blocked`/`retried`/`pinned`/`providerPinned`/`unverified`
+  计数器。没有「允许列表」就没有可判的违规，也就没有需要 fail-closed 的东西；订阅路由
+  今天返回的渠道名是真实的（`deepseek`）或匿名标签（`openai-compatible-private`），
+  两者都只是**要显示的事实**，不是要处置的错误。
+- **配置键**：`pin` / `pins` / `providerPins` / `enforcement` / `retries`。观察没有可
+  配置的行为。旧行照常加载：这些键被忽略并记录进状态文件的 `ignoredOptions`（不刷警告，
+  否则每一行遗留配置都会在每次启动时叫一次）。
+- **prompt 改写**：`installPromptDisplay` / `PERSONA_SECTIONS` / `withoutRoutePrefix`
+  与 `plainModelId`。persona 里的 `cline-pass/` 前缀显示问题已不再由插件处理。
+- **effort 改写**：`EFFORT_LEVELS` / `EFFORT_MAP` / `RETIRED_EFFORTS` /
+  `alignReasoningEffort`。插件不再写 `agent-default-model.reasoningEffort`（effort 由
+  profile 补丁显式给 `high`），也不再往 provider 卡片上写 `reasoningEfforts` —— 卡片
+  上现有的档位声明原样保留，插件不再碰它。
+- **客户端门禁文案**：胶囊里 warn/reason/⚠️ 那一套分支与文案。
+
+还剩什么（行为不许退化的部分）：
+
+- `createFetchPin` → **`createFetchObserver(config, logger)`**。计数器收敛为
+  `{ seen, verified, anonymized, unknown }`：观察到的 chat 请求 / 读出了真实 provider /
+  真实 provider 是匿名标签 / 响应里根本没有 provider 元数据。传输失败与取消的流只计
+  `seen` —— 没有观测到结论，也就没有可归因的答案。
+- 状态文件（同路径、同 tmp+rename 原子写）：
+  `{ service, transport, hook, provision, provisionReason, upstream, profileBaseURL,
+  counters, lastVerified, lastAnonymized, ignoredOptions, pid, at }`，
+  `lastVerified = { at, url, provider, model, sessionId, anonymized }`，按
+  session → model 两级记忆。
+- `?status=1` 返回 `{ ok: true, provider, anonymized, model, sessionId, at }`；还没观测到
+  任何东西时返回 `{ ok: false, reason: 'no-observation' }`（胶囊显示 `Provider: --`）。
+- provider 解析沿用实测有效的那套：routing 元数据（`finalProvider` →
+  `resolvedProvider` → `affinity.pinnedProvider` → 成功过的 `providerAttempts[].provider`）
+  → wire 顶层 `provider` 字段 → `provider_metadata.<x>` 命名空间键（最后一条线索）。
+- 逐帧转发：SSE 响应由 pass-through 流承载，`pull` 按背压逐帧取、逐帧放，读到终止帧就
+  收尾（网关不保证关流）。**没有整包缓冲** —— `checks/dsh-clinepass-buffering-repro.mjs`
+  就是钉这件事的。
+- 用量链（`normalizeUsage` / `fetchUsage` / `createUsageHandler` / `installUsageRoute`）、
+  provider 卡片登记（`llm-pi-ai.providers.cline-pass`）与 `__DSH_CLINEPASS__` 注入不变。
+
+行为变化（值得知道的）：
+
+- 胶囊只显示 provider 名，不再有 ⚠️/原因/reason 字段；匿名渠道仍是告警配色 + 说明性
+  tooltip。
+- 观察者不会因为响应「由别家提供」而拒绝或重试任何东西 —— 它本来也不会。
+- 非流式响应现在**原样返回**（证据从 `clone()` 读），不再被「读完再重建」。
+
 ## 0.11.4
 
 Strict review of 0.11.3 found that two of its three headline claims did not hold in
