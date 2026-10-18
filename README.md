@@ -146,6 +146,31 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
 | `usageCacheMs` | `60000` | 成功读取的缓存时长；`0` = 每次重取（失败只缓存 5 秒） |
 | `statusFile` | `<DSH_HOME>/dsh-clinepass-status.json` | 观察结果落盘处；给字符串换路径，`false` 关掉 |
 
+## in-history system 快照（配套 profile 补丁）
+
+DSH 默认把 `openai-completions` 路由当 leading-only：系统提示词一变就改写头部、重开请求序列。
+pi-ai 的转录层其实支持会话中途 system 消息（实测网关接受，且前缀缓存仍命中），但
+`@deepseek-ai/dsh-llm-pi-ai` 的 `COMPLETIONS_COMPAT_GATE` 把 `supportsMidConvoSystemMessages`
+标成 `withhold` —— 配置层直接写会抛 `PiAiCatalogError`。所以本机做法是两件事一起：
+
+1. profile 的 `llm-pi-ai.providers.cline-pass.models[].compat` 写
+   `supportsMidConvoSystemMessages: true`；
+2. 用本包的 `patch-inhistory.mjs` 把门禁那一行改成 `offer`：
+
+   ```bash
+   node <profile>/node_modules/dsh-clinepass/patch-inhistory.mjs --check   # 0=已打，1=未打
+   node <profile>/node_modules/dsh-clinepass/patch-inhistory.mjs           # 幂等应用，自动备份
+   node <profile>/node_modules/dsh-clinepass/patch-inhistory.mjs --revert  # 还原成 withhold
+   ```
+
+3. 改完重启 dsh web。
+
+**为什么不做成运行时行为**：这个标志被消费两处 —— 配置门禁（决定 YAML 能不能写）和
+pi-ai 模型对象的 `compat`（决定转录层保留还是折叠中途 system 消息）。插件拿不到模型对象，
+`ctx.llm.registerAdapter()` 也不允许接管已注册的 `cline-pass` 路由；唯一入口是 boot 前的源码补丁。
+**升级会重装 node_modules**，所以升级后先 `--check`，未打就重跑，再起服务 ——
+YAML 那行还在而补丁没了，启动会直接失败。
+
 ## 迁移（0.11.x → 0.12.x）
 
 **0.12.0 是删减版**，请求侧整块没了：

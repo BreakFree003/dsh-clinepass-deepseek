@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.12.3
+
+**新增 `patch-inhistory.mjs`：把 cline-pass 的 in-history 开关做成可巡检的一步。**
+
+- 背景：`@deepseek-ai/dsh-llm-pi-ai` 的 `COMPLETIONS_COMPAT_GATE` 默认把
+  `supportsMidConvoSystemMessages` 标成 `withhold`，profile 里直接声明会抛
+  `PiAiCatalogError: not configurable here`。本机要开只能改 `node_modules` 那一行，
+  而升级/重装会把它冲掉。
+- 脚本三种模式：
+  - `--check`：同时检查「门禁补丁 + profile compat 位」。0 = 整套在位；
+    1 = 未生效或不一致（门禁 withheld 而 profile 位还开着时明确报 `BROKEN`，提示下次启动会失败）；
+    2 = 上游锚点漂移（拒绝写入）。
+  - 默认：幂等打补丁，自动备份；profile 位缺失时给出提示但不改 YAML。
+  - `--revert`：profile 位还开着时**拒绝**执行（exit 3），避免自己制造启动失败；
+    `--force` 才还原。
+- 锚点要求 `COMPLETIONS_COMPAT_GATE` 的那对行恰好出现一次，上游改形状时直接报错。
+- README 新增「in-history system 快照（配套 profile 补丁）」一节，说明为什么不能做成运行时行为。
+- `package.json` 的 `files` 把脚本包进发布物。
+- **代码未变**：`index.js` / `client.js` 与 0.12.2 逐字节相同。
+
 ## 0.12.2
 
 **恢复 persona 里的裸模型 id 显示** —— 0.12.0 把它连同请求侧的钉选一起删掉了，那是误删：
