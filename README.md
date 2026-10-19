@@ -23,7 +23,7 @@
 
 ```bash
 dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1
-# 钉某个 tag：同上，末尾加 #v0.12.0
+# 钉某个 tag：同上，末尾加 #v0.12.4
 ```
 
 包自己声明了 `dsh.bundle.patch`，所以 `dsh plugin`（pnpm 的转发器）装上它之后会把这个包追加到
@@ -171,6 +171,48 @@ pi-ai 模型对象的 `compat`（决定转录层保留还是折叠中途 system 
 **升级会重装 node_modules**，所以升级后先 `--check`，未打就重跑，再起服务 ——
 YAML 那行还在而补丁没了，启动会直接失败。
 
+## 网关路由钉选（1017 快照专用）
+
+`providerOptions.gateway.only` 在两条 cline-pass 路由上行为**不同**，别把结论混用：
+
+- `cline-pass/deepseek-v4.1-flash`（稳定别名）：网关**无视**该字段。它的服务端模型属性带
+  `model_properties_override.providerOptions.gateway.order = [deepseek, fireworks]`，
+  客户端写 `only: ['__no_such_upstream__']` 也照常 200、仍落 `deepseek`。
+- `cline-pass/deepseek-v4.1-flash-1017`（日期快照）：网关**执行**该字段。`only: ['deepseek']`
+  时 `finalProvider=deepseek`、`fallbacksAvailable=[]`、`planningReasoning` 带
+  `Provider set restricted to: deepseek.`；写一个不存在的渠道直接
+  500 `No available providers match the 'only' filter`；`only: ['fireworks']` 就真落 fireworks。
+  所以它是**硬钉**：DeepSeek 不可用时请求失败，不回落。
+
+2026-10-19 实测（同一把 key，每项 2 次采样）。上游是否真是 DeepSeek 看
+`provider_metadata.deepseek.systemFingerprint`（1017 仍是 `e72d3c7f…`）；顶层
+`system_fingerprint` 是网关每次 mint 的 `fp_…`，随请求变，不能当上游指纹用。
+
+在 1017 上钉第一方 DeepSeek，两件事一起：
+
+1. profile 的 1017 模型行写 `compat.vercelGatewayRouting.only: [deepseek]`（pi-ai 从模型的
+   `compat` 读，写进请求体）。目前实测生效的只有这个形状；`gateway.order`（只改规划顺序、
+   压不过 `clientSessionId` 的会话亲和）/ `allow` / `pinnedProvider` / 顶层 `provider.only` /
+   `model_properties_override` 在稳定别名上都被忽略，1017 上只验证了 `only`。
+2. 用本包的 `patch-gateway-routing.mjs` 打开门禁：
+
+   ```bash
+   node <profile>/node_modules/dsh-clinepass/patch-gateway-routing.mjs --check   # 0=整套在位
+   node <profile>/node_modules/dsh-clinepass/patch-gateway-routing.mjs           # 幂等应用，自动备份
+   node <profile>/node_modules/dsh-clinepass/patch-gateway-routing.mjs --revert  # YAML 还在用 pin 时拒绝，--force 才还原
+   ```
+
+   它只改 `@deepseek-ai/dsh-llm-pi-ai/lib/index.js` 里
+   `vercelGatewayRouting: "withhold"` 这一行（→ `"offer"`），锚点必须恰好出现一次，
+   上游改形状就报错、不写入。
+3. 改完重启 dsh web。
+
+**为什么不做成运行时行为**：与 in-history 开关同因 —— 这个标志被配置门禁消费，门禁在 boot 前跑；
+插件既拿不到 `pi-ai` 的模型对象，也不能接管已注册的 `cline-pass` 路由。**升级/重装会重装
+node_modules**：补丁被冲掉后 YAML 的 `vercelGatewayRouting` 会让配置加载直接抛
+`PiAiCatalogError`（服务起不来）—— 升级后先 `--check`，未打就重跑，再起服务。
+`~/.config/dsh-web/start.sh` 不会自动重打。
+
 ## 迁移（0.11.x → 0.12.x）
 
 **0.12.0 是删减版**，请求侧整块没了：
@@ -180,10 +222,15 @@ YAML 那行还在而补丁没了，启动会直接失败。
   `ignoredOptions`（不刷警告，否则每个没清理的旧行都会在每次启动时叫一次）。更早的端口时代键
   （`transport` / `listen` / `captureDir` / `address` / `baseURL`）同样忽略，但会各警告一次。
   0.12.0 曾把 `plainModelId` 一起归进这份遗留名单，那是误删；0.12.2 起它又是真选项。
-- **为什么不再需要钉选**：2026-10-16 复测，订阅路由上的 `deepseek` 已由第一方服务（响应里的上游
-  `system_fingerprint` 与官方 `api.deepseek.com` 逐字相同、prefix cache 是 64 块对齐记账、
-  provider id 是 UUID 形状）。本地钉选改变不了任何结果，只剩每次请求多一段装饰字段。证据见
-  [`../clinepass-deepseek-audit/README.md`](../clinepass-deepseek-audit/README.md) §九。
+- **请求侧钉选**：0.12.0 删掉的是插件自带的请求改写与校验 —— 对稳定别名它确实无效
+  （2026-10-19 复测：写 `only: ['__no_such__']` 仍 200、落 `deepseek`；落点由服务端
+  `model_properties_override.providerOptions.gateway.order` 决定）。但 1017 日期快照没有这条
+  服务端覆盖，网关会执行 `only` —— 要钉它请用上面「网关路由钉选」那套
+  （profile compat + `patch-gateway-routing.mjs`），插件本身仍然不碰请求。
+  指纹怎么读：审计 §九/§十二 的「与官方逐字相同」比的是
+  `provider_metadata.deepseek.systemFingerprint`；顶层 `system_fingerprint` 是网关每请求 mint 的
+  `fp_…`（2026-10-19 采样两请求都不同），不要拿它判断上游。证据见
+  [`../clinepass-deepseek-audit/README.md`](../clinepass-deepseek-audit/README.md) §九、§十二、§十三。
 - **effort**：插件不再写 `agent-default-model.reasoningEffort`，也不再往卡片上写
   `reasoningEfforts` / `reasoning`。想固定思考档就在自己的 profile 补丁里显式给（例：
   `agent-default-model` 写 `reasoningEffort: high`），并在卡片里声明档位与默认档
@@ -232,8 +279,11 @@ node smoke-test.mjs [--negative]     # 活体：检查状态文件 + 真实网�
   就变了（dsh 的 TPS 测量正是从它来的）。
 - `checks/dsh-clinepass-streaming-gate-check.mjs` 用**真实 OpenAI SDK** 走一遍安装后的观察者：
   请求原样到达、流仍能装配出完整消息、同一个响应里的上游仍被读出来。
-- `smoke-test.mjs --negative` 会故意要一个不存在的渠道，用来复述「请求侧钉选为什么在 0.12.0 被删」：
-  网关无视那个字段。
+- `smoke-test.mjs --negative` 会故意要一个不存在的渠道。默认打稳定别名：网关无视该字段
+  （200、仍落 `deepseek`），所以断言 PASS —— 这正是 0.12.0 删掉请求改写器的理由。
+  用 `MODEL_ID=cline-pass/deepseek-v4.1-flash-1017` 跑同一条会 **FAIL**
+  （500 `No available providers match the 'only' filter`）：那不是回归，是 1017 快照真的执行
+  `only`。这条负控制只对稳定别名成立。
 
 ### 状态文件
 
@@ -283,8 +333,11 @@ Cline Pass usage card** on Settings → Models.
 
 **It never rewrites a request.** No body, no headers, no retries, no extra calls; SSE bodies are
 forwarded frame by frame, never buffered. 0.12.0 removed the request-side channel pin, enforcement,
-retries and violation bookkeeping, because the subscription route's `deepseek` is served first-party
-(same upstream `system_fingerprint` as `api.deepseek.com`, 64-token-aligned prefix-cache accounting).
+retries and violation bookkeeping: the stable alias's `deepseek` landing is decided server-side
+(`model_properties_override.providerOptions.gateway.order`) and client fields are ignored there.
+The dated `…-1017` snapshot is different — the gateway enforces
+`providerOptions.gateway.only` on it, so pinning is a profile-side `compat` plus a boot-time gate
+patch (`patch-gateway-routing.mjs`); see 「网关路由钉选」.
 Legacy keys (`pin`, `pins`, `providerPins`, `enforcement`, `retries`, `alignReasoningEffort`) still
 load — they are ignored and listed in the status file's `ignoredOptions`.
 

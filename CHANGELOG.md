@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.12.4
+
+**新增 `patch-gateway-routing.mjs`：把 1017 快照的「硬钉第一方 DeepSeek」做成可巡检的一步。**
+
+- 背景：`cline-pass/deepseek-v4.1-flash-1017` 这条日期快照没有服务端
+  `model_properties_override.providerOptions.gateway.order`，网关会执行
+  `providerOptions.gateway.only`；稳定别名则相反（`only` 被忽略，落点由服务端 order 决定）。
+  要在 1017 上钉 DeepSeek，profile 需写 `compat.vercelGatewayRouting.only: [deepseek]`，
+  而 `@deepseek-ai/dsh-llm-pi-ai` 的 `COMPLETIONS_COMPAT_GATE` 默认把
+  `vercelGatewayRouting` 标成 `withhold`，不补门禁配置加载会抛 `PiAiCatalogError`。
+- 脚本只改 `lib/index.js` 里 `vercelGatewayRouting: "withhold"` 这一行（→ `"offer"`），
+  锚点必须恰好出现一次；三种模式与 `patch-inhistory.mjs` 一致：`--check`（0=active /
+  1=未生效或不一致 / 2=锚点漂移）、默认幂等应用并自动备份、`--revert`
+  （YAML 的 pin 还在用 `vercelGatewayRouting` 时拒绝，`--force` 才还原）。
+- 与 in-history 相同有启动依赖：升级/重装把补丁冲掉后，YAML 的 pin 会让配置加载直接失败 ——
+  升级后先 `--check` 再起服务。
+- README 新增「网关路由钉选（1017 快照专用）」一节；「迁移」与「验证」改成按模型区分的实测结论
+  （别名的 `only` 无效、1017 的 `only` 是硬钉；`--negative` 只对别名成立）。
+- `package.json` 的 `files` 把脚本包进发布物。
+
 ## 0.12.3
 
 **新增 `patch-inhistory.mjs`：把 cline-pass 的 in-history 开关做成可巡检的一步。**
