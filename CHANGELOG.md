@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.12.6
+
+**补记两个模型的 API 行为对照（文档，无代码变更）。**
+
+- README 新增「两个模型的 API 行为对照（2026-10-19 实测）」：普通对话、`reasoning_effort`
+  （high/max/low）、OpenAI tools、图片输入、会话中途 system、`max_tokens` 200k/400k 两个模型都
+  200（能力面一致）；差异集中在回显 slug、fallback 池（18 vs 14）、`only` 是否执行（别名忽略 /
+  1017 执行且有硬钉能力），以及卡片 maxTokens 不参与网关校验。
+- 明确记录：落点由网关 affinity 漂移，未钉的 1017 也可能落到 pareto/fireworks；只有
+  `provider_metadata.deepseek.systemFingerprint` 能证明上游（两者均为 `e72d3c7f…`）。
+- `clinepass-deepseek-audit/README.md` §十四 收录原始矩阵与采样；升级说明 §6.4 加交叉引用。
+- `index.js` / `client.js` / 卡片数据与 0.12.5 逐字节相同。
+
 ## 0.12.5
 
 **随包卡片与安装器补上 `cline-pass/deepseek-v4.1-flash-1017`：下载即可选，不依赖本机 profile。**

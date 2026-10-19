@@ -1,6 +1,6 @@
 {
   "name": "dsh-clinepass",
-  "version": "0.12.5",
+  "version": "0.12.6",
   "description": "Cline Pass for DeepSeek Harness: an OpenAI-compatible provider route that provisions itself on Settings → Models, reports the real upstream provider it sees in the gateway's chat responses (composer pill + status file), draws the Cline Pass usage card, and keeps the route's transport prefix out of the model-facing prompt. It never rewrites a request.",
   "type": "module",
   "main": "index.js",

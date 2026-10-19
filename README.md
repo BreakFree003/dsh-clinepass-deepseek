@@ -23,7 +23,7 @@
 
 ```bash
 dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1
-# 钉某个 tag：同上，末尾加 #v0.12.5
+# 钉某个 tag：同上，末尾加 #v0.12.6
 ```
 
 包自己声明了 `dsh.bundle.patch`，所以 `dsh plugin`（pnpm 的转发器）装上它之后会把这个包追加到
@@ -228,6 +228,36 @@ YAML 那行还在而补丁没了，启动会直接失败。
 node_modules**：补丁被冲掉后 YAML 的 `vercelGatewayRouting` 会让配置加载直接抛
 `PiAiCatalogError`（服务起不来）—— 升级后先 `--check`，未打就重跑，再起服务。
 `~/.config/dsh-web/start.sh` 不会自动重打。
+
+## 两个模型的 API 行为对照（2026-10-19 实测）
+
+两条路由共用同一个网关、同一把 key。**能力面相同，路由面不同**（每项 2 次采样，`stream: true`，
+`POST /api/v1/chat/completions`）：
+
+| 维度 | `…-flash`（稳定别名） | `…-flash-1017`（日期快照） |
+|---|---|---|
+| 回显 `model` | `deepseek/deepseek-v4.1-flash` | `deepseek/deepseek-v4.1-flash-1017` |
+| 普通对话 / 流式 | 200 | 200 |
+| `reasoning_effort`（high / max / low） | 全 200；usage 里带 `reasoning_tokens` | 全 200；同上 |
+| 工具调用（OpenAI `tools`） | 200，`finish_reason=tool_calls` | 200，同上 |
+| 图片输入（data URL） | 200 | 200 |
+| 会话中途 system 消息 | 200，遵从后一条 system | 200，同上 |
+| `providerOptions.gateway.only` | **忽略**（假渠道也 200） | **执行**（假渠道 500、硬钉无回落） |
+| 未钉时的 fallback 池 | 18 个 provider | 14 个 provider |
+| 上游指纹 | `provider_metadata.deepseek.systemFingerprint`，仅落 deepseek 时可见 | 同 |
+| 卡片 `maxTokens` | 131072 | 384000 |
+
+补充说明：
+
+- `max_tokens` 在网关上**不按卡片值校验**：两个模型发 200000 / 400000 都返回 200（不代表真能生成
+  那么长，卡片值是客户端预算，不是网关上限）。
+- 落点会漂：别名那 18 个 fallback 的池子按 affinity 轮换，同一批采样里先在 deepseek、随后 3/3 落
+  `fireworks`；1017 未钉时也出现过 `finalProvider=pareto`。所以「未钉也能用」成立，
+  「未钉也稳定在第一方」不成立 —— 这正是 1017 值得钉的原因。
+- 只有 `provider_metadata.deepseek.systemFingerprint` 能证明上游是 DeepSeek（两模型都是
+  `e72d3c7f…`）；顶层 `system_fingerprint` 是网关每请求 mint 的 `fp_…`。
+- 图片用例只验证了**接受度**（1×1 PNG；小图上的颜色回答并不稳定）；context window（921600）与
+  TPS 没有测 —— 要真实填满上下文成本太高。
 
 ## 迁移（0.11.x → 0.12.x）
 
