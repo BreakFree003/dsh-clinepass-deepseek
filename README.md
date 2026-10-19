@@ -333,7 +333,7 @@ node smoke-test.mjs [--negative]     # 活体：检查状态文件 + 真实网�
 
 > pi 侧有一个行为镜像插件：`~/Documents/Projects/pi-clinepass-dsh`。**每个版本发完后必须同步
 > 过去**（模型/compat/观察器 + `check.mjs`），并更新 pi README 的 `Synced with` 标记 ——
-> 步骤见 [`RELEASING.md`](RELEASING.md) §7，规则见 [`AGENTS.md`](AGENTS.md)。
+> 步骤与规则见 [`RELEASING.md`](RELEASING.md) §7。
 
 ### 状态文件
 

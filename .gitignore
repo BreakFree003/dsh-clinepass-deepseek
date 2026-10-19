@@ -16,3 +16,6 @@ dsh-clinepass-status.json
 
 # macOS
 .DS_Store
+
+# Local agent instructions — not part of the published package
+/AGENTS.md
