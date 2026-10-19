@@ -87,3 +87,15 @@
             reasoningEfforts:
               high: high
               max: max
+          # 2026-10-17 的日期快照。这里刻意不写 compat.vercelGatewayRouting：
+          # 门禁未打时写它会抛 PiAiCatalogError（启动失败）。不钉也能用（网关按
+          # 服务端 order 选路）；要硬钉第一方 DeepSeek 就自己声明这一行并加兼容位，
+          # 再跑 patch-gateway-routing.mjs（README「网关路由钉选」）。
+          - id: cline-pass/deepseek-v4.1-flash-1017
+            name: DeepSeek V4.1 Flash 1017
+            contextWindow: 921600
+            maxTokens: 384000
+            input: [text, image]
+            reasoningEfforts:
+              high: high
+              max: max

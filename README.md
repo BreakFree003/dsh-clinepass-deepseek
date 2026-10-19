@@ -23,7 +23,7 @@
 
 ```bash
 dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1
-# 钉某个 tag：同上，末尾加 #v0.12.4
+# 钉某个 tag：同上，末尾加 #v0.12.5
 ```
 
 包自己声明了 `dsh.bundle.patch`，所以 `dsh plugin`（pnpm 的转发器）装上它之后会把这个包追加到
@@ -86,6 +86,17 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
             name: DeepSeek V4.1 Flash
             contextWindow: 921600
             maxTokens: 131072
+            input: [text, image]
+            reasoningEfforts:
+              high: high
+              max: max
+          # 日期快照。这里不写 compat.vercelGatewayRouting：门禁未打时写它会让
+          # 配置加载直接失败（启动失败）。不钉也能用；要硬钉 DeepSeek 见
+          # 「网关路由钉选」一节。
+          - id: cline-pass/deepseek-v4.1-flash-1017
+            name: DeepSeek V4.1 Flash 1017
+            contextWindow: 921600
+            maxTokens: 384000
             input: [text, image]
             reasoningEfforts:
               high: high
@@ -189,6 +200,11 @@ YAML 那行还在而补丁没了，启动会直接失败。
 `system_fingerprint` 是网关每次 mint 的 `fp_…`，随请求变，不能当上游指纹用。
 
 在 1017 上钉第一方 DeepSeek，两件事一起：
+
+随包卡片（方式 A / B）和安装器都会声明**两个**模型：稳定别名在前（默认选中），1017 快照在后。
+1017 那行**故意不带 pin** —— 门禁没打时写 `compat.vercelGatewayRouting` 会让配置加载直接失败；
+不钉也能用（网关按服务端 order 选路）。要硬钉第一方 DeepSeek，按下面做 —— 注意随包的
+`llm-pi-ai` 行是整行替换的，改不了它，得复制到自己 profile 的补丁里（上面「可粘贴」那段）。
 
 1. profile 的 1017 模型行写 `compat.vercelGatewayRouting.only: [deepseek]`（pi-ai 从模型的
    `compat` 读，写进请求体）。目前实测生效的只有这个形状；`gateway.order`（只改规划顺序、

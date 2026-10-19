@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.12.5
+
+**随包卡片与安装器补上 `cline-pass/deepseek-v4.1-flash-1017`：下载即可选，不依赖本机 profile。**
+
+- 0.12.4 的 README 讲了 1017 的钉选，但随包的 `cordis.patch.yml` 与 `install.mjs` 只声明稳定别名 ——
+  新装的人在选择器里根本看不到 1017，除非自己去抄 profile 行。
+- 现在两处卡片都声明两个模型：别名在前（默认）、1017 在后。1017 条目**不带**
+  `compat.vercelGatewayRouting`：门禁未打时写它会抛 `PiAiCatalogError`；不钉也能用。
+- README 的「可粘贴」YAML 与「网关路由钉选」同步：说明随包行为不 pin、要硬钉需自己声明
+  `llm-pi-ai` 行再跑 `patch-gateway-routing.mjs`。
+- `test-package.mjs` 断言随包卡片同时包含两个模型 id。
+
 ## 0.12.4
 
 **新增 `patch-gateway-routing.mjs`：把 1017 快照的「硬钉第一方 DeepSeek」做成可巡检的一步。**

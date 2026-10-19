@@ -100,6 +100,18 @@ const PROVIDER_BLOCK = `# ── Cline Pass provider card ───────�
             input: [text, image]
             reasoningEfforts:
               high: high
+              max: max
+          # The dated snapshot. Deliberately no compat.vercelGatewayRouting here:
+          # with the gate unpatched that compat makes config load fail. It works
+          # unpinned; to hard-pin DeepSeek, declare your own row with the compat
+          # and run patch-gateway-routing.mjs (README 「网关路由钉选」).
+          - id: cline-pass/deepseek-v4.1-flash-1017
+            name: DeepSeek V4.1 Flash 1017
+            contextWindow: 921600
+            maxTokens: 384000
+            input: [text, image]
+            reasoningEfforts:
+              high: high
               max: max`
 
 /** Trailing whitespace and blank edges dropped, CRLF folded: compare by content. */
