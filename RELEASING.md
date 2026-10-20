@@ -94,15 +94,15 @@ shasum -a 256 index.js && git show v<上一个版本>:index.js | shasum -a 256
 
 ## 7. 同步 pi 侧（必做）
 
-pi 侧有一个行为镜像插件：`~/Documents/Projects/pi-clinepass-dsh`
-（公开仓库 <https://github.com/BreakFree003/pi-clinepass-dsh>）。dsh tag + release 之后，
+pi 侧有一个行为镜像插件：`~/Documents/Projects/pi-clinepass-deepseek`
+（公开仓库 <https://github.com/BreakFree003/pi-clinepass-deepseek>）。dsh tag + release 之后，
 **同一版的行为要同步过去** —— 没有这一步，两边的模型定义、`compat` 位、观察器就会开始漂移。
 
 - 对照本版 CHANGELOG 改 pi 的 `src/index.ts`（模型列表、`compat`、观察器、命令、状态文件字段），
   必要时改 `~/.pi/agent/models.json` 的 override；
 - 把 pi 的 `package.json` 版本递增一个 patch，并更新 pi README 顶部的
   `Synced with dsh-clinepass v<version>` 标记；
-- 跑 `node ~/Documents/Projects/pi-clinepass-dsh/check.mjs`，再对两个模型各发一次真实请求；
+- 跑 `node ~/Documents/Projects/pi-clinepass-deepseek/check.mjs`，再对两个模型各发一次真实请求；
 - 本版只动文档/打包时也要同步标记，并在 pi README 写一句「no behavior change」—— 标记过期
   和代码过期一样，会让下一次同步漏东西；
 - 反向同理：pi 侧先落的行为改动，回填 dsh 后走一次 dsh 发版，再回来更新标记。

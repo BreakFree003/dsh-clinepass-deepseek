@@ -14,7 +14,7 @@
 - **分享性质，非长期维护项目**：按 MIT 原样提供，不承诺持续维护、也不承诺跟进上游 dsh 的接口
   漂移。发版清单见 [RELEASING.md](./RELEASING.md)（**tag 和 GitHub Release 是两件事**）。
 
-**pi 版本**：[pi-clinepass-dsh](https://github.com/BreakFree003/pi-clinepass-dsh) 把同一套模型定义、
+**pi 版本**：[pi-clinepass-deepseek](https://github.com/BreakFree003/pi-clinepass-deepseek) 把同一套模型定义、
 Provider 观察与用量报告搬进 pi；两边按发布版本互相同步，这个插件是它的行为基准（见
 [RELEASING.md](./RELEASING.md) §7）。
 
@@ -27,7 +27,7 @@ Provider 观察与用量报告搬进 pi；两边按发布版本互相同步，�
 
 ```bash
 dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1
-# 钉某个 tag：同上，末尾加 #v0.12.6
+# 钉某个 tag：同上，末尾加 #v0.12.7
 ```
 
 包自己声明了 `dsh.bundle.patch`，所以 `dsh plugin`（pnpm 的转发器）装上它之后会把这个包追加到
@@ -89,7 +89,7 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
           - id: cline-pass/deepseek-v4.1-flash
             name: DeepSeek V4.1 Flash
             contextWindow: 921600
-            maxTokens: 131072
+            maxTokens: 384000
             input: [text, image]
             reasoningEfforts:
               high: high
@@ -151,7 +151,7 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
 | `model` | `cline-pass/deepseek-v4.1-flash` | 模型 id（请求体要带 `type/` 前缀） |
 | `displayName` | `Cline Pass` | 设置页卡片标题 |
 | `contextWindow` | `921600` | 登记/对齐卡片用 |
-| `maxTokens` | `131072` | 同上 |
+| `maxTokens` | `384000` | 同上 |
 | `apiKeyEnv` | `CLINE_PASS_API_KEY` | 凭据库里的键名 |
 | `provision` | `true` | `false` = 不登记/不修复 provider 卡片（那卡片就得自己声明） |
 | `plainModelId` | `true` | persona 里显示**裸模型 id**（`deepseek-v4.1-flash`）；`false` = 保持完整 id（详见下节） |
@@ -249,7 +249,7 @@ node_modules**：补丁被冲掉后 YAML 的 `vercelGatewayRouting` 会让配置
 | `providerOptions.gateway.only` | **忽略**（假渠道也 200） | **执行**（假渠道 500、硬钉无回落） |
 | 未钉时的 fallback 池 | 18 个 provider | 14 个 provider |
 | 上游指纹 | `provider_metadata.deepseek.systemFingerprint`，仅落 deepseek 时可见 | 同 |
-| 卡片 `maxTokens` | 131072 | 384000 |
+| 卡片 `maxTokens` | 384000 | 384000 |
 
 补充说明：
 
@@ -335,7 +335,7 @@ node smoke-test.mjs [--negative]     # 活体：检查状态文件 + 真实网�
   （500 `No available providers match the 'only' filter`）：那不是回归，是 1017 快照真的执行
   `only`。这条负控制只对稳定别名成立。
 
-> pi 侧有一个行为镜像插件：[pi-clinepass-dsh](https://github.com/BreakFree003/pi-clinepass-dsh)。
+> pi 侧有一个行为镜像插件：[pi-clinepass-deepseek](https://github.com/BreakFree003/pi-clinepass-deepseek)。
 > **每个版本发完后必须同步过去**（模型/compat/观察器 + `check.mjs`），并更新 pi README 的
 > `Synced with` 标记 —— 步骤与规则见 [`RELEASING.md`](RELEASING.md) §7。
 
@@ -416,7 +416,7 @@ leaves the picker showing a "Provider default" entry.
 first), `smoke-test.mjs`, and `cat ~/.dsh/dsh-clinepass-status.json` (`hook`, `counters.seen` /
 `verified` / `anonymized` / `unknown`, `lastVerified`, `provision`, `ignoredOptions`).
 
-A companion [pi extension](https://github.com/BreakFree003/pi-clinepass-dsh) mirrors the same models,
+A companion [pi extension](https://github.com/BreakFree003/pi-clinepass-deepseek) mirrors the same models,
 provider observer and usage report; the two are kept in sync release by release.
 
 **Status**: shared as-is, not a maintained project — no support promise, and no commitment to track

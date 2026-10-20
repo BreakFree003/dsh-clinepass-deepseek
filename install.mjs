@@ -131,7 +131,7 @@ const PROVIDER_BLOCK = `# ── Cline Pass provider card ───────�
           - id: cline-pass/deepseek-v4.1-flash
             name: DeepSeek V4.1 Flash
             contextWindow: 921600
-            maxTokens: 131072
+            maxTokens: 384000
             input: [text, image]
             reasoningEfforts:
               high: high

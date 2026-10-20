@@ -215,7 +215,7 @@ const DEFAULT_UPSTREAM = 'https://api.cline.bot'
 const ANONYMIZED_CHANNEL = 'openai-compatible-private'
 
 const DEFAULT_CONTEXT_WINDOW = 921600
-const DEFAULT_MAX_TOKENS = 131072
+const DEFAULT_MAX_TOKENS = 384000
 
 /** Coerce a configured number to the positive integer the model catalog requires. */
 function positiveInteger(value, fallback) {

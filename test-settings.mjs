@@ -50,7 +50,7 @@ const OUR_CARD = {
   api: 'openai-completions',
   apiKeyEnv: 'CLINE_PASS_API_KEY',
   baseURL: 'https://api.cline.bot/api/v1',
-  models: [{ id: 'cline-pass/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 921600, maxTokens: 131072, input: ['text', 'image'], reasoningEfforts: { high: 'high', max: 'max' } }],
+  models: [{ id: 'cline-pass/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 921600, maxTokens: 384000, input: ['text', 'image'], reasoningEfforts: { high: 'high', max: 'max' } }],
 }
 
 // ── 1. the option surface ───────────────────────────────────────────────────
@@ -67,7 +67,7 @@ console.log('\n── 1. option surface ─────────────�
   withDefaults({ upstream: 'https://x.test/api/v1' }, pathLogs)
   check('…in one warning', pathLogs.lines.warn.filter((line) => line.includes('carries a path')).length === 1, JSON.stringify(pathLogs.lines.warn))
   check('a non-URL upstream is left for apply to refuse', withDefaults({ upstream: 'api.cline.bot' }).upstream === 'api.cline.bot')
-  check('a boolean is not accepted as a size', withDefaults({ maxTokens: true }).maxTokens === 131072, String(withDefaults({ maxTokens: true }).maxTokens))
+  check('a boolean is not accepted as a size', withDefaults({ maxTokens: true }).maxTokens === 384000, String(withDefaults({ maxTokens: true }).maxTokens))
   check('a numeric string is accepted as a size', withDefaults({ maxTokens: '4096' }).maxTokens === 4096, String(withDefaults({ maxTokens: '4096' }).maxTokens))
   check('provision: false is respected', withDefaults({ provision: false }).provision === false)
   check('usage can be turned off', withDefaults({ usage: false }).usage === false)
@@ -119,7 +119,7 @@ console.log('\n── 2. profile provisioning ───────────�
   check('profile uses an OpenAI-compatible protocol', written.api === 'openai-completions', written.api)
   check('profile names the credential ref', written.apiKeyEnv === 'CLINE_PASS_API_KEY', written.apiKeyEnv)
   check('profile declares the model id the gateway expects', written.models[0].id === 'cline-pass/deepseek-v4.1-flash', written.models[0].id)
-  check('profile declares the capacity', written.models[0].contextWindow === 921600 && written.models[0].maxTokens === 131072, JSON.stringify(written.models[0]))
+  check('profile declares the capacity', written.models[0].contextWindow === 921600 && written.models[0].maxTokens === 384000, JSON.stringify(written.models[0]))
   check('profile declares no reasoning levels — the profile patch owns that', written.models[0].reasoningEfforts === undefined, JSON.stringify(written.models[0]))
   check('nothing loopback is written anywhere', JSON.stringify(empty.writes).includes('127.0.0.1') === false)
 
@@ -163,7 +163,7 @@ console.log('\n── 2. profile provisioning ───────────�
   const upsized = structuredClone(OUR_CARD)
   upsized.models[0].maxTokens = 1000
   const capacity = makeSettings({ providers: { 'cline-pass': upsized } })
-  check('a changed output capacity is repaired', (await provisionProfile(capacity, cfg, quiet)) === 'repaired' && capacity.writes[0].ops[0].value[0].maxTokens === 131072, JSON.stringify(capacity.writes[0]?.ops))
+  check('a changed output capacity is repaired', (await provisionProfile(capacity, cfg, quiet)) === 'repaired' && capacity.writes[0].ops[0].value[0].maxTokens === 384000, JSON.stringify(capacity.writes[0]?.ops))
 
   for (const scalar of ['oops', 42, null]) {
     const broken = makeSettings({ providers: { 'cline-pass': scalar } })

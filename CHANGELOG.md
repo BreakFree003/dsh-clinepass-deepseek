@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.12.7
+
+**默认输出预算对齐 1017：稳定别名 `maxTokens` 131072 → 384000。**
+
+- `DEFAULT_MAX_TOKENS`、随包 `cordis.patch.yml`、`install.mjs` / `uninstall.mjs` 的默认卡片，
+  以及 README 的配置默认值和两模型对照表，统一为 384000；和 1017 快照一致。
+- 已存在的卡片如果 `maxTokens` 还是 131072，启动时的 provisioner 会把它对齐到 384000
+  （与原有的 `contextWindow` / `maxTokens` 修复逻辑同一路径）。
+- 这不是网关上限：dsh 实测 `max_tokens` 200000 / 400000 两个模型都返回 200，卡片值只是
+  客户端预算。实际 dsh profile 此前已显式写 384000，所以本版对当前运行行为无变化。
+- `index.js` 的观察器、请求路径与 `client.js` 未改。
+- 测试同步更新 `test-settings.mjs` 的默认值与容量修复断言。
+
 ## 0.12.6
 
 **补记两个模型的 API 行为对照（文档，无代码变更）。**
