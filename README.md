@@ -335,9 +335,9 @@ node smoke-test.mjs [--negative]     # 活体：检查状态文件 + 真实网�
   （500 `No available providers match the 'only' filter`）：那不是回归，是 1017 快照真的执行
   `only`。这条负控制只对稳定别名成立。
 
-> pi 侧有一个行为镜像插件：`~/Documents/Projects/pi-clinepass-dsh`。**每个版本发完后必须同步
-> 过去**（模型/compat/观察器 + `check.mjs`），并更新 pi README 的 `Synced with` 标记 ——
-> 步骤与规则见 [`RELEASING.md`](RELEASING.md) §7。
+> pi 侧有一个行为镜像插件：[pi-clinepass-dsh](https://github.com/BreakFree003/pi-clinepass-dsh)。
+> **每个版本发完后必须同步过去**（模型/compat/观察器 + `check.mjs`），并更新 pi README 的
+> `Synced with` 标记 —— 步骤与规则见 [`RELEASING.md`](RELEASING.md) §7。
 
 ### 状态文件
 
