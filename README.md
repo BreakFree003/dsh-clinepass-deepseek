@@ -14,6 +14,10 @@
 - **分享性质，非长期维护项目**：按 MIT 原样提供，不承诺持续维护、也不承诺跟进上游 dsh 的接口
   漂移。发版清单见 [RELEASING.md](./RELEASING.md)（**tag 和 GitHub Release 是两件事**）。
 
+**pi 版本**：[pi-clinepass-dsh](https://github.com/BreakFree003/pi-clinepass-dsh) 把同一套模型定义、
+Provider 观察与用量报告搬进 pi；两边按发布版本互相同步，这个插件是它的行为基准（见
+[RELEASING.md](./RELEASING.md) §7）。
+
 ---
 ## 安装
 
@@ -411,6 +415,9 @@ leaves the picker showing a "Provider default" entry.
 **Verify**: `npm test`, the two `checks/` scripts (they import the *installed* copy, so deploy
 first), `smoke-test.mjs`, and `cat ~/.dsh/dsh-clinepass-status.json` (`hook`, `counters.seen` /
 `verified` / `anonymized` / `unknown`, `lastVerified`, `provision`, `ignoredOptions`).
+
+A companion [pi extension](https://github.com/BreakFree003/pi-clinepass-dsh) mirrors the same models,
+provider observer and usage report; the two are kept in sync release by release.
 
 **Status**: shared as-is, not a maintained project — no support promise, and no commitment to track
 upstream dsh changes. MIT.

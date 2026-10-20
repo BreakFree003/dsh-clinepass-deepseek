@@ -94,7 +94,8 @@ shasum -a 256 index.js && git show v<上一个版本>:index.js | shasum -a 256
 
 ## 7. 同步 pi 侧（必做）
 
-pi 侧有一个行为镜像插件：`~/Documents/Projects/pi-clinepass-dsh`。dsh tag + release 之后，
+pi 侧有一个行为镜像插件：`~/Documents/Projects/pi-clinepass-dsh`
+（公开仓库 <https://github.com/BreakFree003/pi-clinepass-dsh>）。dsh tag + release 之后，
 **同一版的行为要同步过去** —— 没有这一步，两边的模型定义、`compat` 位、观察器就会开始漂移。
 
 - 对照本版 CHANGELOG 改 pi 的 `src/index.ts`（模型列表、`compat`、观察器、命令、状态文件字段），
