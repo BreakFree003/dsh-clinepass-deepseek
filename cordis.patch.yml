@@ -2,7 +2,7 @@
 #
 # This file is what makes the plugin installable with one command:
 #
-#   dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1
+#   dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseek
 #
 # `dsh plugin add` forwards to pnpm, then notices that the installed manifest
 # declares `dsh.bundle.patch` (see package.json) and appends this package to

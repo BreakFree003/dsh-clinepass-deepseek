@@ -62,7 +62,7 @@ tar tzf dsh-clinepass-<version>.tgz   # 核对文件列表，应当与 package.j
 
 ```sh
 gh release create v<version> ./dsh-clinepass-<version>.tgz \
-  --repo BreakFree003/dsh-clinepass-deepseekv4.1 \
+  --repo BreakFree003/dsh-clinepass-deepseek \
   --title "v<version> — <一句话>" \
   --notes-file <notes.md> \
   --verify-tag
@@ -75,11 +75,11 @@ gh release create v<version> ./dsh-clinepass-<version>.tgz \
 
 ```sh
 # 1) 出现在列表里、资产是 uploaded、并且成了 latest
-curl -sS https://api.github.com/repos/BreakFree003/dsh-clinepass-deepseekv4.1/releases/latest
+curl -sS https://api.github.com/repos/BreakFree003/dsh-clinepass-deepseek/releases/latest
 
 # 2) 下载回来的 tgz 与本地构建的逐字节相同
 curl -sSL -o /tmp/dl.tgz \
-  https://github.com/BreakFree003/dsh-clinepass-deepseekv4.1/releases/download/v<version>/dsh-clinepass-<version>.tgz
+  https://github.com/BreakFree003/dsh-clinepass-deepseek/releases/download/v<version>/dsh-clinepass-<version>.tgz
 shasum -a 256 /tmp/dl.tgz dsh-clinepass-<version>.tgz
 
 # 3) 解包后：版本号对、index.js 与仓库 HEAD 一致、打包不变量仍然成立

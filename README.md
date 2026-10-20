@@ -26,7 +26,7 @@ Provider 观察与用量报告搬进 pi；两边按发布版本互相同步，�
 ### 方式 A：一条命令（bundle 包，推荐）
 
 ```bash
-dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1
+dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseek
 # 钉某个 tag：同上，末尾加 #v0.12.7
 ```
 
@@ -399,7 +399,7 @@ It does rewrite the **prompt template**: the wire needs the `type/model` prefix,
 sections are patched to the bare id (`You are a coding agent powered by the deepseek-v4.1-flash
 model.`), `variables` untouched; `plainModelId: false` turns that off (see 「提示词里的模型 id」).
 
-**Install** with `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseekv4.1` (the
+**Install** with `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseek` (the
 package declares `dsh.bundle.patch`, so its two config rows come along automatically), with
 `node install.mjs` where pnpm is not available, or by hand (`patch.example.yml`). Restart dsh, then
 paste your key into the card on Settings → Models (stored as `CLINE_PASS_API_KEY` in the credential

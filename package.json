@@ -56,11 +56,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/BreakFree003/dsh-clinepass-deepseekv4.1.git"
+    "url": "git+https://github.com/BreakFree003/dsh-clinepass-deepseek.git"
   },
-  "homepage": "https://github.com/BreakFree003/dsh-clinepass-deepseekv4.1#readme",
+  "homepage": "https://github.com/BreakFree003/dsh-clinepass-deepseek#readme",
   "bugs": {
-    "url": "https://github.com/BreakFree003/dsh-clinepass-deepseekv4.1/issues"
+    "url": "https://github.com/BreakFree003/dsh-clinepass-deepseek/issues"
   },
   "dsh": {
     "bundle": {
