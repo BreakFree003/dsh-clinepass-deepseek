@@ -8,7 +8,7 @@
  *      `supportsMidConvoSystemMessages: "withhold"`, which rejects the profile's
  *      `compat` block at config load (`PiAiCatalogError: not configurable here`).
  *      Patch it to `"offer"`.
- *   2. `cordis.patch.yml` — `cline-pass/deepseek-v4.1-flash`'s
+ *   2. `cordis.patch.yml` — `cline-pass/deepseek-v4.1-flash-1017`'s
  *      `compat.supportsMidConvoSystemMessages: true`. Without it the gate patch
  *      changes nothing.
  *

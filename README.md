@@ -86,7 +86,7 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
         baseURL: https://api.cline.bot/api/v1
         reasoning: high          # 默认思考档；不写就会多出「Provider default」选项
         models:
-          - id: cline-pass/deepseek-v4.1-flash
+          - id: cline-pass/deepseek-v4.1-flash-1017
             name: DeepSeek V4.1 Flash
             contextWindow: 921600
             maxTokens: 384000
@@ -137,13 +137,13 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
 |---|---|---|
 | `upstream` | `https://api.cline.bot` | 网关 **origin**（profile 的 baseURL 是它 + `/api/v1`）。带路径会被截成 origin 并警告；不是 URL 则什么都不装 |
 | `provider` | `cline-pass` | 路由 id（卡片与胶囊都认它） |
-| `model` | `cline-pass/deepseek-v4.1-flash` | 模型 id（请求体要带 `type/` 前缀） |
+| `model` | `cline-pass/deepseek-v4.1-flash-1017` | 模型 id（请求体要带 `type/` 前缀） |
 | `displayName` | `Cline Pass` | 设置页卡片标题 |
 | `contextWindow` | `921600` | 登记/对齐卡片用 |
 | `maxTokens` | `384000` | 同上 |
 | `apiKeyEnv` | `CLINE_PASS_API_KEY` | 凭据库里的键名 |
 | `provision` | `true` | `false` = 不登记/不修复 provider 卡片（那卡片就得自己声明） |
-| `plainModelId` | `true` | persona 里显示**裸模型 id**（`deepseek-v4.1-flash`）；`false` = 保持完整 id（详见下节） |
+| `plainModelId` | `true` | persona 里显示**裸模型 id**（`deepseek-v4.1-flash-1017`）；`false` = 保持完整 id（详见下节） |
 | `usage` | `true` | `false` = 不挂载用量路由（卡片会显示「没挂载」而不是一直转圈） |
 | `usageRoute` | `/api/clinepass.usage` | 用量路由路径 |
 | `usageTimeoutMs` | `15000` | 宿主读网关的超时 |
@@ -184,13 +184,14 @@ YAML 那行还在而补丁没了，启动会直接失败。
 
 唯一还执行 `only` 的是规范命名空间 `deepseek/deepseek-v4.1-flash-1017`，但它是 usage-billing
 通道、需要额外 credits，而 **Cline Pass 订阅只覆盖 `cline-pass/*` 前缀的模型**（2026-10-22 确认）。
-所以订阅内没有可用的钉选路径；本包也不再附带 `patch-gateway-routing.mjs` 或 1017 模型行。
+所以订阅内没有可用的钉选路径；本包只声明 `…-1017` 这一个模型（显示名 `DeepSeek V4.1 Flash`），
+也不再附带 `patch-gateway-routing.mjs`。
 证据与复现见审计
 [`../clinepass-deepseek-audit/README.md`](../clinepass-deepseek-audit/README.md) §十五、§十六。
 
 ## 模型的 API 行为（2026-10-22 实测）
 
-随包只声明 `cline-pass/deepseek-v4.1-flash` 一个模型。同一把 key、`stream: true/false`、
+随包只声明 `cline-pass/deepseek-v4.1-flash-1017` 一个模型（显示名 `DeepSeek V4.1 Flash`）。同一把 key、`stream: true/false`、
 `POST /api/v1/chat/completions` 实测：
 
 | 维度 | 结果 |
@@ -207,7 +208,7 @@ YAML 那行还在而补丁没了，启动会直接失败。
 补充说明：
 
 - 落点：当前 `cline-pass/*` → VMC contributor 路由
-  （`vmc/deepseek-v4p1-flash-contributor-fallbacks` → `private/deepseek-v4p1-flash-contributor`），
+  （`vmc/deepseek-v4p1-flash-1017-contributor-fallbacks` → `private/deepseek-v4p1-flash-1017-contributor`），
   匿名、无 ZDR；观察者会如实报 `openai-compatible-private`，**这不是插件故障**。
 - 只有 `provider_metadata.deepseek.systemFingerprint` 能证明上游落在 DeepSeek（当前匿名路由没有
   这个命名空间）；顶层 `system_fingerprint` 是网关每请求 mint 的 `fp_…`，不能当上游指纹。
@@ -240,7 +241,7 @@ YAML 那行还在而补丁没了，启动会直接失败。
 网关要求请求体里是 `type/model`（裸 id 报 `invalid model format`），而 dsh 把目录 id 原样发给
 wire —— 于是 `{{model}}` 会把这段**传输细节**渲染进 persona，第一方路由都不会这样。插件因此把
 persona 模板里的 `{{model}}` 换成裸 id：上下文里读作
-`You are a coding agent powered by the deepseek-v4.1-flash model.`，与官方部署一致。
+`You are a coding agent powered by the deepseek-v4.1-flash-1017 model.`，与官方部署一致。
 `plainModelId: false` 关掉它（启动行会说明显示的是配置里的完整 id）。
 
 只能改**模板**，因为三条看似更省事的路都走不通：改目录 id（老会话的 `model/selection` 与
@@ -337,14 +338,16 @@ Cline Pass usage card** on Settings → Models.
 forwarded frame by frame, never buffered. 0.12.0 removed the request-side channel pin, enforcement,
 retries and violation bookkeeping. Since 2026-10-22 the gateway re-points every `cline-pass/*` model
 id to a VMC contributor route that ignores `providerOptions.gateway.only`, so the package ships **no
-pin**: no `compat.vercelGatewayRouting`, no gate-patch script, no dated 1017 row. The canonical
+pin**: no `compat.vercelGatewayRouting`, no gate-patch script. The package registers the dated
+`cline-pass/deepseek-v4.1-flash-1017` id (display name `DeepSeek V4.1 Flash`) — it is the id that
+historically honoured `only`, so a gateway revert would make it pinnable again. The canonical
 `deepseek/…` ids still enforce `only`, but they are usage-billing (extra credits) and outside the
 Cline Pass subscription. See audit §15/§16.
 Legacy keys (`pin`, `pins`, `providerPins`, `enforcement`, `retries`, `alignReasoningEffort`) still
 load — they are ignored and listed in the status file's `ignoredOptions`.
 
 It does rewrite the **prompt template**: the wire needs the `type/model` prefix, so the persona
-sections are patched to the bare id (`You are a coding agent powered by the deepseek-v4.1-flash
+sections are patched to the bare id (`You are a coding agent powered by the deepseek-v4.1-flash-1017
 model.`), `variables` untouched; `plainModelId: false` turns that off (see 「提示词里的模型 id」).
 
 **Install** with `dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseek` (the

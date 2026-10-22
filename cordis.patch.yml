@@ -79,7 +79,7 @@
         # 否则请求即报 UNSUPPORTED_REASONING_EFFORT。
         reasoning: high
         models:
-          - id: cline-pass/deepseek-v4.1-flash
+          - id: cline-pass/deepseek-v4.1-flash-1017
             name: DeepSeek V4.1 Flash
             contextWindow: 921600
             maxTokens: 384000

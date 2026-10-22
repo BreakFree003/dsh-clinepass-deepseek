@@ -29,7 +29,7 @@
  * rewrite anything else), so mounting the plugin is the whole install.
  *
  * Finally, it keeps that prefix out of the **prompt**: the persona would
- * otherwise read "powered by the cline-pass/deepseek-v4.1-flash model", while
+ * otherwise read "powered by the cline-pass/deepseek-v4.1-flash-1017 model", while
  * every first-party route shows a bare model id (the shipped `deepseek` route
  * declares `deepseek-v4-flash`, no prefix). The wire keeps the prefix; only the
  * display drops it — see `installPromptDisplay`, and `plainModelId` to turn it
@@ -55,7 +55,7 @@ export const inject = ['settings']
 export const PROVIDER = 'cline-pass'
 
 /** Model id as the gateway wants it (`type/model`), and as declared in the profile. */
-export const MODEL = 'cline-pass/deepseek-v4.1-flash'
+export const MODEL = 'cline-pass/deepseek-v4.1-flash-1017'
 
 /** Settings namespace the provider profile lives in — this is what puts the key field on the Models page. */
 export const PROFILE_NS = 'llm-pi-ai'

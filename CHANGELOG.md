@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.14.0
+
+**只保留 1017 快照 id，显示名去掉 "1017"。**
+
+- 目录里唯一模型改为 `cline-pass/deepseek-v4.1-flash-1017`，`name: DeepSeek V4.1 Flash`；
+  稳定别名 `cline-pass/deepseek-v4.1-flash` 从随包卡片、安装器、卸载器与测试断言中移除。
+- 保留 1017 的理由：两条路由 API 面逐项一致（审计 §十六），但**只有 1017 在网关历史上执行过
+  `only`**；网关若改回，它还能重新钉住，别名则从来不能。
+- `index.js` 的 `MODEL` 常量（provisioner 对齐卡片时用的默认 id）同步改为 1017，避免运行时把
+  别名二次追加进卡片。
+- 仍不带 `compat.vercelGatewayRouting`：`only` 目前被 VMC 路由忽略，门禁补丁已回退为上游
+  `withhold`。
+- README 的默认值、提示词示例、VMC 落点 slug、English 段同步；`patch-inhistory.mjs` 注释跟进。
+
 ## 0.13.0
 
 **删除上游钉选：去掉 1017 模型行、gate 补丁脚本与相关文档。**

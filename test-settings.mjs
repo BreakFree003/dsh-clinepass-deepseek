@@ -50,14 +50,14 @@ const OUR_CARD = {
   api: 'openai-completions',
   apiKeyEnv: 'CLINE_PASS_API_KEY',
   baseURL: 'https://api.cline.bot/api/v1',
-  models: [{ id: 'cline-pass/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', contextWindow: 921600, maxTokens: 384000, input: ['text', 'image'], reasoningEfforts: { high: 'high', max: 'max' } }],
+  models: [{ id: 'cline-pass/deepseek-v4.1-flash-1017', name: 'DeepSeek V4.1 Flash', contextWindow: 921600, maxTokens: 384000, input: ['text', 'image'], reasoningEfforts: { high: 'high', max: 'max' } }],
 }
 
 // ── 1. the option surface ───────────────────────────────────────────────────
 console.log('\n── 1. option surface ─────────────────────────────────────')
 {
   const cfg = withDefaults({})
-  check('the defaults name the official gateway and this route', cfg.upstream === 'https://api.cline.bot' && cfg.provider === 'cline-pass' && cfg.model === 'cline-pass/deepseek-v4.1-flash', JSON.stringify({ upstream: cfg.upstream, provider: cfg.provider, model: cfg.model }))
+  check('the defaults name the official gateway and this route', cfg.upstream === 'https://api.cline.bot' && cfg.provider === 'cline-pass' && cfg.model === 'cline-pass/deepseek-v4.1-flash-1017', JSON.stringify({ upstream: cfg.upstream, provider: cfg.provider, model: cfg.model }))
   check('no pin/enforcement/retry option exists any more', cfg.pin === undefined && cfg.pins === undefined && cfg.providerPins === undefined && cfg.enforcement === undefined && cfg.retries === undefined, JSON.stringify(Object.keys(cfg)))
   check('no transport option exists any more', cfg.transport === undefined && cfg.listen === undefined && cfg.captureDir === undefined, JSON.stringify(Object.keys(cfg)))
   check('withDefaults strips a trailing slash', withDefaults({ upstream: 'https://x.test/' }).upstream === 'https://x.test')
@@ -118,7 +118,7 @@ console.log('\n── 2. profile provisioning ───────────�
   check('profile points at the gateway itself, with no port', written.baseURL === 'https://api.cline.bot/api/v1', written.baseURL)
   check('profile uses an OpenAI-compatible protocol', written.api === 'openai-completions', written.api)
   check('profile names the credential ref', written.apiKeyEnv === 'CLINE_PASS_API_KEY', written.apiKeyEnv)
-  check('profile declares the model id the gateway expects', written.models[0].id === 'cline-pass/deepseek-v4.1-flash', written.models[0].id)
+  check('profile declares the model id the gateway expects', written.models[0].id === 'cline-pass/deepseek-v4.1-flash-1017', written.models[0].id)
   check('profile declares the capacity', written.models[0].contextWindow === 921600 && written.models[0].maxTokens === 384000, JSON.stringify(written.models[0]))
   check('profile declares no reasoning levels — the profile patch owns that', written.models[0].reasoningEfforts === undefined, JSON.stringify(written.models[0]))
   check('nothing loopback is written anywhere', JSON.stringify(empty.writes).includes('127.0.0.1') === false)
@@ -144,7 +144,7 @@ console.log('\n── 2. profile provisioning ───────────�
   const missingModel = makeSettings({ providers: { 'cline-pass': { displayName: 'Cline Pass', api: 'openai-completions', apiKeyEnv: 'CLINE_PASS_API_KEY', baseURL: 'https://api.cline.bot/api/v1' } } })
   check('a model entry that went missing is restored', (await provisionProfile(missingModel, cfg, quiet)) === 'repaired', JSON.stringify(missingModel.writes))
   check('…as the only change', JSON.stringify(missingModel.writes[0]?.ops.map((op) => op.path.join('.'))) === '["providers.cline-pass.models"]', JSON.stringify(missingModel.writes[0]?.ops.map((op) => op.path.join('.'))))
-  check('…with the gateway model id and capacity', missingModel.writes[0].ops[0].value[0].id === 'cline-pass/deepseek-v4.1-flash' && missingModel.writes[0].ops[0].value[0].contextWindow === 921600, JSON.stringify(missingModel.writes[0].ops[0].value[0]))
+  check('…with the gateway model id and capacity', missingModel.writes[0].ops[0].value[0].id === 'cline-pass/deepseek-v4.1-flash-1017' && missingModel.writes[0].ops[0].value[0].contextWindow === 921600, JSON.stringify(missingModel.writes[0].ops[0].value[0]))
 
   const foreign = makeSettings({ providers: { 'cline-pass': { apiKeyEnv: 'SOMEONE_ELSES_KEY', baseURL: 'https://elsewhere.test/v1' } } })
   check('a profile that is not ours is left alone', (await provisionProfile(foreign, cfg, quiet)) === 'mismatch' && foreign.writes.length === 0)

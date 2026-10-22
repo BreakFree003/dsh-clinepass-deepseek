@@ -93,7 +93,7 @@ const PROVIDER_BLOCK = `# ── Cline Pass provider card ───────�
         # High / Max and starts on High.
         reasoning: high
         models:
-          - id: cline-pass/deepseek-v4.1-flash
+          - id: cline-pass/deepseek-v4.1-flash-1017
             name: DeepSeek V4.1 Flash
             contextWindow: 921600
             maxTokens: 384000
