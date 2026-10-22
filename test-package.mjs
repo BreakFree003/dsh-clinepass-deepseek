@@ -120,7 +120,7 @@ check(
 const providerText = (providerEntry ?? []).join('\n')
 check(
   'the provider card names the pi-ai route, the key env, the gateway and the model',
-  ['- id: llm-pi-ai', 'cline-pass:', 'api: openai-completions', 'apiKeyEnv: CLINE_PASS_API_KEY', 'baseURL: https://api.cline.bot/api/v1', 'id: cline-pass/deepseek-v4.1-flash', 'id: cline-pass/deepseek-v4.1-flash-1017'].every(
+  ['- id: llm-pi-ai', 'cline-pass:', 'api: openai-completions', 'apiKeyEnv: CLINE_PASS_API_KEY', 'baseURL: https://api.cline.bot/api/v1', 'id: cline-pass/deepseek-v4.1-flash'].every(
     (needle) => providerText.includes(needle),
   ),
   JSON.stringify(providerEntry),

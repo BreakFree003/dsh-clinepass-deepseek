@@ -94,17 +94,6 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
             reasoningEfforts:
               high: high
               max: max
-          # 日期快照。这里不写 compat.vercelGatewayRouting：门禁未打时写它会让
-          # 配置加载直接失败（启动失败）。不钉也能用；要硬钉 DeepSeek 见
-          # 「网关路由钉选」一节。
-          - id: cline-pass/deepseek-v4.1-flash-1017
-            name: DeepSeek V4.1 Flash 1017
-            contextWindow: 921600
-            maxTokens: 384000
-            input: [text, image]
-            reasoningEfforts:
-              high: high
-              max: max
 ```
 
 ## 设置 API key
@@ -186,82 +175,45 @@ pi-ai 模型对象的 `compat`（决定转录层保留还是折叠中途 system 
 **升级会重装 node_modules**，所以升级后先 `--check`，未打就重跑，再起服务 ——
 YAML 那行还在而补丁没了，启动会直接失败。
 
-## 网关路由钉选（1017 快照专用）
+## 关于上游钉选
 
-`providerOptions.gateway.only` 在两条 cline-pass 路由上行为**不同**，别把结论混用：
+**本包不提供钉选。** 插件从 0.12.0 起不改写请求，客户端唯一入口是 pi-ai 模型 `compat` 里的
+`vercelGatewayRouting.only`；而网关从 2026-10-22 起把 `cline-pass/*` 全部改指 VMC contributor
+路由，该字段被忽略。实测 `only: [deepseek]`、`[fireworks]`、`gateway.order`、`allow`、
+`pinnedProvider`、`sort`、顶层 `provider.only` 的落点完全相同（都是 `openai-compatible-private`）。
 
-- `cline-pass/deepseek-v4.1-flash`（稳定别名）：网关**无视**该字段。它的服务端模型属性带
-  `model_properties_override.providerOptions.gateway.order = [deepseek, fireworks]`，
-  客户端写 `only: ['__no_such_upstream__']` 也照常 200、仍落 `deepseek`。
-- `cline-pass/deepseek-v4.1-flash-1017`（日期快照）：网关**执行**该字段。`only: ['deepseek']`
-  时 `finalProvider=deepseek`、`fallbacksAvailable=[]`、`planningReasoning` 带
-  `Provider set restricted to: deepseek.`；写一个不存在的渠道直接
-  500 `No available providers match the 'only' filter`；`only: ['fireworks']` 就真落 fireworks。
-  所以它是**硬钉**：DeepSeek 不可用时请求失败，不回落。
+唯一还执行 `only` 的是规范命名空间 `deepseek/deepseek-v4.1-flash-1017`，但它是 usage-billing
+通道、需要额外 credits，而 **Cline Pass 订阅只覆盖 `cline-pass/*` 前缀的模型**（2026-10-22 确认）。
+所以订阅内没有可用的钉选路径；本包也不再附带 `patch-gateway-routing.mjs` 或 1017 模型行。
+证据与复现见审计
+[`../clinepass-deepseek-audit/README.md`](../clinepass-deepseek-audit/README.md) §十五、§十六。
 
-2026-10-19 实测（同一把 key，每项 2 次采样）。上游是否真是 DeepSeek 看
-`provider_metadata.deepseek.systemFingerprint`（1017 仍是 `e72d3c7f…`）；顶层
-`system_fingerprint` 是网关每次 mint 的 `fp_…`，随请求变，不能当上游指纹用。
+## 模型的 API 行为（2026-10-22 实测）
 
-在 1017 上钉第一方 DeepSeek，两件事一起：
+随包只声明 `cline-pass/deepseek-v4.1-flash` 一个模型。同一把 key、`stream: true/false`、
+`POST /api/v1/chat/completions` 实测：
 
-随包卡片（方式 A / B）和安装器都会声明**两个**模型：稳定别名在前（默认选中），1017 快照在后。
-1017 那行**故意不带 pin** —— 门禁没打时写 `compat.vercelGatewayRouting` 会让配置加载直接失败；
-不钉也能用（网关按服务端 order 选路）。要硬钉第一方 DeepSeek，按下面做 —— 注意随包的
-`llm-pi-ai` 行是整行替换的，改不了它，得复制到自己 profile 的补丁里（上面「可粘贴」那段）。
-
-1. profile 的 1017 模型行写 `compat.vercelGatewayRouting.only: [deepseek]`（pi-ai 从模型的
-   `compat` 读，写进请求体）。目前实测生效的只有这个形状；`gateway.order`（只改规划顺序、
-   压不过 `clientSessionId` 的会话亲和）/ `allow` / `pinnedProvider` / 顶层 `provider.only` /
-   `model_properties_override` 在稳定别名上都被忽略，1017 上只验证了 `only`。
-2. 用本包的 `patch-gateway-routing.mjs` 打开门禁：
-
-   ```bash
-   node <profile>/node_modules/dsh-clinepass/patch-gateway-routing.mjs --check   # 0=整套在位
-   node <profile>/node_modules/dsh-clinepass/patch-gateway-routing.mjs           # 幂等应用，自动备份
-   node <profile>/node_modules/dsh-clinepass/patch-gateway-routing.mjs --revert  # YAML 还在用 pin 时拒绝，--force 才还原
-   ```
-
-   它只改 `@deepseek-ai/dsh-llm-pi-ai/lib/index.js` 里
-   `vercelGatewayRouting: "withhold"` 这一行（→ `"offer"`），锚点必须恰好出现一次，
-   上游改形状就报错、不写入。
-3. 改完重启 dsh web。
-
-**为什么不做成运行时行为**：与 in-history 开关同因 —— 这个标志被配置门禁消费，门禁在 boot 前跑；
-插件既拿不到 `pi-ai` 的模型对象，也不能接管已注册的 `cline-pass` 路由。**升级/重装会重装
-node_modules**：补丁被冲掉后 YAML 的 `vercelGatewayRouting` 会让配置加载直接抛
-`PiAiCatalogError`（服务起不来）—— 升级后先 `--check`，未打就重跑，再起服务。
-`~/.config/dsh-web/start.sh` 不会自动重打。
-
-## 两个模型的 API 行为对照（2026-10-19 实测）
-
-两条路由共用同一个网关、同一把 key。**能力面相同，路由面不同**（每项 2 次采样，`stream: true`，
-`POST /api/v1/chat/completions`）：
-
-| 维度 | `…-flash`（稳定别名） | `…-flash-1017`（日期快照） |
-|---|---|---|
-| 回显 `model` | `deepseek/deepseek-v4.1-flash` | `deepseek/deepseek-v4.1-flash-1017` |
-| 普通对话 / 流式 | 200 | 200 |
-| `reasoning_effort`（high / max / low） | 全 200；usage 里带 `reasoning_tokens` | 全 200；同上 |
-| 工具调用（OpenAI `tools`） | 200，`finish_reason=tool_calls` | 200，同上 |
-| 图片输入（data URL） | 200 | 200 |
-| 会话中途 system 消息 | 200，遵从后一条 system | 200，同上 |
-| `providerOptions.gateway.only` | **忽略**（假渠道也 200） | **执行**（假渠道 500、硬钉无回落） |
-| 未钉时的 fallback 池 | 18 个 provider | 14 个 provider |
-| 上游指纹 | `provider_metadata.deepseek.systemFingerprint`，仅落 deepseek 时可见 | 同 |
-| 卡片 `maxTokens` | 384000 | 384000 |
+| 维度 | 结果 |
+|---|---|
+| 普通对话 / 流式 / 非流式 | 200 |
+| `reasoning_effort`（high / max / low） | 全 200；usage 带 `reasoning_tokens` |
+| 工具调用（OpenAI `tools`） | 200，`finish_reason=tool_calls` |
+| 图片输入（data URL） | 200 |
+| 会话中途 system 消息 | 200，遵从后一条 system |
+| `response_format: json_object` | 200，返回合法 JSON |
+| `providerOptions.gateway.only` | **忽略**（假渠道也 200），落 `openai-compatible-private` |
+| `max_tokens: 200000` | 200（网关不按卡片值校验） |
 
 补充说明：
 
-- `max_tokens` 在网关上**不按卡片值校验**：两个模型发 200000 / 400000 都返回 200（不代表真能生成
-  那么长，卡片值是客户端预算，不是网关上限）。
-- 落点会漂：别名那 18 个 fallback 的池子按 affinity 轮换，同一批采样里先在 deepseek、随后 3/3 落
-  `fireworks`；1017 未钉时也出现过 `finalProvider=pareto`。所以「未钉也能用」成立，
-  「未钉也稳定在第一方」不成立 —— 这正是 1017 值得钉的原因。
-- 只有 `provider_metadata.deepseek.systemFingerprint` 能证明上游是 DeepSeek（两模型都是
-  `e72d3c7f…`）；顶层 `system_fingerprint` 是网关每请求 mint 的 `fp_…`。
-- 图片用例只验证了**接受度**（1×1 PNG；小图上的颜色回答并不稳定）；context window（921600）与
-  TPS 没有测 —— 要真实填满上下文成本太高。
+- 落点：当前 `cline-pass/*` → VMC contributor 路由
+  （`vmc/deepseek-v4p1-flash-contributor-fallbacks` → `private/deepseek-v4p1-flash-contributor`），
+  匿名、无 ZDR；观察者会如实报 `openai-compatible-private`，**这不是插件故障**。
+- 只有 `provider_metadata.deepseek.systemFingerprint` 能证明上游落在 DeepSeek（当前匿名路由没有
+  这个命名空间）；顶层 `system_fingerprint` 是网关每请求 mint 的 `fp_…`，不能当上游指纹。
+- 卡片 `maxTokens` / `contextWindow` 是客户端预算，不是网关上限；921600 上下文与 TPS 没有实测。
+- 计费：`cline-pass/*` 在 Cline Pass 订阅内；规范命名空间 `deepseek/*` 是 usage-billing、
+  需要额外 credits（订阅不覆盖）。
 
 ## 迁移（0.11.x → 0.12.x）
 
@@ -272,15 +224,12 @@ node_modules**：补丁被冲掉后 YAML 的 `vercelGatewayRouting` 会让配置
   `ignoredOptions`（不刷警告，否则每个没清理的旧行都会在每次启动时叫一次）。更早的端口时代键
   （`transport` / `listen` / `captureDir` / `address` / `baseURL`）同样忽略，但会各警告一次。
   0.12.0 曾把 `plainModelId` 一起归进这份遗留名单，那是误删；0.12.2 起它又是真选项。
-- **请求侧钉选**：0.12.0 删掉的是插件自带的请求改写与校验 —— 对稳定别名它确实无效
-  （2026-10-19 复测：写 `only: ['__no_such__']` 仍 200、落 `deepseek`；落点由服务端
-  `model_properties_override.providerOptions.gateway.order` 决定）。但 1017 日期快照没有这条
-  服务端覆盖，网关会执行 `only` —— 要钉它请用上面「网关路由钉选」那套
-  （profile compat + `patch-gateway-routing.mjs`），插件本身仍然不碰请求。
+- **请求侧钉选**：0.12.0 删掉的是插件自带的请求改写与校验；客户端唯一入口是 pi-ai 的模型
+  `compat`，而 2026-10-22 起网关把 `cline-pass/*` 改指 VMC、`only` 被忽略（见「关于上游钉选」）。
   指纹怎么读：审计 §九/§十二 的「与官方逐字相同」比的是
   `provider_metadata.deepseek.systemFingerprint`；顶层 `system_fingerprint` 是网关每请求 mint 的
   `fp_…`（2026-10-19 采样两请求都不同），不要拿它判断上游。证据见
-  [`../clinepass-deepseek-audit/README.md`](../clinepass-deepseek-audit/README.md) §九、§十二、§十三。
+  [`../clinepass-deepseek-audit/README.md`](../clinepass-deepseek-audit/README.md) §九、§十二、§十三、§十五。
 - **effort**：插件不再写 `agent-default-model.reasoningEffort`，也不再往卡片上写
   `reasoningEfforts` / `reasoning`。想固定思考档就在自己的 profile 补丁里显式给（例：
   `agent-default-model` 写 `reasoningEffort: high`），并在卡片里声明档位与默认档
@@ -329,11 +278,10 @@ node smoke-test.mjs [--negative]     # 活体：检查状态文件 + 真实网�
   就变了（dsh 的 TPS 测量正是从它来的）。
 - `checks/dsh-clinepass-streaming-gate-check.mjs` 用**真实 OpenAI SDK** 走一遍安装后的观察者：
   请求原样到达、流仍能装配出完整消息、同一个响应里的上游仍被读出来。
-- `smoke-test.mjs --negative` 会故意要一个不存在的渠道。默认打稳定别名：网关无视该字段
-  （200、仍落 `deepseek`），所以断言 PASS —— 这正是 0.12.0 删掉请求改写器的理由。
-  用 `MODEL_ID=cline-pass/deepseek-v4.1-flash-1017` 跑同一条会 **FAIL**
-  （500 `No available providers match the 'only' filter`）：那不是回归，是 1017 快照真的执行
-  `only`。这条负控制只对稳定别名成立。
+- `smoke-test.mjs --negative` 会故意要一个不存在的渠道。当前 `cline-pass/*` 路由忽略该字段
+  （200、落匿名），所以断言 PASS —— 这正是 0.12.0 删掉请求改写器的理由。这条的预期值跟着网关走：
+  2026-10-19 曾在 1017 上返回 500，10-22 起改为 200 + 流内 `stream_initialization_failed`；
+  跑之前可以先用审计 §十五 的 curl 复核。
 
 > pi 侧有一个行为镜像插件：[pi-clinepass-deepseek](https://github.com/BreakFree003/pi-clinepass-deepseek)。
 > **每个版本发完后必须同步过去**（模型/compat/观察器 + `check.mjs`），并更新 pi README 的
@@ -387,11 +335,11 @@ Cline Pass usage card** on Settings → Models.
 
 **It never rewrites a request.** No body, no headers, no retries, no extra calls; SSE bodies are
 forwarded frame by frame, never buffered. 0.12.0 removed the request-side channel pin, enforcement,
-retries and violation bookkeeping: the stable alias's `deepseek` landing is decided server-side
-(`model_properties_override.providerOptions.gateway.order`) and client fields are ignored there.
-The dated `…-1017` snapshot is different — the gateway enforces
-`providerOptions.gateway.only` on it, so pinning is a profile-side `compat` plus a boot-time gate
-patch (`patch-gateway-routing.mjs`); see 「网关路由钉选」.
+retries and violation bookkeeping. Since 2026-10-22 the gateway re-points every `cline-pass/*` model
+id to a VMC contributor route that ignores `providerOptions.gateway.only`, so the package ships **no
+pin**: no `compat.vercelGatewayRouting`, no gate-patch script, no dated 1017 row. The canonical
+`deepseek/…` ids still enforce `only`, but they are usage-billing (extra credits) and outside the
+Cline Pass subscription. See audit §15/§16.
 Legacy keys (`pin`, `pins`, `providerPins`, `enforcement`, `retries`, `alignReasoningEffort`) still
 load — they are ignored and listed in the status file's `ignoredOptions`.
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.13.0
+
+**删除上游钉选：去掉 1017 模型行、gate 补丁脚本与相关文档。**
+
+- 2026-10-22 起网关把 `cline-pass/*` 全部改指 VMC contributor 路由，
+  `providerOptions.gateway.only` 被忽略；规范 id `deepseek/…-1017` 虽仍执行 `only`，但属
+  usage-billing（额外 credits），订阅只覆盖 `cline-pass/*`。钉选已无可用路径（审计 §十五）。
+- 删除 `patch-gateway-routing.mjs`：它唯一的用途是打开 pi-ai 的 `vercelGatewayRouting` 门禁；
+  本机该补丁已回退为上游的 `withhold`，`package.json` 的 `files` 同步移除。
+- 随包 `cordis.patch.yml` 与 `install.mjs` / `uninstall.mjs` 只声明
+  `cline-pass/deepseek-v4.1-flash` 一个模型；`test-package.mjs` 的断言随之收敛。
+- README 删除「网关路由钉选」与两模型对照，改为「关于上游钉选」+ 单模型 API 行为；
+  验证清单里 1017 负控制的日期注记顺手收敛。
+- `index.js` / `client.js` 未改：观察器、用量卡、`plainModelId` 行为不变。
+
 ## 0.12.7
 
 **默认输出预算对齐 1017：稳定别名 `maxTokens` 131072 → 384000。**
