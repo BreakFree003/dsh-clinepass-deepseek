@@ -27,7 +27,7 @@ Provider 观察与用量报告搬进 pi；两边按发布版本互相同步，�
 
 ```bash
 dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseek
-# 钉某个 tag：同上，末尾加 #v0.12.7
+# 钉某个 tag：同上，末尾加 #v0.15.0
 ```
 
 包自己声明了 `dsh.bundle.patch`，所以 `dsh plugin`（pnpm 的转发器）装上它之后会把这个包追加到
@@ -175,19 +175,51 @@ pi-ai 模型对象的 `compat`（决定转录层保留还是折叠中途 system 
 **升级会重装 node_modules**，所以升级后先 `--check`，未打就重跑，再起服务 ——
 YAML 那行还在而补丁没了，启动会直接失败。
 
-## 关于上游钉选
+## 关于上游钉选（2026-10-23 起又能钉住）
 
-**本包不提供钉选。** 插件从 0.12.0 起不改写请求，客户端唯一入口是 pi-ai 模型 `compat` 里的
-`vercelGatewayRouting.only`；而网关从 2026-10-22 起把 `cline-pass/*` 全部改指 VMC contributor
-路由，该字段被忽略。实测 `only: [deepseek]`、`[fireworks]`、`gateway.order`、`allow`、
-`pinnedProvider`、`sort`、顶层 `provider.only` 的落点完全相同（都是 `openai-compatible-private`）。
+**插件仍然不改写请求。** 钉选入口只有 pi-ai 模型 `compat.vercelGatewayRouting.only`；本包提供
+的是把 pi-ai 门禁打开的那个 boot 期补丁脚本，不是运行时行为。
 
-唯一还执行 `only` 的是规范命名空间 `deepseek/deepseek-v4.1-flash-1017`，但它是 usage-billing
-通道、需要额外 credits，而 **Cline Pass 订阅只覆盖 `cline-pass/*` 前缀的模型**（2026-10-22 确认）。
-所以订阅内没有可用的钉选路径；本包只声明 `…-1017` 这一个模型（显示名 `DeepSeek V4.1 Flash`），
-也不再附带 `patch-gateway-routing.mjs`。
-证据与复现见审计
-[`../clinepass-deepseek-audit/README.md`](../clinepass-deepseek-audit/README.md) §十五、§十六。
+网关行为按 id 分裂，所以结论随日期变：
+
+- 2026-10-22：`cline-pass/*` 全被改指 VMC contributor 路由（`openai-compatible-private`），
+  `only` 被忽略（审计 §十五）。
+- 2026-10-23 02:1x 复测：**1017 快照重新执行 `only`**。同一把 key，每项 2 次：
+  `only: [deepseek]` → `finalProvider=deepseek` 且带原生
+  `provider_metadata.deepseek.systemFingerprint`；`only: [fireworks]` → fireworks；
+  **不带 `only`** 时网关的加权抽签会让 fireworks 赢 tier 0
+  （`Weighted tie pick: fireworks won tier 0 over pareto`）—— 这就是要防的回落。
+  稳定别名 `…-flash` 仍被改指 VMC，所以本包只声明 1017（审计 §十九）。
+
+要钉死第一方 DeepSeek（本机 profile 的做法），两件事一起，顺序不能错：
+
+1. profile 的 `llm-pi-ai.providers.cline-pass.models[].compat` 里写：
+
+   ```yaml
+   vercelGatewayRouting:
+     only: [deepseek]
+   ```
+
+2. 用本包的 `patch-gateway-routing.mjs` 把 pi-ai 的 `COMPLETIONS_COMPAT_GATE` 打开
+   （`vercelGatewayRouting: withhold` → `offer`）：
+
+   ```bash
+   node <profile>/node_modules/dsh-clinepass/patch-gateway-routing.mjs --check  # 0=门禁 offer 且 YAML 有 pin
+   node <profile>/node_modules/dsh-clinepass/patch-gateway-routing.mjs           # 幂等应用，自动备份
+   node <profile>/node_modules/dsh-clinepass/patch-gateway-routing.mjs --revert   # 还原 withhold（先删 YAML 那行）
+   ```
+
+3. **重启** dsh web —— 这是 boot 期补丁，不热重载。
+
+**依赖是有方向的**：YAML 写了 `only` 而门禁还是 `withhold`，启动直接抛
+`PiAiCatalogError: model "…" sets compat "vercelGatewayRouting", but its api is "openai-completions",
+which does not take it`。升级/重装 `node_modules` 会冲掉补丁，**先跑脚本再起服务**。
+
+边界：`--check` 只能证明「门禁已开 + YAML 有 pin」，证明不了网关当前还认 `only`；要确认落点看
+composer 的上游胶囊或 `~/.dsh/dsh-clinepass-status.json` 的 `lastVerified.provider`。钉住只限制
+候选集合，不改变计费（仍走 Cline Pass 订阅；规范 `deepseek/…` 命名空间是 usage-billing，需要
+额外 credits，不在订阅内）。证据与复现见审计
+[`../clinepass-deepseek-audit/README.md`](../clinepass-deepseek-audit/README.md) §十三、§十五、§十九。
 
 ## 模型的 API 行为（2026-10-22 实测）
 
@@ -336,13 +368,18 @@ Cline Pass usage card** on Settings → Models.
 
 **It never rewrites a request.** No body, no headers, no retries, no extra calls; SSE bodies are
 forwarded frame by frame, never buffered. 0.12.0 removed the request-side channel pin, enforcement,
-retries and violation bookkeeping. Since 2026-10-22 the gateway re-points every `cline-pass/*` model
-id to a VMC contributor route that ignores `providerOptions.gateway.only`, so the package ships **no
-pin**: no `compat.vercelGatewayRouting`, no gate-patch script. The package registers the dated
-`cline-pass/deepseek-v4.1-flash-1017` id (display name `DeepSeek V4.1 Flash`) — it is the id that
-historically honoured `only`, so a gateway revert would make it pinnable again. The canonical
-`deepseek/…` ids still enforce `only`, but they are usage-billing (extra credits) and outside the
-Cline Pass subscription. See audit §15/§16.
+retries and violation bookkeeping. Pinning is config-level only: pi-ai's
+`compat.vercelGatewayRouting.only` on the model entry, plus `patch-gateway-routing.mjs` (0.15.0)
+to flip pi-ai's boot gate from `withhold` to `offer`. As of 2026-10-23 the dated
+`cline-pass/deepseek-v4.1-flash-1017` id honours `only` again (`only: [deepseek]` lands first-party
+DeepSeek; without it the gateway's weighted tie-pick can hand tier 0 to fireworks), while the stable
+alias and — per audit §15 — the whole `cline-pass/*` family were re-pointed to a VMC contributor
+route on 2026-10-22. That is why the package registers only the 1017 id (display name
+`DeepSeek V4.1 Flash`). The canonical `deepseek/…` ids still enforce `only`, but they are
+usage-billing (extra credits) and outside the Cline Pass subscription. See audit §13/§15/§19.
+An ordering hazard comes with the gate: with `only` in the YAML and the gate left at `withhold`,
+startup fails with `PiAiCatalogError`; a `node_modules` reinstall wipes the gate patch, so run
+`patch-gateway-routing.mjs --check` (then the script, if nonzero) **before** starting the service.
 Legacy keys (`pin`, `pins`, `providerPins`, `enforcement`, `retries`, `alignReasoningEffort`) still
 load — they are ignored and listed in the status file's `ignoredOptions`.
 

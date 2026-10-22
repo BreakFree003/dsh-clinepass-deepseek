@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.15.0
+
+**恢复上游钉选：1017 快照重新执行 `only`，把门禁补丁脚本放回包里。**（未发布：等 tag + release。）
+
+- 2026-10-23 02:1x 复测：`cline-pass/deepseek-v4.1-flash-1017` 重新执行
+  `providerOptions.gateway.only` —— `[deepseek]` 落第一方 deepseek（带原生
+  `systemFingerprint`），`[fireworks]` 落 fireworks；不带 `only` 时加权抽签会让 fireworks 赢
+  tier 0。稳定别名 `…-flash` 仍被改指 VMC（审计 §十九）。
+- 恢复 `patch-gateway-routing.mjs`（0.13.0 删除）：把
+  `@deepseek-ai/dsh-llm-pi-ai/lib/index.js` 的 `vercelGatewayRouting` 门禁
+  `withhold` → `offer`，带 `--check` / `--revert`、幂等、自动备份；`package.json` 的 `files`
+  加回该文件。
+- README「关于上游钉选」重写为两件套配方（`compat.vercelGatewayRouting.only` + 门禁补丁 +
+  重启），并写明顺序依赖与 `--check` 的证明边界；English 段同步。
+- 插件运行时行为**未改**：仍是纯观察者，不改写请求。
+
 ## 0.14.0
 
 **只保留 1017 快照 id，显示名去掉 "1017"。**
