@@ -152,6 +152,14 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
 
 ## in-history system 快照（配套 profile 补丁）
 
+> ⛔ **2026-10-28（DSH 0.2.2-alpha.2）退役 —— 不要再跑 `patch-inhistory.mjs`。**
+> 上游 pi-ai 已改为：不支持中途 system 消息的模型，后续 system 消息在**原位置**包成
+> `<system-reminder>` 提供，不再移到最初提示词里（changelog 原话，代码在
+> `appendSharedHistory` 的 else 分支）。本机 YAML 的
+> `compat.supportsMidConvoSystemMessages` 已删、门禁已 `--revert` 回 `withhold`。
+> 下面保留的是退役前的做法与理由（历史）；`--check` 在退役态会报
+> `verdict: inactive`（exit 1），属预期，不再作为巡检项。
+
 DSH 默认把 `openai-completions` 路由当 leading-only：系统提示词一变就改写头部、重开请求序列。
 pi-ai 的转录层其实支持会话中途 system 消息（实测网关接受，且前缀缓存仍命中），但
 `@deepseek-ai/dsh-llm-pi-ai` 的 `COMPLETIONS_COMPAT_GATE` 把 `supportsMidConvoSystemMessages`

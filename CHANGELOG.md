@@ -1,5 +1,20 @@
 # Changelog
 
+## 未发布（下一版）
+
+**`patch-inhistory.mjs` 退役：DSH 0.2.2-alpha.2 起上游自己处理「中途 system 消息」。**
+
+- 上游 `@deepseek-ai/dsh-llm-pi-ai` 的 `appendSharedHistory` 已新增回退分支：模型声明
+  `supportsMidConvoSystemMessages: false` 时，后续 system 消息在**原位置**包成
+  `<system-reminder>` user 消息，不再移到最初提示词里 —— 本机当初为前缀缓存/顺序打的
+  门禁补丁因此不再需要。
+- 本机动作：删除 `cordis.patch.yml` 里 1017 的 `compat.supportsMidConvoSystemMessages: true`，
+  对 `node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js` 执行
+  `patch-inhistory.mjs --revert`（门禁回上游 `withhold`），并删掉升级巡检里的该脚本项。
+- 脚本本身保留（历史 + 万一上游回退可再启用），README 顶部已标退役；**不要再跑**。
+- 行为差异：上游现在给的是 `<system-reminder>` user 消息而非真正的 `role: system`；
+  本机接受这一差异（遵循「上游已有的先用上游」）。pi 侧同步时按 no behavior change 处理。
+
 ## 0.15.0
 
 **恢复上游钉选：1017 快照重新执行 `only`，把门禁补丁脚本放回包里。**（未发布：等 tag + release。）
