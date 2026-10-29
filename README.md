@@ -257,6 +257,14 @@ which does not take it`。升级/重装 `node_modules` 会冲掉补丁，**先�
 node ../clinepass-deepseek-audit/evidence/scripts/verify-pi-ai-has.mjs  # 期望 gateway 里 only + has 都在
 ```
 
+**偏移了怎么办**：先跑 `--check`。补丁还在（exit 0）而落点变了 = 网关行为变了，按审计
+[§二十二](../clinepass-deepseek-audit/README.md) 的排查手册来：先翻 Vercel AI Gateway 的
+[Model Filtering](https://vercel.com/docs/ai-gateway/models-and-providers/model-filtering)（`has` 的
+合法值会加新标签）与 [Provider Options](https://vercel.com/docs/ai-gateway/models-and-providers/provider-options)
+（`only`/`order`/`sort`/`models`），再用 `clinepass-deepseek-audit/evidence/scripts/route-probe.mjs`
+跑矩阵（基线 / 只 `only` / 只 `has` / 组合），**不要只试一个字段**。`has` 是 model 层条件、`only` 是
+provider 层条件——私有池是另一条 model entry，provider 层字段永远碰不到它。
+
 边界：`--check` 与上面这个脚本只能证明「补丁在 + YAML 有值 + 请求体里有 `has`」，证明不了网关
 此刻的调度决策；要确认落点看 composer 的上游胶囊或 `~/.dsh/dsh-clinepass-status.json` 的
 `lastVerified.provider`（应为 `deepseek`）。钉住只限制候选集合，不改变计费（仍走 Cline Pass
@@ -431,6 +439,14 @@ An ordering hazard comes with the gate: with `vercelGatewayRouting` in the YAML 
 run `patch-gateway-routing.mjs --check` (then the script, if nonzero) **before** starting the
 service. `evidence/scripts/verify-pi-ai-has.mjs` proves the field reaches the wire without spending
 quota.
+**When the landing provider drifts,** run `--check` first: green means the gateway changed, not the
+patch. Then follow audit §22 — re-read Vercel AI Gateway's
+[model-filtering](https://vercel.com/docs/ai-gateway/models-and-providers/model-filtering) and
+[provider-options](https://vercel.com/docs/ai-gateway/models-and-providers/provider-options) docs (new
+`has` capabilities get added there) and run `evidence/scripts/route-probe.mjs` over
+baseline / only / has / combined before touching anything. `has` filters model entries, `only` filters
+providers inside an entry; the private pool is a separate model entry, so provider-level fields can
+never reach it.
 Legacy keys (`pin`, `pins`, `providerPins`, `enforcement`, `retries`, `alignReasoningEffort`) still
 load — they are ignored and listed in the status file's `ignoredOptions`.
 
