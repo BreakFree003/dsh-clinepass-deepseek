@@ -1,6 +1,22 @@
 # Changelog
 
-## 未发布（下一版）
+## 0.16.0
+
+**上游钉选修正：`gateway.has` 才是开关，0.15.0 那套（只写 `only`）一直是空转。**
+
+- 2026-10-30 矩阵复测（审计 §二十）：无 `has` 时网关把请求丢进
+  `openai-compatible-private`（VMC），`only` 被完全忽略；带 `has` 才走公开候选路由，再由
+  `only` 收敛到第一方 deepseek（原生 `systemFingerprint=bc19ba97…`）。2026-10-23 那次
+  「又能钉住」是误判 —— 那天不带 pin 也落 deepseek。
+- `patch-gateway-routing.mjs` 扩成三锚点：门禁 `withhold→offer`、pi-ai
+  `VercelGatewayRoutingSchema` 补 `has` 声明、`api/openai-completions.js` 把 `has` 抄进
+  `providerOptions.gateway`。`--check` 要求三锚点 + YAML 的 `only`/`has` 同时成立才返回 0；
+  `--revert` 一并还原；锚点形状变化直接 exit 2，不再猜。
+- 本机 profile 的 1017 行加 `has: [vision, implicit-caching]`（顺序依赖不变：先跑脚本再起服务，
+  否则 `PiAiCatalogError`）。
+- 新增 `../clinepass-deepseek-audit/evidence/scripts/verify-pi-ai-has.mjs`：假 fetch 截请求体，
+  不花额度地证明 `has` 真的发到了线上。
+- 插件运行时行为**未改**：仍是纯观察者，不改写请求。
 
 **`patch-inhistory.mjs` 退役：DSH 0.2.2-alpha.2 起上游自己处理「中途 system 消息」。**
 
