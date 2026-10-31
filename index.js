@@ -214,6 +214,33 @@ const DEFAULT_UPSTREAM = 'https://api.cline.bot'
  */
 const ANONYMIZED_CHANNEL = 'openai-compatible-private'
 
+/**
+ * 回退池（degraded pool）在**回显模型名**里的形状。
+ *
+ * 网关按**模型档位**决定走不走回退池，与 provider 选择是两条独立决策：同一次请求可以
+ * `finalProvider=deepseek`，而帧里回显 `vmc/deepseek-v4p1-flash-1017-contributor-fallbacks`
+ * （2026-10-31 实测：smoke-test 第 2 节这一轮就被服务成
+ * `openai-compatible-private` + 该回显模型）。provider 元数据读不出这一层，模型名是唯一可靠的信号。
+ *
+ * 只匹配后缀、不做等值比较：主池回显的是 canonical slug
+ * （`deepseek/deepseek-v4.1-flash-1017`），与请求 id（`cline-pass/…`）从来就不相等 ——
+ * 等值比较会把每一次正常请求都判成异常。
+ */
+export const DEGRADED_MODEL_PATTERN = /contributor-fallbacks?$|\/fallbacks?$|-fallbacks?$/i
+
+/**
+ * 这个回显模型名是不是回退池。
+ *
+ * 注意 `vendor/fallbackless-model` 这类名字**不是**：只有 `-fallback(s)` 后缀才算，
+ * 词中间的 "fallback" 是模型名的一部分，不是池子的标记。
+ *
+ * @param model - 上游回显的模型名（`null` / 空串都算否）。
+ * @returns 是否由回退池服务。
+ */
+export function isDegradedModel(model) {
+  return typeof model === 'string' && model.trim().length > 0 && DEGRADED_MODEL_PATTERN.test(model.trim())
+}
+
 const DEFAULT_CONTEXT_WINDOW = 921600
 const DEFAULT_MAX_TOKENS = 384000
 
@@ -565,6 +592,10 @@ export function createUsageHandler(routeCtx, cfg, logger = console, options = {}
         provider: verified.provider,
         anonymized: verified.anonymized === true || verified.provider === ANONYMIZED_CHANNEL,
         model: verified.model ?? null,
+        // 上游回显的实际服务模型与回退池标记：`provider` 说明「谁服务的」，这两个字段
+        // 说明「按哪个模型档位服务的」—— 钉住 provider 也挡不住回退池。
+        servedModel: verified.servedModel ?? null,
+        degraded: verified.degraded === true,
         sessionId: verified.sessionId ?? null,
         at: verified.at ?? null,
       })
@@ -782,6 +813,26 @@ export function providersOfText(text) {
 }
 
 /**
+ * 从一次响应里读出上游**实际服务**的模型名（不是请求要的那个）。
+ *
+ * 网关在帧的回显 `model` 字段里写它真正按哪个 id 服务；最后一个非空值胜出（中间帧可能
+ * 不带 `model`，空值不覆盖已知值）。原样返回（去首尾空白）—— 拼写是事实的一部分，
+ * 是否回退池由 {@link isDegradedModel} 单独判断。
+ *
+ * @param text - 响应体原文（SSE 或单个 JSON 文档）。
+ * @returns 模型名，或 null。
+ */
+export function servedModelOfText(text) {
+  let served = null
+  for (const document of sseDocuments(text)) {
+    if (!isPlainObject(document)) continue
+    const model = document.model
+    if (typeof model === 'string' && model.trim().length > 0) served = model.trim()
+  }
+  return served
+}
+
+/**
  * {@link routingsOfText} 里最后出现的那一处。
  *
  * @param text - 响应体原文。
@@ -868,12 +919,12 @@ export function observedProviderOf(evidence = {}) {
  * 从一次响应体原文里读证据（非流式路径与测试共用）。
  *
  * @param text - 响应体原文（SSE 或单个 JSON 文档）。
- * @returns `{ routings, providers, namespaces }`。
+ * @returns `{ routings, providers, namespaces, servedModel }`。
  */
 function evidenceOfText(text) {
   const namespaces = []
   for (const document of sseDocuments(text)) collectProviderNamespaces(document, namespaces)
-  return { routings: routingsOfText(text), providers: providersOfText(text), namespaces }
+  return { routings: routingsOfText(text), providers: providersOfText(text), namespaces, servedModel: servedModelOfText(text) }
 }
 
 /** SSE 帧以空行结束。分隔符按**字节**找：正文原样转发才有保真与节奏。 */
@@ -1137,23 +1188,35 @@ export function createFetchObserver(config, logger = console) {
    * @param provider - 归一化小写的 provider 名字。
    * @param model - 这次请求的 wire model id（读不出时为 null）。
    * @param sessionId - 请求头里的会话 id（dsh 目前不发，通常为 null）。
+   * @param servedModel - 上游回显的实际服务模型（响应帧里读的，可能为 null）。
    * @returns 这条观测的序号，交给 `completeObservation()`。
    */
-  function recordObservation(url, provider, model, sessionId) {
+  function recordObservation(url, provider, model, sessionId, servedModel = null) {
     const at = new Date().toISOString()
     const anonymized = provider === ANONYMIZED_CHANNEL
+    // 回退池是**模型档位**的决策，与 provider 无关：`finalProvider=deepseek` 的请求也可能
+    // 由 `vmc/…-contributor-fallbacks` 服务。判定只看回显模型名的后缀，见
+    // {@link isDegradedModel}。
+    const degraded = isDegradedModel(servedModel)
     observationSeq += 1
     lastVerifiedSeq = observationSeq
-    lastVerified = { at, url, provider, model, sessionId, anonymized }
+    lastVerified = { at, url, provider, model, servedModel, degraded, sessionId, anonymized }
     if (sessionId) lastVerifiedBySession.set(String(sessionId), lastVerified)
     if (model) lastVerifiedByModel.set(model, lastVerified)
     if (anonymized) {
       lastAnonymizedSeq = observationSeq
-      lastAnonymized = { at, url, provider, model, sessionId }
+      lastAnonymized = { at, url, provider, model, servedModel, degraded, sessionId }
     }
     publish()
     if (anonymized) logger.warn?.('[clinepass] %s → %s (the upstream channel is anonymized; see the audit notes)', url, provider)
-    else logger.info?.('[clinepass] %s → %s', url, provider)
+    if (degraded) {
+      logger.warn?.(
+        '[clinepass] %s was served by the degraded pool (%s); the pool is chosen by model tier, not by provider — pinning does not avoid it',
+        url,
+        servedModel,
+      )
+    }
+    if (!anonymized && !degraded) logger.info?.('[clinepass] %s → %s', url, provider)
     return observationSeq
   }
 
@@ -1186,7 +1249,7 @@ export function createFetchObserver(config, logger = console) {
    * @param url - 请求 URL。
    * @param sessionId - 请求头里的会话 id。
    * @param modelPromise - `requestModel()` 的 promise（可能还没 settle）。
-   * @param evidence - `{ routings, providers, namespaces }`。
+   * @param evidence - `{ routings, providers, namespaces, servedModel }`。
    */
   function conclude(url, sessionId, modelPromise, evidence) {
     const provider = observedProviderOf(evidence)
@@ -1198,7 +1261,10 @@ export function createFetchObserver(config, logger = console) {
     }
     counters.verified += 1
     if (provider === ANONYMIZED_CHANNEL) counters.anonymized += 1
-    const seq = recordObservation(url, provider, null, sessionId)
+    // 回显模型在响应读完时已经见到，和 provider 一起同步落下；请求的 wire model 仍等
+    // modelPromise（见上）。
+    const servedModel = typeof evidence?.servedModel === 'string' ? evidence.servedModel : null
+    const seq = recordObservation(url, provider, null, sessionId, servedModel)
     Promise.resolve(modelPromise).then(
       (model) => completeObservation(seq, model),
       () => {},
@@ -1228,6 +1294,8 @@ export function createFetchObserver(config, logger = console) {
     const routings = []
     const providers = []
     const namespaces = []
+    /** 最后一个带 `model` 的帧胜出（网关每帧回显，中间帧也可能不带）。 */
+    let servedModel = null
     const MAX_EVIDENCE = 64
 
     const note = (frame) => {
@@ -1243,6 +1311,8 @@ export function createFetchObserver(config, logger = console) {
         seenProvider.add(provider)
         providers.push(provider)
       }
+      const served = servedModelOfText(text)
+      if (served !== null) servedModel = served
       const found = []
       for (const document of sseDocuments(text)) collectProviderNamespaces(document, found)
       for (const namespace of found) {
@@ -1255,7 +1325,7 @@ export function createFetchObserver(config, logger = console) {
     const finish = () => {
       if (finished) return
       finished = true
-      conclude(url, sessionId, modelPromise, { routings, providers, namespaces })
+      conclude(url, sessionId, modelPromise, { routings, providers, namespaces, servedModel })
     }
 
     const body = new ReadableStream({

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.17.0
+
+**观察者开始读「上游实际按哪个模型服务」：回退池（降级池）从不可见变成可见。**
+
+- 起因：`xiao-qiu-qiu/ClinePassBridge` v0.4.1（2026-10-29）把「实际服务模型 + 降级池」
+  做成了一等事实。它是对的：回退池是**模型档位**的路由决策，不是 provider 决策 ——
+  同一次请求可以 `finalProvider=deepseek`，而帧里回显
+  `vmc/deepseek-v4p1-flash-1017-contributor-fallbacks`。旧胶囊只看 provider，
+  这种情况会显示绿色的 `deepseek`，看起来「钉住了」。
+- 2026-10-31 的 live smoke 打到了真实的一例：`provider` 记成
+  `openai-compatible-private`，回显模型是
+  `vmc/deepseek-v4p1-flash-1017-contributor-fallbacks` —— 也就是说这不是理论形状，
+  本机流量当下就在回退池里。
+- 观察者现在在每条响应帧上读顶层 `model`（最后一个非空值胜出），记进
+  `lastVerified.servedModel`，并按后缀
+  （`contributor-fallbacks?` / `/fallbacks?` / `-fallbacks?`）判 `degraded`。
+  **不做等值比较**：主池回显 canonical slug（`deepseek/…`），请求 id 是
+  `cline-pass/…`，两者从来就不相等。
+- 同步落点：状态文件 `lastVerified` / `lastAnonymized`、`?status=1` 的
+  `servedModel` / `degraded`、胶囊（`Provider: deepseek · 降级池` + 警示图标 +
+  tooltip）。判定在响应读完时就有，`model` 仍等请求体 promise，两者不互相覆盖。
+- 新导出：`DEGRADED_MODEL_PATTERN`、`isDegradedModel()`、`servedModelOfText()`；
+  测试覆盖：后缀（含 `fallbackless` 反例）、最后一个非空帧、空值不覆盖、
+  流式/非流式、`?status=1`、观测时序与乱序请求。
+- 插件运行时行为**仍未改**：纯观察者，不改写请求、不重试、不另发请求。
+- 文档：README 的胶囊一节、状态文件字段表、验证清单同步；安装示例的 tag 更新到本版。
+
 ## 0.16.0
 
 **上游钉选修正：`gateway.has` 才是开关，0.15.0 那套（只写 `only`）一直是空转。**

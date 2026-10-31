@@ -256,7 +256,12 @@ let hook = null
       )
       if ((record.counters?.seen ?? 0) === 0) console.log('       (no gateway request since boot; send one and re-run to see the counters move)')
       if (record.lastVerified !== undefined && record.lastVerified !== null) {
-        console.log(`       last observed: ${record.lastVerified.at} ${record.lastVerified.provider} (${record.lastVerified.model ?? 'model unknown'})`)
+        console.log(
+          `       last observed: ${record.lastVerified.at} ${record.lastVerified.provider}` +
+            ` (${record.lastVerified.model ?? 'model unknown'})` +
+            ` served=${record.lastVerified.servedModel ?? '(not recorded)'}` +
+            ` degraded=${String(record.lastVerified.degraded ?? false)}`,
+        )
       }
       if (record.lastAnonymized !== undefined && record.lastAnonymized !== null) {
         console.log(`       last anonymized channel: ${record.lastAnonymized.at} ${record.lastAnonymized.provider}`)
@@ -307,6 +312,8 @@ let routing = null
 let content = ''
 let streamError = null
 let providersSeen = []
+/** The last top-level `model` this test read off the wire itself (independent of the observer). */
+let servedSeen = null
 if (key === undefined) {
   check('credential stored', false, `${keyRef} is missing — type it on Settings → Models`)
 } else {
@@ -342,6 +349,7 @@ if (key === undefined) {
       if (json.error !== undefined) streamError = json.error.message ?? JSON.stringify(json.error)
       for (const found of findRouting(json)) routing = found
       providersSeen = findProvider(json, providersSeen)
+      if (typeof json.model === 'string' && json.model.trim().length > 0) servedSeen = json.model.trim()
       for (const choice of json.choices ?? []) content += choice.delta?.content ?? ''
     } catch {
       /* partial frame */
@@ -365,6 +373,14 @@ if (key === undefined) {
     observed !== null && (expectedProvider === null || observed.provider === String(expectedProvider).trim().toLowerCase()),
     `observed=${observed?.provider ?? '(none)'} wire=${String(expectedProvider ?? '(none)')}`,
   )
+  // The served model is checked against this process's own reading of the same
+  // frames, not against the observer's own parser: if the two disagree, the
+  // degraded-pool judgement is looking at something other than the wire.
+  check(
+    '…and the served model it recorded matches the frames this test read',
+    observed !== null && (observed.servedModel ?? null) === servedSeen,
+    `observed=${String(observed?.servedModel ?? null)} wire=${String(servedSeen)}`,
+  )
   // The wire model is the one part of an observation that lands a moment later
   // (it needs the request body), so it gets its own wait and its own assertion —
   // never a wait on the whole `lastVerified`.
@@ -380,6 +396,11 @@ if (key === undefined) {
     console.log(`       the channel is anonymized as ${observed.provider} — the contributor-tier fallback net (see clinepass-deepseek-audit/)`)
   } else if (observed !== null) {
     console.log(`       served first-party-ish by: ${observed.provider}`)
+  }
+  if (observed?.degraded === true) {
+    console.log(`       DEGRADED POOL: the frames echo ${String(observed.servedModel)} — a model-tier decision the provider pin cannot avoid`)
+  } else if (observed !== null && observed.servedModel) {
+    console.log(`       served model: ${observed.servedModel}`)
   }
   if (Array.isArray(routing?.fallbacksAvailable) && routing.fallbacksAvailable.length > 0) {
     console.log(`       note: the routing metadata still lists ${routing.fallbacksAvailable.length} fallback channels (this is a fact about the gateway, not a decision this plugin makes)`)

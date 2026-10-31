@@ -112,6 +112,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           monthly: '每月',
           providerTitle: 'ClinePass 提供方',
           providerAwaiting: '等待 API 返回…',
+          providerDegradedBadge: '降级池',
+          providerDegradedTooltip: '降级池：上游实际按 {model} 服务。池子按模型档位选择，不是按提供方 —— 钉上游挡不住；该池通常不共享前缀缓存，首字更慢。',
           providerAnonymizedTooltip: 'deepseek 渠道已被网关匿名化为 openai-compatible-private（contributor 档：数据可能用于训练，无 ZDR）',
         },
         en: {
@@ -140,6 +142,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           monthly: 'Monthly',
           providerTitle: 'ClinePass Provider',
           providerAwaiting: 'Awaiting API response…',
+          providerDegradedBadge: 'degraded pool',
+          providerDegradedTooltip: 'Degraded pool: the upstream actually served {model}. The pool is selected by model tier, not by provider — pinning the provider cannot avoid it; the pool usually shares no prefix cache, so the first token is slower.',
           providerAnonymizedTooltip: 'deepseek channel anonymized by gateway as openai-compatible-private (contributor tier: data may be used for training, no ZDR)',
         },
       }
@@ -672,7 +676,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         ])
       }
 
-      function AnonymizedIcon() {
+      /** 警示三角：匿名渠道与回退池都用它 —— 两种都是「不是你以为的那条直连」。 */
+      function WarningIcon() {
         return React.createElement('svg', {
           viewBox: '0 0 16 16',
           width: 14,
@@ -726,7 +731,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         var lang = useLanguage(ctx)
         var t = TEXT[lang] || TEXT.zh
 
-        var statePair = React.useState({ provider: null, anonymized: false, model: null, at: null, loading: false })
+        var statePair = React.useState({ provider: null, anonymized: false, model: null, servedModel: null, degraded: false, at: null, loading: false })
         var status = statePair[0]
         var setStatus = statePair[1]
 
@@ -748,6 +753,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                   provider: data.provider,
                   anonymized: data.anonymized === true,
                   model: data.model,
+                  servedModel: data.servedModel || null,
+                  degraded: data.degraded === true,
                   at: data.at,
                   loading: false,
                 })
@@ -787,10 +794,13 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         }, [isClinepass, running, refresh])
 
         var isAnonymized = status.anonymized === true
+        var isDegraded = status.degraded === true
         var providerName = status.provider
-        var displayText = providerName ? ('Provider: ' + providerName) : 'Provider: --'
+        var displayText = providerName ? ('Provider: ' + providerName + (isDegraded ? ' · ' + t.providerDegradedBadge : '')) : 'Provider: --'
         var tooltip = providerName
-          ? (isAnonymized ? (providerName + ' — ' + t.providerAnonymizedTooltip) : ('网关返回提供方: ' + providerName))
+          ? (isDegraded
+              ? (providerName + ' — ' + fill(t.providerDegradedTooltip, { model: status.servedModel || '?' }))
+              : (isAnonymized ? (providerName + ' — ' + t.providerAnonymizedTooltip) : ('网关返回提供方: ' + providerName)))
           : t.providerAwaiting
 
         var hoverPair = React.useState(false)
@@ -800,8 +810,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         // 全部 hook 到此为止；下面才是「非本路由的卡片原样放过」。
         if (!isClinepass) return null
 
-        var icon = isAnonymized
-          ? React.createElement(AnonymizedIcon, null)
+        var icon = (isAnonymized || isDegraded)
+          ? React.createElement(WarningIcon, null)
           : React.createElement(ServerIcon, null)
 
         return React.createElement('span', {
@@ -824,7 +834,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           style: {
             boxSizing: 'border-box',
             maxWidth: '100%',
-            color: hovered ? LABEL_PRIMARY : (isAnonymized ? WARN : LABEL_TERTIARY),
+            color: hovered ? LABEL_PRIMARY : (isAnonymized || isDegraded ? WARN : LABEL_TERTIARY),
             font: 'inherit',
             fontVariantNumeric: 'tabular-nums',
             lineHeight: 'inherit',
