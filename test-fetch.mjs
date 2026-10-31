@@ -23,7 +23,6 @@ import {
   createFetchObserver,
   createUsageHandler,
   apply,
-  isDegradedModel,
   isGatewayChat,
   installPromptDisplay,
   isTerminatorFrame,
@@ -32,8 +31,9 @@ import {
   providersOfText,
   routingOfText,
   routingsOfText,
-  servedModelOfText,
   statusFileFor,
+  upstreamModelOfRoutings,
+  virtualModelOfText,
   withDefaults,
 } from './index.js'
 
@@ -69,10 +69,11 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const frame = (payload) => `data: ${typeof payload === 'string' ? payload : JSON.stringify(payload)}\n\n`
 const contentFrame = (index = 0) => frame({ id: 'gen_1', object: 'chat.completion.chunk', model: 'cline-pass/deepseek-v4.1-flash', choices: [{ index: 0, delta: { content: `tok${index}` }, finish_reason: null }] })
 /**
- * The same chunk as served by the contributor fallback pool: the routing still
- * names `deepseek` as the provider, and only the echoed model says otherwise.
+ * A chunk from a `cline-pass/*` request: the gateway echoes the **virtual model**
+ * (`vmc/…-contributor-fallbacks`) for the alias no matter which provider actually
+ * serves it, so this name must not be read as "served by the fallback pool".
  */
-const degradedFrame = (index = 0) => frame({ id: 'gen_1', object: 'chat.completion.chunk', model: 'vmc/deepseek-v4p1-flash-1017-contributor-fallbacks', choices: [{ index: 0, delta: { content: `tok${index}` }, finish_reason: null }] })
+const aliasFrame = (index = 0) => frame({ id: 'gen_1', object: 'chat.completion.chunk', model: 'vmc/deepseek-v4p1-flash-1017-contributor-fallbacks', choices: [{ index: 0, delta: { content: `tok${index}` }, finish_reason: null }] })
 const routingFrame = (routing) => frame({ choices: [{ index: 0, delta: { provider_metadata: { gateway: { routing } } } }] })
 const DONE = 'data: [DONE]\n\n'
 
@@ -80,9 +81,21 @@ const DONE = 'data: [DONE]\n\n'
 const DEEPSEEK_ROUTING = {
   finalProvider: 'deepseek',
   resolvedProvider: 'deepseek',
+  canonicalSlug: 'deepseek/deepseek-v4.1-flash-1017',
   affinity: { pinnedProvider: 'deepseek' },
   fallbacksAvailable: ['fireworks', 'baseten'],
   modelAttempts: [{ providerAttempts: [{ provider: 'deepseek', success: true, statusCode: 200 }] }],
+}
+
+/**
+ * The routing metadata for an unpinned turn: no `has`, so the gateway falls to the
+ * anonymous private channel and the canonical slug says `private/…-contributor`.
+ */
+const PRIVATE_ROUTING = {
+  finalProvider: 'openai-compatible-private',
+  resolvedProvider: 'openai-compatible-private',
+  canonicalSlug: 'private/deepseek-v4p1-flash-1017-contributor',
+  affinity: { pinnedProvider: 'openai-compatible-private' },
 }
 
 /** A response whose body is the given SSE frames, streamed one pull at a time. */
@@ -217,8 +230,13 @@ console.log('\n── 3. streaming observation ───────────
   check('…the wire model it answered for', status?.lastVerified?.model === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(status?.lastVerified))
   check('…the URL', status?.lastVerified?.url === CHAT, String(status?.lastVerified?.url))
   check('…and that it is not anonymized', status?.lastVerified?.anonymized === false, JSON.stringify(status?.lastVerified))
-  check('…the model the upstream echoed back', status?.lastVerified?.servedModel === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(status?.lastVerified?.servedModel))
-  check('…and that it was not the degraded pool', status?.lastVerified?.degraded === false, JSON.stringify(status?.lastVerified?.degraded))
+  check('…the virtual model the gateway echoed', status?.lastVerified?.virtualModel === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(status?.lastVerified?.virtualModel))
+  check('…and the canonical model it actually executed', status?.lastVerified?.upstreamModel === 'deepseek/deepseek-v4.1-flash-1017', JSON.stringify(status?.lastVerified?.upstreamModel))
+  check(
+    '…with no removed fields coming back',
+    !('degraded' in status.lastVerified) && !('servedModel' in status.lastVerified),
+    JSON.stringify(status.lastVerified),
+  )
   check('the counters are in the status file', status?.counters?.seen === 1 && status?.counters?.verified === 1, JSON.stringify(status?.counters))
   check('the file names the service and transport', status?.service === 'dsh-clinepass' && status?.transport === 'fetch', JSON.stringify(status?.service))
   check('…and reports the hook as installed', status?.hook === 'installed', String(status?.hook))
@@ -230,25 +248,37 @@ console.log('\n── 3. streaming observation ───────────
 }
 {
   // The anonymous fallback-net label: recorded as a fact, flagged, counted.
-  const routing = { finalProvider: 'openai-compatible-private', resolvedProvider: 'openai-compatible-private', affinity: { pinnedProvider: 'openai-compatible-private' } }
-  const result = await runObserved(() => sseResponse([contentFrame(), routingFrame(routing), DONE]))
+  const result = await runObserved(() => sseResponse([contentFrame(), routingFrame(PRIVATE_ROUTING), DONE]))
   check('the anonymous label is recorded as the provider', result.status?.lastVerified?.provider === 'openai-compatible-private', JSON.stringify(result.status?.lastVerified))
   check('…and flagged anonymized', result.status?.lastVerified?.anonymized === true, JSON.stringify(result.status?.lastVerified))
   check('…counted separately', result.observer.counters.anonymized === 1, JSON.stringify(result.observer.counters))
+  check('…with the private canonical slug as the upstream model', result.status?.lastVerified?.upstreamModel === 'private/deepseek-v4p1-flash-1017-contributor', JSON.stringify(result.status?.lastVerified?.upstreamModel))
+  check(
+    '…and the anonymized record carries both model fields',
+    result.status?.lastAnonymized?.virtualModel === 'cline-pass/deepseek-v4.1-flash' &&
+      result.status?.lastAnonymized?.upstreamModel === 'private/deepseek-v4p1-flash-1017-contributor',
+    JSON.stringify(result.status?.lastAnonymized),
+  )
   check('…and remembered as the last anonymized turn', result.status?.lastAnonymized?.provider === 'openai-compatible-private', JSON.stringify(result.status?.lastAnonymized))
   check('the observer says so in the log', result.logger.lines.warn.some((line) => line.includes('openai-compatible-private')), JSON.stringify(result.logger.lines.warn))
 }
 {
-  // The degraded pool: the routing still names `deepseek`, only the echoed model
-  // says the request was served by the contributor fallback tier.
-  const result = await runObserved(() => sseResponse([contentFrame(), degradedFrame(1), routingFrame(DEEPSEEK_ROUTING), DONE]))
+  // The production shape on 2026-10-31: the alias is pinned to first-party
+  // deepseek, so the routing names deepseek and the canonical slug is
+  // deepseek/…; the echoed model is still the virtual name. Both are recorded,
+  // and the virtual name must not be read as "served by a fallback pool".
+  const result = await runObserved(() => sseResponse([aliasFrame(), routingFrame(DEEPSEEK_ROUTING), DONE]))
   check(
-    'the degraded pool is read from the echoed model',
-    result.status?.lastVerified?.servedModel === 'vmc/deepseek-v4p1-flash-1017-contributor-fallbacks',
-    JSON.stringify(result.status?.lastVerified?.servedModel),
+    'the echoed virtual model is recorded as-is',
+    result.status?.lastVerified?.virtualModel === 'vmc/deepseek-v4p1-flash-1017-contributor-fallbacks',
+    JSON.stringify(result.status?.lastVerified?.virtualModel),
   )
-  check('…and flagged as degraded', result.status?.lastVerified?.degraded === true, JSON.stringify(result.status?.lastVerified))
-  check('…while the provider is still the one routing named', result.status?.lastVerified?.provider === 'deepseek', JSON.stringify(result.status?.lastVerified?.provider))
+  check(
+    '…while the canonical upstream model comes from the routing',
+    result.status?.lastVerified?.upstreamModel === 'deepseek/deepseek-v4.1-flash-1017',
+    JSON.stringify(result.status?.lastVerified?.upstreamModel),
+  )
+  check('…the provider is the routed first party', result.status?.lastVerified?.provider === 'deepseek', JSON.stringify(result.status?.lastVerified?.provider))
   check('…which is not the anonymous channel', result.status?.lastVerified?.anonymized === false, JSON.stringify(result.status?.lastVerified))
   check(
     '…and the observation is still counted as verified',
@@ -256,10 +286,20 @@ console.log('\n── 3. streaming observation ───────────
     JSON.stringify(result.observer.counters),
   )
   check(
-    '…and the log names the pool',
-    result.logger.lines.warn.some((line) => line.includes('degraded pool') && line.includes('contributor-fallbacks')),
+    '…and no warning calls it degraded',
+    !result.logger.lines.warn.some((line) => line.toLowerCase().includes('degraded')),
     JSON.stringify(result.logger.lines.warn),
   )
+}
+{
+  // Missing evidence stays null: no echoed model and no canonical slug are not
+  // the same thing as "the main pool".
+  const result = await runObserved(() =>
+    sseResponse([frame({ id: 'gen_1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: 'x' }, finish_reason: null }] }), routingFrame({ finalProvider: 'deepseek' }), DONE]),
+  )
+  check('no echoed model leaves virtualModel null', result.status?.lastVerified?.virtualModel === null, JSON.stringify(result.status?.lastVerified))
+  check('no canonical slug leaves upstreamModel null', result.status?.lastVerified?.upstreamModel === null, JSON.stringify(result.status?.lastVerified))
+  check('…while the provider is still read', result.status?.lastVerified?.provider === 'deepseek', JSON.stringify(result.status?.lastVerified))
 }
 {
   // No provider metadata at all: say so rather than guess.
@@ -300,8 +340,8 @@ console.log('\n── 4. non-streaming observation ─────────�
   check('a JSON response is returned to the caller unchanged', result.text === payload, JSON.stringify(result.text?.slice(0, 40)))
   check('…and its routing metadata is still read', result.status?.lastVerified?.provider === 'deepseek', JSON.stringify(result.status?.lastVerified))
   check("…with the model from the request's own body", result.status?.lastVerified?.model === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(result.status?.lastVerified))
-  check('…and the model the upstream echoed back', result.status?.lastVerified?.servedModel === 'deepseek/deepseek-v4.1-flash-1017', JSON.stringify(result.status?.lastVerified?.servedModel))
-  check('…which is the main pool, not the degraded one', result.status?.lastVerified?.degraded === false, JSON.stringify(result.status?.lastVerified?.degraded))
+  check('…the virtual model the gateway echoed', result.status?.lastVerified?.virtualModel === 'deepseek/deepseek-v4.1-flash-1017', JSON.stringify(result.status?.lastVerified?.virtualModel))
+  check('…and the canonical model it actually executed', result.status?.lastVerified?.upstreamModel === 'deepseek/deepseek-v4.1-flash-1017', JSON.stringify(result.status?.lastVerified?.upstreamModel))
 }
 {
   // A `Request` carries its own body: the model comes from a clone, the request
@@ -548,8 +588,9 @@ console.log('\n── 8. ?status=1 ───────────────
   check('the status route reports the observed provider', hitBody.ok === true && hitBody.provider === 'deepseek', JSON.stringify(hitBody))
   check('…with the anonymous flag', hitBody.anonymized === false, JSON.stringify(hitBody))
   check('…the model it belongs to', hitBody.model === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(hitBody))
-  check('…the model the upstream echoed back', hitBody.servedModel === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(hitBody))
-  check('…and that it was not the degraded pool', hitBody.degraded === false, JSON.stringify(hitBody))
+  check('…the virtual model the gateway echoed', hitBody.virtualModel === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(hitBody))
+  check('…and the canonical model it actually executed', hitBody.upstreamModel === 'deepseek/deepseek-v4.1-flash-1017', JSON.stringify(hitBody))
+  check('…with no removed fields coming back', !('degraded' in hitBody) && !('servedModel' in hitBody), JSON.stringify(hitBody))
   check('…and when it was seen', typeof hitBody.at === 'string' && hitBody.at.length > 0, JSON.stringify(hitBody))
   check('…and no gating fields leak in', !('warn' in hitBody) && !('allowed' in hitBody) && !('attempts' in hitBody), JSON.stringify(hitBody))
 }
@@ -593,18 +634,17 @@ console.log('\n── 9. parsing helpers ─────────────
   check('nothing at all is null', observedProviderOf({}) === null && observedProviderOf() === null)
 }
 {
-  // The degraded pool is a model-tier decision: recognised by suffix only, never
-  // by comparing the echoed id with the requested one (they never match).
-  check('the contributor fallback pool is degraded', isDegradedModel('vmc/deepseek-v4p1-flash-1017-contributor-fallbacks') === true)
-  check('a bare /fallback(s) suffix is degraded too', isDegradedModel('vendor/model-1017-fallback') === true && isDegradedModel('x/fallbacks') === true)
-  check('a "fallbackless" name is not', isDegradedModel('vendor/fallbackless-model') === false)
-  check('the canonical main-pool slug is not', isDegradedModel('deepseek/deepseek-v4.1-flash-1017') === false)
-  check('null and empty are not degraded', isDegradedModel(null) === false && isDegradedModel('') === false)
-  check('the suffix match is case-insensitive', isDegradedModel('vmc/X-Contributor-Fallbacks') === true)
-  check('the last model with content wins', servedModelOfText('data: {"model":"a/b"}\n\ndata: {"model":"c/d"}\n\n') === 'c/d')
-  check('a frame without a model does not erase it', servedModelOfText('data: {"model":"a/b"}\n\ndata: {"choices":[]}\n\n') === 'a/b')
-  check('the echoed model is trimmed', servedModelOfText('data: {"model":"  a/b  "}\n\n') === 'a/b')
-  check('no model anywhere is null', servedModelOfText('data: {"choices":[]}\n\n') === null && servedModelOfText('') === null)
+  // `canonicalSlug` is the gateway's "actually executed" model id; the echoed
+  // `model` is the alias's virtual model name and says nothing about the serving
+  // provider (2026-10-31: pinned deepseek still echoes vmc/…-contributor-fallbacks).
+  check('the last canonical slug wins', upstreamModelOfRoutings([{ canonicalSlug: 'private/y' }, { canonicalSlug: 'deepseek/x' }]) === 'deepseek/x')
+  check('blank slugs are skipped', upstreamModelOfRoutings([{ canonicalSlug: 'deepseek/x' }, { canonicalSlug: '   ' }, {}]) === 'deepseek/x')
+  check('the slug is trimmed', upstreamModelOfRoutings([{ canonicalSlug: '  deepseek/x  ' }]) === 'deepseek/x')
+  check('no routing is null', upstreamModelOfRoutings([]) === null && upstreamModelOfRoutings(null) === null)
+  check('the last echoed model with content wins', virtualModelOfText('data: {"model":"a/b"}\n\ndata: {"model":"c/d"}\n\n') === 'c/d')
+  check('a frame without a model does not erase it', virtualModelOfText('data: {"model":"a/b"}\n\ndata: {"choices":[]}\n\n') === 'a/b')
+  check('the echoed model is trimmed', virtualModelOfText('data: {"model":"  a/b  "}\n\n') === 'a/b')
+  check('no model anywhere is null', virtualModelOfText('data: {"choices":[]}\n\n') === null && virtualModelOfText('') === null)
 }
 
 // ── 10. a real HTTP round trip, through undici ──────────────────────────────
@@ -834,8 +874,8 @@ async function readToDone(response) {
       JSON.stringify(observer.status().lastVerified?.model),
     )
     check(
-      '…but the served model is already known (it came from the frames)',
-      observer.status().lastVerified?.servedModel === 'cline-pass/deepseek-v4.1-flash' && observer.status().lastVerified?.degraded === false,
+      '…but the virtual and upstream models are already known (they came from the frames)',
+      observer.status().lastVerified?.virtualModel === 'cline-pass/deepseek-v4.1-flash' && observer.status().lastVerified?.upstreamModel === 'deepseek/deepseek-v4.1-flash-1017',
       JSON.stringify(observer.status().lastVerified),
     )
     gated.release('cline-pass/deepseek-v4.1-flash')
@@ -859,8 +899,8 @@ async function readToDone(response) {
   const statusPath = path.join(SCRATCH, 'status-race.json')
   const real = globalThis.fetch
   const gated = gatedRequest()
-  const anonymous = { finalProvider: 'openai-compatible-private', resolvedProvider: 'openai-compatible-private' }
-  const responses = [() => sseResponse([degradedFrame(), routingFrame(DEEPSEEK_ROUTING), DONE]), () => sseResponse([contentFrame(), routingFrame(anonymous), DONE])]
+  const anonymous = PRIVATE_ROUTING
+  const responses = [() => sseResponse([aliasFrame(), routingFrame(DEEPSEEK_ROUTING), DONE]), () => sseResponse([contentFrame(), routingFrame(anonymous), DONE])]
   let served = 0
   globalThis.fetch = () => responses[served++]()
   const observer = createFetchObserver({ upstream: GATEWAY, statusFile: statusPath }, quiet)
@@ -872,8 +912,8 @@ async function readToDone(response) {
     check('the newest observation wins', observer.status().lastVerified?.provider === 'openai-compatible-private', JSON.stringify(observer.status().lastVerified))
     check('…with its own model', observer.status().lastVerified?.model === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(observer.status().lastVerified?.model))
     check(
-      '…and its own served model, not the degraded first one',
-      observer.status().lastVerified?.servedModel === 'cline-pass/deepseek-v4.1-flash' && observer.status().lastVerified?.degraded === false,
+      '…and its own virtual model, not the alias of the first one',
+      observer.status().lastVerified?.virtualModel === 'cline-pass/deepseek-v4.1-flash' && observer.status().lastVerified?.upstreamModel === 'private/deepseek-v4p1-flash-1017-contributor',
       JSON.stringify(observer.status().lastVerified),
     )
     gated.release('cline-pass/model-of-the-first-request')
@@ -885,8 +925,8 @@ async function readToDone(response) {
     )
     check('…nor replace its model', observer.status().lastVerified?.model === 'cline-pass/deepseek-v4.1-flash', JSON.stringify(observer.status().lastVerified?.model))
     check(
-      '…nor rewrite the served model that came with it',
-      observer.status().lastVerified?.servedModel === 'cline-pass/deepseek-v4.1-flash' && observer.status().lastVerified?.degraded === false,
+      '…nor rewrite the virtual/upstream models that came with it',
+      observer.status().lastVerified?.virtualModel === 'cline-pass/deepseek-v4.1-flash' && observer.status().lastVerified?.upstreamModel === 'private/deepseek-v4p1-flash-1017-contributor',
       JSON.stringify(observer.status().lastVerified),
     )
     check('…and the stale model is not indexed', observer.verifiedByModel('cline-pass/model-of-the-first-request') === undefined)

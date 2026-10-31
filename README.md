@@ -27,7 +27,7 @@ Provider 观察与用量报告搬进 pi；两边按发布版本互相同步，�
 
 ```bash
 dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseek
-# 钉某个 tag：同上，末尾加 #v0.17.0
+# 钉某个 tag：同上，末尾加 #v0.17.1
 ```
 
 包自己声明了 `dsh.bundle.patch`，所以 `dsh plugin`（pnpm 的转发器）装上它之后会把这个包追加到
@@ -109,19 +109,23 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
 在 composer 底部，显示这条路由**最近一次真实上游**：
 
 - 有结论时是 `Provider: <名字>`（例如 `Provider: deepseek`）；悬停有说明，点一下立即重读；
-- 网关返回**匿名标签** `openai-compatible-private`（VMC 回退网形状）时换成警示色 + 专门图标 +
+- 网关返回**匿名标签** `openai-compatible-private`（VMC 私有通道形状）时换成警示色 + 专门图标 +
   tooltip（contributor 档：数据可能用于训练，无 ZDR）；
-- 网关把请求放进**回退池**（帧里回显 `vmc/…-contributor-fallbacks` 这类模型名）时显示
-  `Provider: deepseek · 降级池`，同样换警示图标 + tooltip。**回退池是模型档位的决策，不是
-  provider 的**：`finalProvider=deepseek` 的请求照样可能落进去，`only`/`has` 钉住挡不住它；
+- 状态文件另外记两个模型名，胶囊本身不据此改变样式：`virtualModel` 是帧里回显的**虚拟模型名**
+  （`cline-pass/…` 这个别名解析出来的，钉不钉住都一样），`upstreamModel` 是
+  `routing.canonicalSlug`（真正执行的规范 id：`deepseek/…` = 第一方，`private/…-contributor`
+  = 匿名私有通道）。**回显名不代表服务方**，不要拿它判断落点；
 - 还没观察到任何结论时显示 `Provider: --`（tooltip「等待 API 返回…」）；
 - 数据来自状态文件，经宿主路由 `?status=1` 暴露；按 session → model 两级记忆；
 - **读不到元数据就不给结论**：那种响应只计 `seen`，胶囊保持上一次的结论（或 `--`）。
 
-判定只认回显模型名的**后缀**（`contributor-fallbacks?` / `/fallbacks?` / `-fallbacks?`），
-不拿它和请求的 model 做等值比较 —— 主池回显 canonical slug（`deepseek/…`），请求 id 是
-`cline-pass/…`，两者从来就不相等。已知边界：网关不再回显 `model` 时 `servedModel` 是 null、
-`degraded` 是 false（读不到就不猜）；`?status=1` 里 `servedModel: null` 就是形状变了的口子。
+2026-10-31 实测（`clinepass-deepseek-audit/evidence/samples/2026-10-31-response-shape/`）：
+生产配置带上 `providerOptions.gateway = { only: [deepseek], has: [vision, implicit-caching] }`
+后，网关规划日志写 `Provider set restricted to: deepseek`、`canonicalSlug=deepseek/…`、冷前缀
+第二轮缓存命中 5888/6045，而回显仍是 `vmc/…-contributor-fallbacks` —— 回显的是别名的虚拟模型
+名，不是服务方。所以本插件**不从回显名推断落点**，只如实记录两个名字；落点看 `provider` 与
+`upstreamModel`。已知边界：网关不再回显 `model` 时 `virtualModel` 是 null；routing 里没有
+`canonicalSlug` 时 `upstreamModel` 是 null（读不到就不猜）。
 
 服务端在放行终止帧之前就写完结论，所以一轮结束通常立刻可见；胶囊在回合结束后还会补读一次，
 运行中每 2 秒刷新一次。
@@ -398,7 +402,7 @@ cat ~/.dsh/dsh-clinepass-status.json
 | `counters.verified` | 读出了真实 provider 的数量 |
 | `counters.anonymized` | 结论是匿名标签 `openai-compatible-private` 的数量 |
 | `counters.unknown` | 响应里根本没有 provider 元数据的数量 |
-| `lastVerified` / `lastAnonymized` | 最近一条结论：`{at, url, provider, model, servedModel, degraded, sessionId, anonymized}`；`model` 是**请求**的 wire id，`servedModel` 是网关**回显**的实际服务模型（`degraded` 按它的后缀判定） |
+| `lastVerified` / `lastAnonymized` | 最近一条结论：`{at, url, provider, model, virtualModel, upstreamModel, sessionId, anonymized}`；`model` 是**请求**的 wire id，`virtualModel` 是帧回显的虚拟模型名（别名解析结果），`upstreamModel` 是 `routing.canonicalSlug`（实际执行的规范模型 id） |
 | `provision` / `provisionReason` | provider 卡片的登记结果与原因（`created` / `present` / `repaired` / `mismatch` / `off` / `pending` / `failed` / `unavailable`） |
 | `ignoredOptions` | 被忽略的遗留配置键 |
 | `pid` / `at` | 进程号 / 落盘时间 |
@@ -484,7 +488,7 @@ leaves the picker showing a "Provider default" entry.
 
 **Verify**: `npm test`, the two `checks/` scripts (they import the *installed* copy, so deploy
 first), `smoke-test.mjs`, and `cat ~/.dsh/dsh-clinepass-status.json` (`hook`, `counters.seen` /
-`verified` / `anonymized` / `unknown`, `lastVerified` including `servedModel` / `degraded`,
+`verified` / `anonymized` / `unknown`, `lastVerified` including `virtualModel` / `upstreamModel`,
 `provision`, `ignoredOptions`).
 
 A companion [pi extension](https://github.com/BreakFree003/pi-clinepass-deepseek) mirrors the same models,

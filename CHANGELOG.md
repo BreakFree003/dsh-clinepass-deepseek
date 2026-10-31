@@ -1,6 +1,36 @@
 # Changelog
 
+## 0.17.1
+
+**撤掉 0.17.0 的「降级池」判定：它把每一条钉住第一方的生产请求都误判成回退池。**
+
+- 0.17.0 用帧回显 `model` 的后缀判 `degraded`。2026-10-31 复测
+  （`clinepass-deepseek-audit/evidence/samples/2026-10-31-response-shape/pin-matrix.md`）
+  证明这个信号在这条网关上无效：`cline-pass/…` 是别名，网关先把它解析成虚拟模型
+  `deepseek-v4p1-flash-1017-contributor-fallbacks`，再在候选池里选 provider；**回显的
+  `model` 就是这个虚拟模型名，钉住第一方 deepseek 时也一字不变**。
+- 钉住后的真实形状（生产配置 `gateway.only=[deepseek] + has=[vision, implicit-caching]`）：
+  `finalProvider=deepseek`、`canonicalSlug=deepseek/deepseek-v4.1-flash-1017`、
+  `planningReasoning` 写明 `Provider set restricted to: deepseek`；冷前缀（6045 token）
+  第二轮缓存命中 5888、费用降到 1/21.4。未钉住（无 `has`）才是
+  `openai-compatible-private` + `private/…-contributor`，两轮都 0 缓存。
+- 因此删除 `DEGRADED_MODEL_PATTERN`、`isDegradedModel()`、`degraded` 字段，以及胶囊的
+  「降级池」角标 / 文案 / 图标分支；`servedModelOfText()` 更名为 `virtualModelOfText()`
+  （语义是「帧回显的虚拟模型名」，不是服务方）。
+- 新增 `upstreamModelOfRoutings()`：从 `routing.canonicalSlug` 读**实际执行**的规范模型 id，
+  记进 `lastVerified.upstreamModel`；`?status=1` 返回 `virtualModel` / `upstreamModel`
+  两个字段。落点判断用 `provider` + `upstreamModel`，不再从回显名推断。
+- 测试随之改写：降级后缀用例换成 canonicalSlug 提取、别名回显与钉住/未钉住两种形状、
+  `?status=1` 新字段、时序里两个模型名都不被迟到请求覆盖。
+- 0.17.0 从未打 tag、从未发布，本版取代它；插件运行时行为仍未改（纯观察者）。
+
 ## 0.17.0
+
+**（已被 0.17.1 撤销；本版从未发布。）** 更正：本段把回显 `model` 当成「实际服务模型」，
+据此判定回退池 —— 实测证明回显的是别名的虚拟模型名，钉住第一方 deepseek 时也不变；
+落点看 `routing.finalProvider` / `canonicalSlug`（见 0.17.1 与
+`clinepass-deepseek-audit/evidence/samples/2026-10-31-response-shape/pin-matrix.md`）。
+
 
 **观察者开始读「上游实际按哪个模型服务」：回退池（降级池）从不可见变成可见。**
 

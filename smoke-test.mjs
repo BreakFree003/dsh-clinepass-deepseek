@@ -259,8 +259,8 @@ let hook = null
         console.log(
           `       last observed: ${record.lastVerified.at} ${record.lastVerified.provider}` +
             ` (${record.lastVerified.model ?? 'model unknown'})` +
-            ` served=${record.lastVerified.servedModel ?? '(not recorded)'}` +
-            ` degraded=${String(record.lastVerified.degraded ?? false)}`,
+            ` virtual=${record.lastVerified.virtualModel ?? '(not recorded)'}` +
+            ` upstream=${record.lastVerified.upstreamModel ?? '(not recorded)'}`,
         )
       }
       if (record.lastAnonymized !== undefined && record.lastAnonymized !== null) {
@@ -313,7 +313,7 @@ let content = ''
 let streamError = null
 let providersSeen = []
 /** The last top-level `model` this test read off the wire itself (independent of the observer). */
-let servedSeen = null
+let echoedSeen = null
 if (key === undefined) {
   check('credential stored', false, `${keyRef} is missing — type it on Settings → Models`)
 } else {
@@ -349,7 +349,7 @@ if (key === undefined) {
       if (json.error !== undefined) streamError = json.error.message ?? JSON.stringify(json.error)
       for (const found of findRouting(json)) routing = found
       providersSeen = findProvider(json, providersSeen)
-      if (typeof json.model === 'string' && json.model.trim().length > 0) servedSeen = json.model.trim()
+      if (typeof json.model === 'string' && json.model.trim().length > 0) echoedSeen = json.model.trim()
       for (const choice of json.choices ?? []) content += choice.delta?.content ?? ''
     } catch {
       /* partial frame */
@@ -373,13 +373,18 @@ if (key === undefined) {
     observed !== null && (expectedProvider === null || observed.provider === String(expectedProvider).trim().toLowerCase()),
     `observed=${observed?.provider ?? '(none)'} wire=${String(expectedProvider ?? '(none)')}`,
   )
-  // The served model is checked against this process's own reading of the same
+  // The echoed model is checked against this process's own reading of the same
   // frames, not against the observer's own parser: if the two disagree, the
-  // degraded-pool judgement is looking at something other than the wire.
+  // observer is looking at something other than the wire.
   check(
-    '…and the served model it recorded matches the frames this test read',
-    observed !== null && (observed.servedModel ?? null) === servedSeen,
-    `observed=${String(observed?.servedModel ?? null)} wire=${String(servedSeen)}`,
+    '…and the virtual model it recorded matches the frames this test read',
+    observed !== null && (observed.virtualModel ?? null) === echoedSeen,
+    `observed=${String(observed?.virtualModel ?? null)} wire=${String(echoedSeen)}`,
+  )
+  check(
+    '…and the canonical upstream model matches the routing metadata',
+    observed !== null && (observed.upstreamModel ?? null) === (routing?.canonicalSlug ?? null),
+    `observed=${String(observed?.upstreamModel ?? null)} wire=${String(routing?.canonicalSlug ?? null)}`,
   )
   // The wire model is the one part of an observation that lands a moment later
   // (it needs the request body), so it gets its own wait and its own assertion —
@@ -395,12 +400,13 @@ if (key === undefined) {
   if (observed?.anonymized === true) {
     console.log(`       the channel is anonymized as ${observed.provider} — the contributor-tier fallback net (see clinepass-deepseek-audit/)`)
   } else if (observed !== null) {
-    console.log(`       served first-party-ish by: ${observed.provider}`)
+    console.log(`       routed by the gateway to: ${observed.provider}`)
   }
-  if (observed?.degraded === true) {
-    console.log(`       DEGRADED POOL: the frames echo ${String(observed.servedModel)} — a model-tier decision the provider pin cannot avoid`)
-  } else if (observed !== null && observed.servedModel) {
-    console.log(`       served model: ${observed.servedModel}`)
+  if (observed !== null && observed.upstreamModel) {
+    console.log(`       canonical upstream model: ${observed.upstreamModel}`)
+  }
+  if (observed !== null && observed.virtualModel) {
+    console.log(`       virtual model echoed by the alias: ${observed.virtualModel}`)
   }
   if (Array.isArray(routing?.fallbacksAvailable) && routing.fallbacksAvailable.length > 0) {
     console.log(`       note: the routing metadata still lists ${routing.fallbacksAvailable.length} fallback channels (this is a fact about the gateway, not a decision this plugin makes)`)
