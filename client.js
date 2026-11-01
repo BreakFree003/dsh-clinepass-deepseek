@@ -123,6 +123,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendResetHint: '以当前累计值为新起点，把显示的数字归零',
           spendConfirm: '确认重置？',
           spendHint: '按 DeepSeek 官方峰谷价累计；旧会话的历史不计入',
+          spendUnreachable: '读不到本地投影缓存，累计暂时不可用',
           // ── 成本（官方峰谷价）──
           costTitle: 'DeepSeek 官方价（按每次请求发生的时刻判峰谷）',
           costActual: '实际 {cost}',
@@ -175,6 +176,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendResetHint: 'Make the current total the new starting point and show 0',
           spendConfirm: 'Confirm reset?',
           spendHint: 'Accumulated at the DeepSeek list price; history of older sessions is excluded',
+          spendUnreachable: 'The local projection cache is unreadable; the total is unavailable',
           // ── cost (official peak/off-peak price) ──
           costTitle: 'DeepSeek list price (peak/off-peak by the time of each request)',
           costActual: 'actual {cost}',
@@ -227,18 +229,20 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         return true
       }
 
-      /** 累计值路由（宿主注入；缺省同上，读不到就整段不显示）。 */
+      /**
+       * 累计值路由。固定常量，不通过 boot global 宣布 —— 它不可配置，宣布一个可能没注册
+       * 成功的路径只会让浏览器白打一条 404（失败时形状检查会整段隐藏）。
+       */
       function spendRoute() {
-        var boot = window[BOOT_GLOBAL]
-        if (boot !== null && typeof boot === 'object' && typeof boot.spendRoute === 'string' && boot.spendRoute.length > 0) return boot.spendRoute
         return '/api/clinepass.spend'
       }
 
-      /** 累计值请求路径（同源，不需要 origin）。 */
+      /** 累计值请求路径（同源；保留 query —— 路由可配置时 query 可能是认证的一部分）。 */
       function spendUrl() {
         var base = spendRoute()
         try {
-          return new URL(base, 'http://127.0.0.1:3080').pathname
+          var parsed = new URL(base, 'http://127.0.0.1:3080')
+          return parsed.pathname + parsed.search
         } catch {
           return base
         }
@@ -573,9 +577,21 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
             .then(function (body) {
               if (spendGeneration.current !== mine) return
               if (body !== null && typeof body === 'object' && body.ok === true) setSpendState({ status: 'ready', body: body })
+              // 写失败（500）要把话说出来：之前这里静默吞掉，用户点了两次「确认」什么都没发生。
+              else setSpendState(function (previous) {
+                return { status: 'failed', body: previous.body, error: 'reset' }
+              })
             })
-            .catch(function () {})
-            .then(function () { setResetArmed(0) })
+            .catch(function (error) {
+              if (spendGeneration.current !== mine) return
+              setSpendState(function (previous) {
+                return { status: 'failed', body: previous.body, error: error && error.name === 'AbortError' ? 'timeout' : 'network' }
+              })
+            })
+            .then(function () {
+              if (spendGeneration.current !== mine) return
+              setResetArmed(0)
+            })
         }, [])
 
         var load = React.useCallback(
@@ -829,7 +845,11 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                     { style: { fontSize: 18, fontWeight: 600, lineHeight: 1.4, fontVariantNumeric: 'tabular-nums' } },
                     amountText,
                   ),
-                    React.createElement('div', { style: { color: LABEL_TERTIARY, fontSize: 11 } }, t.spendHint),
+                    React.createElement(
+                      'div',
+                      { style: { color: spend.reachable === false ? WARN : LABEL_TERTIARY, fontSize: 11 } },
+                      spend.reachable === false ? t.spendUnreachable : t.spendHint,
+                    ),
                 )
               })()
             : null,
@@ -1080,8 +1100,21 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
 
       /** `useSessions` 的兜底：dock 契约总会给，这里保证缺了也不炸（返回空 store）。 */
       var EMPTY_SESSION_LIST = { byId: {} }
-      function selectEmptySessions(selector) {
-        return selector(EMPTY_SESSION_LIST)
+      var emptySubscribe = function () {
+        return function () {}
+      }
+      var emptySnapshot = function () {
+        return EMPTY_SESSION_LIST
+      }
+      /**
+       * `props.useSessions` 缺席时的替身。
+       *
+       * 必须是**函数组件语义上的 hook**（内部调一个 `useSyncExternalStore`），不能用
+       * 普通函数 `selector(EMPTY_SESSION_LIST)` —— 那样 `useSessions` 的有无会改变本组件
+       * 的 hook 数量，从「有」切到「无」就是 React 的 "Rendered more hooks" 崩法。
+       */
+      function useEmptySessions(selector) {
+        return selector(React.useSyncExternalStore(emptySubscribe, emptySnapshot))
       }
 
       /**
@@ -1139,7 +1172,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         //   `isSubagentOf` 规则聚合 —— 子代理的投影跳过 seeded 继承前缀，直接相加
         //   不会把父会话的历史算第二遍。
         var costView = useProjection ? useProjection('clinepassCost') : undefined
-        var subscribeSessions = typeof useSessions === 'function' ? useSessions : selectEmptySessions
+        var subscribeSessions = typeof useSessions === 'function' ? useSessions : useEmptySessions
         var subagentCost = subscribeSessions(function (state) {
           return subagentCostOf(state ? state.byId : undefined, sessionId)
         }, sameCostView)
@@ -1256,21 +1289,27 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
          * 位置在**点击那一刻**按锚点算一次（fixed + bottom）：面板在 dock 上方展开，
          * 内容再长也只会向上长。dock 贴着窗口底边，所以不需要跟随滚动。
          */
+        var reposition = React.useCallback(function () {
+          var rect = rootRef.current ? rootRef.current.getBoundingClientRect() : null
+          var viewportWidth = typeof window === 'undefined' ? 360 : window.innerWidth
+          var viewportHeight = typeof window === 'undefined' ? 800 : window.innerHeight
+          var width = Math.min(340, viewportWidth - 16)
+          // 拿不到锚点（测试/首帧）时贴右下角，而不是干脆不显示。
+          var left = rect === null ? Math.max(8, viewportWidth - width - 8) : Math.max(8, Math.min(rect.left, viewportWidth - width - 8))
+          var bottom = rect === null ? 8 : Math.max(8, Math.min(viewportHeight - 8, viewportHeight - rect.top + 6))
+          setPos({ left: left, bottom: bottom, width: width })
+        }, [])
+
         var toggleOpen = React.useCallback(function () {
           if (open) {
             setOpen(false)
             return
           }
-          var rect = rootRef.current ? rootRef.current.getBoundingClientRect() : null
-          var viewportWidth = typeof window === 'undefined' ? 360 : window.innerWidth
-          var width = Math.min(340, viewportWidth - 16)
-          var left = rect === null ? 8 : Math.max(8, Math.min(rect.left, viewportWidth - width - 8))
-          var bottom = rect === null ? 8 : Math.max(8, window.innerHeight - rect.top + 6)
-          setPos({ left: left, bottom: bottom, width: width })
+          reposition()
           setOpen(true)
           // 点开时顺手重读一次上游，和点胶囊原来的行为一致。
           refresh()
-        }, [open, refresh])
+        }, [open, reposition, refresh])
 
         // 点外面 / Esc 收起。监听挂在 document 上，effect 只在打开期间存在。
         React.useEffect(function () {
@@ -1286,11 +1325,14 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           }
           document.addEventListener('mousedown', onDown)
           document.addEventListener('keydown', onKey)
+          // 窗口尺寸变了要重新贴住锚点，否则底部 dock 一动面板就飘了。
+          window.addEventListener('resize', reposition)
           return function () {
             document.removeEventListener('mousedown', onDown)
             document.removeEventListener('keydown', onKey)
+            window.removeEventListener('resize', reposition)
           }
-        }, [open])
+        }, [open, reposition])
 
         // 全部 hook 到此为止；下面才是「非本路由的卡片原样放过」。
         if (!isClinepass) return null
@@ -1324,12 +1366,12 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         }
 
         /**
-         * 明细里的金额：≥ ¥0.01 固定两位（¥0.20 比 ¥0.200 稳），更小的才给四位
-         * （子代理常常只花几厘钱，两位会全变成 ¥0.00）。0 也显示，不留空。
+         * 明细里的金额：**和胶囊用同一个格式化**（4/3/2 位随量级），两处显示同一个数时
+         * 不会出现 ¥0.156 / ¥0.16 这种对不上。0 也显示，不留空。
          */
         var money = function (value) {
-          if (typeof value !== 'number' || !isFinite(value) || value <= 0) return '¥0.00'
-          return '¥' + value.toFixed(value < 0.01 ? 4 : 2)
+          var text = formatCny(value)
+          return text === null ? '¥0.00' : text
         }
 
         var panelChildren = null

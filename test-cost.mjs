@@ -337,6 +337,60 @@ if (zod === null || typeof zod.object !== 'function') {
   check('非法 view 被拒（缺 requests）', rejects(definition.wire.viewSchema, { ...goodView, requests: undefined }), '这是 2026-11-02 事故的形状')
 }
 
+{
+  // 边界：前缀只到 inheritedEventCount - 1，所以 seq === inheritedEventCount 的那条**要算**。
+  let state = initCostState({}, 5)
+  state = applyCostEvent(state, header(5, PEAK_TIME))
+  state = applyCostEvent(state, message(6, PEAK_TIME, 1, 1, usage(1000, 100, 4000)))
+  check('seq 等于 inheritedEventCount 的 header 计入（路由建立）', costViewOf(state).requests === 1, JSON.stringify(costViewOf(state)))
+  let skipped = initCostState({}, 5)
+  skipped = applyCostEvent(skipped, header(4, PEAK_TIME))
+  skipped = applyCostEvent(skipped, message(4, PEAK_TIME, 1, 1, usage(1000, 100, 4000)))
+  check('…而 seq 小于它的一律跳过（连路由都不建立）', costViewOf(skipped).requests === 0 && skipped.route === null, JSON.stringify(costViewOf(skipped)))
+}
+
+{
+  // 价表只覆盖 flash 快照：同路由换 v4-pro 时不能拿 flash 的价去算（会低估 3–7 倍）。
+  let state = initCostState({}, 0)
+  state = applyCostEvent(state, header(1, PEAK_TIME, 'cline-pass', 'cline-pass/deepseek-v4-pro'))
+  state = applyCostEvent(state, message(2, PEAK_TIME, 1, 1, usage(1000, 100, 4000)))
+  check('未覆盖的模型不计价（不按 flash 低估）', costViewOf(state).requests === 0 && costViewOf(state).cny === 0, JSON.stringify(costViewOf(state)))
+  check('flash 快照仍然计价', (() => {
+    let ok = initCostState({}, 0)
+    ok = applyCostEvent(ok, header(1, PEAK_TIME))
+    ok = applyCostEvent(ok, message(2, PEAK_TIME, 1, 1, usage(1000, 100, 4000)))
+    return costViewOf(ok).requests === 1
+  })())
+  let switched = initCostState({}, 0)
+  switched = applyCostEvent(switched, header(1, PEAK_TIME))
+  switched = applyCostEvent(switched, message(2, PEAK_TIME, 1, 1, usage(1000, 100, 4000)))
+  switched = applyCostEvent(switched, header(3, PEAK_TIME, 'cline-pass', 'cline-pass/deepseek-v4-pro'))
+  switched = applyCostEvent(switched, message(4, PEAK_TIME, 1, 2, usage(9_000_000, 0, 0)))
+  check('中途换到未覆盖模型时只保留已计价的那条', costViewOf(switched).requests === 1, JSON.stringify(costViewOf(switched)))
+}
+
+{
+  // 不依赖 zod 的形状闸：view 的字段集合是契约，改了就必须同步改这里。
+  // 2026-11-02 那次事故就是「状态算对了、视图少一个字段」，宿主的 viewSchema 直接拒绝。
+  let state = initCostState({}, 0)
+  state = applyCostEvent(state, header(1, PEAK_TIME))
+  state = applyCostEvent(state, message(2, PEAK_TIME, 1, 1, usage(1000, 100, 4000)))
+  const view = costViewOf(state)
+  const viewKeys = Object.keys(view).sort().join(',')
+  check(
+    'view 的字段集合固定',
+    viewKeys === 'cny,cnyPeak,offCny,peakCny,peakRequests,pricing,requests,tokens',
+    viewKeys,
+  )
+  const tokenKeys = Object.keys(view.tokens).sort().join(',')
+  check('view.tokens 只有四个桶（没有 requests）', tokenKeys === 'cacheRead,cacheWrite,output,uncachedInput', tokenKeys)
+  check(
+    'view 里所有数值都是非负有限数',
+    ['cny', 'cnyPeak', 'peakCny', 'offCny', 'requests', 'peakRequests'].every((key) => Number.isFinite(view[key]) && view[key] >= 0),
+    JSON.stringify(view),
+  )
+}
+
 // ═══════════════════════════ 结果 ═══════════════════════════
 
 if (failures.length > 0) {

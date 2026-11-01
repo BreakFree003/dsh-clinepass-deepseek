@@ -121,7 +121,8 @@ export async function sumCachedCosts(dir) {
   try {
     names = await fs.promises.readdir(dir)
   } catch {
-    return { sessions, scanned: 0, errors: 1, skipped: 0 }
+    // 目录读不到要能和「真的没有花费」区分：调用方把 `reachable: false` 一路带到界面上。
+    return { sessions, scanned: 0, errors: 1, skipped: 0, reachable: false }
   }
   let scanned = 0
   let errors = 0
@@ -170,7 +171,7 @@ export async function sumCachedCosts(dir) {
       }
     }),
   )
-  return { sessions, scanned, errors, skipped }
+  return { sessions, scanned, errors, skipped, reachable: true }
 }
 
 /**
@@ -253,6 +254,7 @@ export function createSpendHandler(options = {}) {
           scanned: scanned.scanned,
           errors: scanned.errors,
           skipped: scanned.skipped,
+          reachable: scanned.reachable,
           at: new Date(at).toISOString(),
         }
         cache = { at, body }

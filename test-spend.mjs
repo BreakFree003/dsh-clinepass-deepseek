@@ -29,7 +29,8 @@ const stateOf = (cacheRead = 4000, requests = 1) => ({
   last: null,
 })
 
-const CNY_ONE = costViewOf(stateOf()).cny
+/** 一次请求的实际金额（写死，不用 costViewOf 现算 —— 否则求和断言是自证）。 */
+const CNY_ONE = 0.00296
 const near = (a, b) => Math.abs(a - b) < 1e-9
 
 /** 写一个投影缓存文件（形状与宿主落盘的 `{record:{identity,rows:{key:{seq,ver,val}}}}` 一致）。 */

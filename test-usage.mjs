@@ -705,7 +705,15 @@ console.log('\n── 8. client render ─────────────�
    * 展开面板会 `document.addEventListener` + `createPortal(…, document.body)`。
    * 这里给一个最小替身：**只在打开时**才会被碰到，所以收起态的行为一点没变。
    */
-  globalThis.document = { body: {}, addEventListener() {}, removeEventListener() {} }
+  globalThis.document = {
+    body: {},
+    __listeners: [],
+    addEventListener(type, fn) { this.__listeners.push({ type, fn }) },
+    removeEventListener(type, fn) {
+      const index = this.__listeners.findIndex((entry) => entry.type === type && entry.fn === fn)
+      if (index >= 0) this.__listeners.splice(index, 1)
+    },
+  }
 
   globalThis.window = {
     __ModuleLoader__: {
@@ -718,6 +726,12 @@ console.log('\n── 8. client render ─────────────�
     __CALLS__: [],
     __TIMERS__: { started: 0, cleared: 0, ids: new Set() },
     location: { origin: 'http://127.0.0.1:3080' },
+    __windowListeners: [],
+    addEventListener(type, fn) { this.__windowListeners.push({ type, fn }) },
+    removeEventListener(type, fn) {
+      const index = this.__windowListeners.findIndex((entry) => entry.type === type && entry.fn === fn)
+      if (index >= 0) this.__windowListeners.splice(index, 1)
+    },
     fetch: (url, init) => {
       globalThis.window.__CALLS__.push({ url, init })
       const isSpend = String(url).includes('/clinepass.spend')
@@ -1154,7 +1168,7 @@ console.log('\n── 8. client render ─────────────�
       const off = Date.UTC(2026, 10, 2, 12, 0, 0) // 2026-11-02 20:00 +08（谷）
       const usage = { inputTokens: 2000, outputTokens: 5000, cacheReadTokens: 1_500_000 }
       let state = initCostState({}, 0)
-      state = applyCostEvent(state, { type: 'request/header', seq: 1, time: peak, data: { header: { config: { provider: 'cline-pass', model: 'cline-pass/x' } } } })
+      state = applyCostEvent(state, { type: 'request/header', seq: 1, time: peak, data: { header: { config: { provider: 'cline-pass', model: 'cline-pass/deepseek-v4.1-flash-1017' } } } })
       state = applyCostEvent(state, { type: 'assistant/message', seq: 2, time: peak, data: { turn: 1, step: 1, message: {}, usage } })
       state = applyCostEvent(state, { type: 'assistant/message', seq: 3, time: off, data: { turn: 1, step: 2, message: {}, usage } })
       return costViewOf(state)
@@ -1176,15 +1190,25 @@ console.log('\n── 8. client render ─────────────�
     check('点一下展开面板', countProp(costDock, 'data-clinepass-panel') === 1)
     const panelText = textOf(costDock).join(' | ')
     check('面板有本会话小计', panelText.includes('This session'))
-    check('面板有峰谷拆分（不带次数）', panelText.includes('Peak ¥0.10') && panelText.includes('Off-peak ¥0.05') && !panelText.includes(' req'), panelText)
+    check('面板有峰谷拆分（不带次数）', panelText.includes('Peak ¥0.104') && panelText.includes('Off-peak ¥0.052') && !panelText.includes(' req'), panelText)
     check('面板有 token 四桶', panelText.includes('3.00M') && panelText.includes('4.0k') && panelText.includes('10.0k'), panelText)
     check('面板不再显示请求数', !panelText.includes('Requests'), panelText)
     check('面板缓存命中率两位小数', panelText.includes('Cache hit 99.87%'), panelText)
-    check('面板有 ClinePass 计费（恒按高峰）', panelText.includes('ClinePass billing') && panelText.includes('¥0.21'), panelText)
+    check('面板有 ClinePass 计费（恒按高峰）', panelText.includes('ClinePass billing') && panelText.includes('¥0.208'), panelText)
     check('面板不再显示峰谷规则/价表说明', !panelText.includes('Peak: Mon') && !panelText.includes('2026-11-02'), panelText)
     costDock.children[0].props.onClick()
     costDock = await renderChecked(costMount.dockSeat, costMount.stub, costProps(), 'closing the panel')
     check('再点收起', countProp(costDock, 'data-clinepass-panel') === 0)
+    // 监听器必须是「开着才有、关了就没」：外点/Esc 的实现靠它，泄漏会在切会话时越积越多。
+    costDock.children[0].props.onClick()
+    costDock = await renderChecked(costMount.dockSeat, costMount.stub, costProps(), 'reopening the panel')
+    const docTypes = globalThis.document.__listeners.map((l) => l.type).sort().join(',')
+    const winTypes = globalThis.window.__windowListeners.map((l) => l.type).sort().join(',')
+    check('打开时挂了 mousedown/keydown', docTypes === 'keydown,mousedown', docTypes)
+    check('打开时挂了 resize', winTypes === 'resize', winTypes)
+    costDock.children[0].props.onClick()
+    costDock = await renderChecked(costMount.dockSeat, costMount.stub, costProps(), 'closing again')
+    check('关闭后监听器清空', globalThis.document.__listeners.length === 0 && globalThis.window.__windowListeners.length === 0, JSON.stringify({ d: globalThis.document.__listeners.length, w: globalThis.window.__windowListeners.length }))
 
     // 零次的时段不写那一行（这里峰时段 0 次）。
     const zeroPeakView = { ...costView, peakCny: 0, peakRequests: 0, offCny: 0.5 }
@@ -1203,7 +1227,7 @@ console.log('\n── 8. client render ─────────────�
     }
     costDock = await openPanel(costMount.dockSeat, costMount.stub, zeroProps, 'zero-peak panel')
     const zeroText = textOf(costDock).join(' | ')
-    check('零次时段不写那一行', !zeroText.includes('Peak ¥') && zeroText.includes('Off-peak ¥0.50'), zeroText)
+    check('零次时段不写那一行', !zeroText.includes('Peak ¥') && zeroText.includes('Off-peak ¥0.500'), zeroText)
 
     // 子代理只显示分组行：标题与逐个金额都不再渲染。
     const subView = {

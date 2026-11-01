@@ -2121,9 +2121,10 @@ export async function apply(ctx, config) {
     table.push({
       kind: 'global',
       name: USAGE_BOOT_GLOBAL,
+      // `spendRoute` 不往外宣布：它是常量（`/api/clinepass.spend`），客户端自带同样的
+      // 默认值。宣布一个可能没注册成功的路径，只会让浏览器白打一条 404。
       value: {
         usageRoute: mounted === 'installed' ? cfg.usageRoute : null,
-        spendRoute: mounted === 'installed' ? SPEND_ROUTE : null,
         enabled: mounted === 'installed',
       },
     })

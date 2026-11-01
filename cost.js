@@ -19,8 +19,8 @@
  *   缓存命中 $0.006 → ¥0.04，未命中 $0.30 → ¥2.00，输出 $1.20 → ¥8.00（每百万 tokens）。
  * - 低峰 = 高峰价 × 0.5。
  * - 高峰时段：北京时间（UTC+8）**周一至周五 09:00–12:00、14:00–18:00**；
- *   其余（含整个周末）都是低峰。**中国法定节假日官方是全天低峰，这里没有实现** ——
- *   节假日会按峰价算，最多高估 2 倍（见 README「已知边界」）。
+ *   其余（含整个周末）都是低峰。**具体日期不参与判定**：只按星期几 + 钟点算，法定节假日
+ *   不做例外（落在上述窗口里的节假日按峰价，这是既定口径，不是缺陷）。
  * - 只算 `provider === 'cline-pass'` 的请求；同一会话里换到别的 provider 的请求不套这张价表。
  *
  * ## 哪些事件计入
@@ -155,6 +155,17 @@ export function routeOfRequest(provider, model) {
 }
 
 /**
+ * 这个模型是否被本价表覆盖。
+ *
+ * 价表只覆盖 `deepseek-v4.1-flash-*`（0.04 / 2.00 / 8.00 元每百万，峰价）。同一路由下如果
+ * 换成 `deepseek-v4-pro`，官方价是它的 3–7 倍，拿 flash 的价去算会**低估**；宁可不算，
+ * 也不给一个错的数。未覆盖的请求直接跳过（不写进任何桶）。
+ */
+export function isPricedModel(model) {
+  return typeof model === 'string' && /deepseek-v4\.1-flash/i.test(model)
+}
+
+/**
  * 从流式记录里取最后一个 `usage` 块。
  *
  * 失败/中断/被重试掉的 `assistant/attempt` 没有 `data.usage`：usage 只存在于
@@ -276,6 +287,8 @@ export function applyCostEvent(state, event) {
   if (usage === undefined) return state
   // 不是本路由的请求：价表对不上，跳过（会话中途换过 provider 时只算 cline-pass 那部分）。
   if (state.route === null || !routeOfRequest(state.route.provider, state.route.model)) return state
+  // 同一路由下的其它模型（例如 v4-pro）没有价表，跳过而不是按 flash 的价低估。
+  if (!isPricedModel(state.route.model)) return state
 
   const turn = event.data?.turn
   const step = event.data?.step
