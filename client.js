@@ -801,7 +801,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                   ? since.toLocaleString(localeId, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
                   : '--'
                 var amount = typeof spend.cny === 'number' && isFinite(spend.cny) ? spend.cny : 0
-                var amountText = amount <= 0 ? '¥0.00' : '¥' + amount.toFixed(amount < 0.01 ? 4 : 2)
+                // 和胶囊/面板同一套格式化：同一笔钱在三个界面上位数一致。
+                var amountText = formatCny(amount) ?? '¥0.00'
                 return React.createElement(
                   'div',
                   {

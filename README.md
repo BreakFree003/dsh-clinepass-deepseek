@@ -27,7 +27,7 @@ Provider 观察与用量报告搬进 pi；两边按发布版本互相同步，�
 
 ```bash
 dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseek
-# 钉某个 tag：同上，末尾加 #v0.18.1
+# 钉某个 tag：同上，末尾加 #v0.18.2
 ```
 
 包自己声明了 `dsh.bundle.patch`，所以 `dsh plugin`（pnpm 的转发器）装上它之后会把这个包追加到
