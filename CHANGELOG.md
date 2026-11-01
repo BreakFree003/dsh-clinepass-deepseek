@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.18.0
+
+**对话下方开始显示「这条对话按 DeepSeek 官方峰谷价实际值多少钱」。**
+
+- 新增 `cost.js`：官方价目表（人民币，峰/谷）、北京时间峰谷判定、逐请求折叠的纯函数。
+  峰时为周一至周五 09:00–12:00、14:00–18:00（UTC+8），其余半价；时间一律从 `event.time`
+  平移 +8 后读，与宿主时区无关。
+- 新增会话投影 `clinepassCost`：按 `request/header`（每轮）与 `request/context`（变化时）记
+  provider/model，只对 `cline-pass` 的 `assistant/message` 计价；同一 turn/step 的重复样本是
+  「替换」而非累加，`llm/retry-started` 清空替换槽（与上游 `tokenUsage` 同一套语义）。
+  seeded（fork）子代理跳过 `seq < inheritedEventCount` 的前缀，不把父会话历史算第二遍。
+- 投影的 `apply` 是同步纯函数，不读 `Date.now()`、不联网、不写盘；宿主重启后从日志重放得到
+  同样的数字。zod 由宿主 profile 提供，`apply` 里动态加载；加载失败/注册表缺席只降级为
+  「胶囊只显示 Provider」，不影响其它功能。
+- Provider 胶囊同一行追加 ` · ¥0.021`（位数随量级 4/3/2 位），悬停显示合计与子代理会话数；
+  新增 `data-clinepass-cost` 属性供排查读取。
+- 点胶囊展开**明细面板**（portal 到 body，点外面 / Esc / 再点收起）：官方价合计、本会话与子代理分组
+  （子代理只给合计行）、峰/谷时段各花多少（只写金额，0 次的时段整行不写）、**ClinePass 计费**（恒按高峰价）、
+  token 四桶、缓存命中率（两位小数）。为此给 wire 视图加了 `peakCny` / `offCny` / `tokens` 三个字段
+  （state 形状未变，`stateVersion` 仍是 1；旧缓存行照常可读）。
+- 面板不再写峰谷规则与价表版本那两行（不是有效信息）；ClinePass 的计费口径改成面板里的一行数字，
+  和官方实付价并排 —— 低峰期两者差 2 倍，这是**预期**。
+- 成本合计含所有子代理会话（沿用上游 `isSubagentOf` 规则：只沿 `origin === 'subagent'` 走，
+  fork 不算，比率为零的子代理当不存在）。
+- `assistant/attempt` 的 usage 补了流式兜底（`data.stream` 最后一帧）：失败/被重试掉的尝试
+  没有 `data.usage`，只读它就会永远漏记（与上游 `tokenUsage` 同一语义）。
+- 设置页用量卡下方新增**官方定价累计**：扫投影缓存求和（`spend.js`，`GET /api/clinepass.spend`），
+  标注「自 <基线时间> 起」，带两段式「重置为 0」按钮（`POST` 同一路由，把当前总数记成新基线）。
+  基线落 `$DSH_HOME/dsh-clinepass-spend.json`，首次运行以当时总数为基线（从 0 开始涨）。
+- 新增 `test-spend.mjs`：求和/坏文件/首次基线/重置/重置后继续累计/缓存/损坏基线的重建。
+- 新增 `test-cost.mjs`：峰谷边界 12 例、价目表算术、替换/重试/seeded/换 provider/缺
+  `request/context` 各一例；`CLINEPASS_SESSION_LOG=<jsonl>` 可对真实日志回放并与独立口径对账。
+- 实测：本机一条 66 次请求、全在低峰的会话 ¥0.387132（全按高峰 ¥0.774264，正好 2 倍）。
+
+# Changelog
+
 ## 0.17.1
 
 **撤掉 0.17.0 的「降级池」判定：它把每一条钉住第一方的生产请求都误判成回退池。**

@@ -41,6 +41,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
       Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
       var React = require('react')
+      // 明细面板挂 portal：dock 在页面底部、祖先链上随时可能出现 overflow/transform，
+      // 绝对定位会在那里被裁掉。上游 usage 胶囊的弹层也是 portal（见
+      // dsh-client-ui-chat 的 DialogPill），这里跟随同一套做法。
+      var ReactDOM = require('react-dom')
 
       // ═══════════════════════════ 常量 ═══════════════════════════
 
@@ -113,6 +117,30 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           providerTitle: 'ClinePass 提供方',
           providerAwaiting: '等待 API 返回…',
           providerAnonymizedTooltip: 'deepseek 渠道已被网关匿名化为 openai-compatible-private（contributor 档：数据可能用于训练，无 ZDR）',
+          spendTitle: '官方定价累计',
+          spendSince: '自 {time} 起',
+          spendReset: '重置为 0',
+          spendResetHint: '以当前累计值为新起点，把显示的数字归零',
+          spendConfirm: '确认重置？',
+          spendHint: '按 DeepSeek 官方峰谷价累计；旧会话的历史不计入',
+          // ── 成本（官方峰谷价）──
+          costTitle: 'DeepSeek 官方价（按每次请求发生的时刻判峰谷）',
+          costActual: '实际 {cost}',
+          costPeak: '若全按高峰价 {cost}',
+          costSubagents: '含 {count} 个子代理会话',
+          // ── 展开后的明细面板 ──
+          panelTitle: '官方价明细',
+          panelSelf: '本会话',
+          panelSubagents: '子代理（{count} 个）',
+          panelPeak: '峰时段 {cost}',
+          panelOff: '谷时段 {cost}',
+          panelInput: '输入（未命中）',
+          panelCacheRead: '缓存命中读取',
+          panelCacheWrite: '缓存写入',
+          panelOutput: '输出',
+          panelCacheHit: '缓存命中 {percent}%',
+          panelClinepass: 'ClinePass 计费',
+          panelEmpty: '这个对话还没有计费请求',
         },
         en: {
           title: 'ClinePass remaining usage',
@@ -141,6 +169,30 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           providerTitle: 'ClinePass Provider',
           providerAwaiting: 'Awaiting API response…',
           providerAnonymizedTooltip: 'deepseek channel anonymized by gateway as openai-compatible-private (contributor tier: data may be used for training, no ZDR)',
+          spendTitle: 'List-price total',
+          spendSince: 'since {time}',
+          spendReset: 'Reset to 0',
+          spendResetHint: 'Make the current total the new starting point and show 0',
+          spendConfirm: 'Confirm reset?',
+          spendHint: 'Accumulated at the DeepSeek list price; history of older sessions is excluded',
+          // ── cost (official peak/off-peak price) ──
+          costTitle: 'DeepSeek list price (peak/off-peak by the time of each request)',
+          costActual: 'actual {cost}',
+          costPeak: 'all-peak {cost}',
+          costSubagents: 'incl. {count} subagent sessions',
+          // ── expanded breakdown panel ──
+          panelTitle: 'List-price breakdown',
+          panelSelf: 'This session',
+          panelSubagents: 'Subagents ({count})',
+          panelPeak: 'Peak {cost}',
+          panelOff: 'Off-peak {cost}',
+          panelInput: 'Input (uncached)',
+          panelCacheRead: 'Cache reads',
+          panelCacheWrite: 'Cache writes',
+          panelOutput: 'Output',
+          panelCacheHit: 'Cache hit {percent}%',
+          panelClinepass: 'ClinePass billing',
+          panelEmpty: 'No billable requests in this conversation yet',
         },
       }
 
@@ -173,6 +225,23 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         var boot = window[BOOT_GLOBAL]
         if (boot !== null && typeof boot === 'object' && boot.enabled === false) return false
         return true
+      }
+
+      /** 累计值路由（宿主注入；缺省同上，读不到就整段不显示）。 */
+      function spendRoute() {
+        var boot = window[BOOT_GLOBAL]
+        if (boot !== null && typeof boot === 'object' && typeof boot.spendRoute === 'string' && boot.spendRoute.length > 0) return boot.spendRoute
+        return '/api/clinepass.spend'
+      }
+
+      /** 累计值请求路径（同源，不需要 origin）。 */
+      function spendUrl() {
+        var base = spendRoute()
+        try {
+          return new URL(base, 'http://127.0.0.1:3080').pathname
+        } catch {
+          return base
+        }
       }
 
       /**
@@ -446,6 +515,69 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         // 区分「刚挂载」与「key 变了」：前者走宿主缓存，后者强制绕过。
         var firstRead = React.useRef(true)
 
+        // 官方定价累计：独立于额度卡的数据源（一个来自网关，一个来自本地投影缓存），
+        // 读失败就整段不渲染 —— 不让它把额度卡拖成错误态。
+        var spendPair = React.useState({ status: 'loading', body: null })
+        var spendState = spendPair[0]
+        var setSpendState = spendPair[1]
+        // 0 = 没在确认；1 = 已点一次，等第二次。
+        var armPair = React.useState(0)
+        var resetArmed = armPair[0]
+        var setResetArmed = armPair[1]
+        var spendGeneration = React.useRef(0)
+        var armTimer = React.useRef(null)
+
+        var loadSpend = React.useCallback(function () {
+          var mine = spendGeneration.current + 1
+          spendGeneration.current = mine
+          window
+            .fetch(spendUrl(), { headers: { accept: 'application/json' }, credentials: 'same-origin' })
+            .then(function (response) {
+              return response.json().then(
+                function (body) { return { response: response, body: body } },
+                function () { return { response: response, body: null } },
+              )
+            })
+            .then(function (result) {
+              if (spendGeneration.current !== mine) return
+              // 形状要够：`ok` 之外还得有 `cny` 与 `since`，否则整段不渲染 ——
+              // 路由没挂上时这条请求可能拿到 usage 的响应或 HTML，不能当成累计值。
+              if (
+                result.body !== null &&
+                typeof result.body === 'object' &&
+                result.body.ok === true &&
+                typeof result.body.cny === 'number' &&
+                typeof result.body.since === 'string'
+              ) {
+                setSpendState({ status: 'ready', body: result.body })
+                return
+              }
+              setSpendState({ status: 'failed', body: null })
+            })
+            .catch(function () {
+              if (spendGeneration.current !== mine) return
+              setSpendState({ status: 'failed', body: null })
+            })
+        }, [])
+
+        var resetSpend = React.useCallback(function () {
+          var mine = spendGeneration.current + 1
+          spendGeneration.current = mine
+          window
+            .fetch(spendUrl(), {
+              method: 'POST',
+              headers: { accept: 'application/json' },
+              credentials: 'same-origin',
+            })
+            .then(function (response) { return response.json() })
+            .then(function (body) {
+              if (spendGeneration.current !== mine) return
+              if (body !== null && typeof body === 'object' && body.ok === true) setSpendState({ status: 'ready', body: body })
+            })
+            .catch(function () {})
+            .then(function () { setResetArmed(0) })
+        }, [])
+
         var load = React.useCallback(
           function (force) {
             var mine = generation.current + 1
@@ -519,12 +651,25 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
             var force = firstRead.current !== true
             firstRead.current = false
             load(force)
+            loadSpend()
             return function () {
               generation.current += 1
+              spendGeneration.current += 1
             }
           },
-          [isOurs, enabled, load, keyConfigured],
+          [isOurs, enabled, load, loadSpend, keyConfigured],
         )
+
+        // 确认态 4 秒后自动撤回：用户点了「重置」却不想确认时，不该一直悬着。
+        React.useEffect(function () {
+          if (resetArmed === 0) return undefined
+          armTimer.current = window.setTimeout(function () {
+            setResetArmed(0)
+          }, 4000)
+          return function () {
+            window.clearTimeout(armTimer.current)
+          }
+        }, [resetArmed])
 
         if (!isOurs || !enabled) return null
 
@@ -632,6 +777,62 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           limits.map(function (item) {
             return React.createElement(UsageRow, { key: item.type, type: item.type, row: item.row, now: now, zh: zh, locale: localeId, t: t })
           }),
+          spendState.status === 'ready' && spendState.body !== null && spendState.body.ok === true
+            ? (function () {
+                var spend = spendState.body
+                var since = typeof spend.since === 'string' ? new Date(spend.since) : null
+                var sinceText = since !== null && !Number.isNaN(since.getTime())
+                  ? since.toLocaleString(localeId, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+                  : '--'
+                var amount = typeof spend.cny === 'number' && isFinite(spend.cny) ? spend.cny : 0
+                var amountText = amount <= 0 ? '¥0.00' : '¥' + amount.toFixed(amount < 0.01 ? 4 : 2)
+                return React.createElement(
+                  'div',
+                  {
+                    'data-clinepass-spend': '',
+                    style: { marginTop: 10, paddingTop: 8, borderTop: '1px solid ' + BORDER },
+                  },
+                  React.createElement(
+                    'div',
+                    { style: { display: 'flex', alignItems: 'baseline', gap: 8 } },
+                    React.createElement('span', { style: { fontWeight: 600, color: LABEL_SECONDARY } }, t.spendTitle),
+                    React.createElement('span', { style: { flex: '1 1 auto' } }),
+                    React.createElement(
+                      'button',
+                      {
+                        type: 'button',
+                        'data-clinepass-spend-reset': '',
+                        onClick: function () {
+                          if (resetArmed === 0) {
+                            setResetArmed(1)
+                            return
+                          }
+                          resetSpend()
+                        },
+                        title: t.spendResetHint,
+                        style: {
+                          border: 'none',
+                          background: 'none',
+                          padding: 0,
+                          cursor: 'pointer',
+                          color: resetArmed === 0 ? LINK : WARN,
+                          font: 'inherit',
+                          fontSize: 11,
+                        },
+                      },
+                      resetArmed === 0 ? t.spendReset : t.spendConfirm,
+                    ),
+                  ),
+                  React.createElement('div', { style: { color: LABEL_TERTIARY, fontSize: 11, marginTop: 2 } }, fill(t.spendSince, { time: sinceText })),
+                  React.createElement(
+                    'div',
+                    { style: { fontSize: 18, fontWeight: 600, lineHeight: 1.4, fontVariantNumeric: 'tabular-nums' } },
+                    amountText,
+                  ),
+                    React.createElement('div', { style: { color: LABEL_TERTIARY, fontSize: 11 } }, t.spendHint),
+                )
+              })()
+            : null,
         )
       }
 
@@ -695,6 +896,214 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         ])
       }
 
+      // ═══════════════════════════ 成本（官方峰谷价）═══════════════════════════
+
+      /**
+       * 金额格式化：¥ 前缀 + 动态位数。
+       *
+       * 一次对话常常只有几分钱（本机实测一条 66 次请求的会话 ¥0.39，单轮 ¥0.003），
+       * 固定两位会全变成 0.00；这里按量级给 4/3/2 位。四舍五入后归零的极小值写成
+       * `¥0.0001`，不写一个骗人的 `¥0.0000`。
+       *
+       * @param value - 人民币金额。
+       * @returns 展示文本；非正数返回 null（不显示）。
+       */
+      function formatCny(value) {
+        if (typeof value !== 'number' || !isFinite(value) || value <= 0) return null
+        var digits = value < 0.01 ? 4 : value < 1 ? 3 : 2
+        var text = value.toFixed(digits)
+        if (Number(text) === 0) return '¥' + (1 / Math.pow(10, digits)).toFixed(digits)
+        return '¥' + text
+      }
+
+      /**
+       * 紧凑数字：明细里 token 是 6~7 位数，写全了会把面板撑爆。
+       *
+       * @param value - token 数。
+       * @returns `1.23M` / `12.3k` / `999` 这样的文本。
+       */
+      function formatCompact(value) {
+        if (typeof value !== 'number' || !isFinite(value) || value <= 0) return '0'
+        if (value >= 1e6) return (value / 1e6).toFixed(2) + 'M'
+        if (value >= 1e3) return (value / 1e3).toFixed(1) + 'k'
+        return String(Math.round(value))
+      }
+
+      /**
+       * 缓存命中率（按计费口径）：命中读 /（命中读 + 未命中输入 + 缓存写入）。
+       *
+       * @param tokens - `{ cacheRead, uncachedInput, cacheWrite }`。
+       * @returns 百分比整数，没有可计费输入时为 null。
+       */
+      function cacheHitPercent(tokens) {
+        var billed = tokens.cacheRead + tokens.uncachedInput + tokens.cacheWrite
+        if (!(billed > 0)) return null
+        // 两位小数：99.87% 和 99% 对「缓存有没有真的命中」是两种结论。
+        return Math.round((tokens.cacheRead / billed) * 10000) / 100
+      }
+
+      /**
+       * 把一个成本投影视图（wire 值）规整成数字。
+       *
+       * 投影是**插件注册的**：没加载、被禁用、或宿主没挂 sessionProjections 时，
+       * `projectionValues.clinepassCost` 就是 undefined —— 那时整段成本不显示，
+       * 胶囊退回原来的「只看 Provider」。这是降级，不是错误。
+       *
+       * @param view - `clinepassCost` 的视图，可能缺席。
+       * @returns `{ cny, cnyPeak, requests }`，没有时为 null。
+       */
+      /** 空成本：所有字段归零，方便聚合时统一相加。 */
+      function emptyCost() {
+        return {
+          cny: 0,
+          cnyPeak: 0,
+          peakCny: 0,
+          offCny: 0,
+          requests: 0,
+          peakRequests: 0,
+          tokens: { cacheRead: 0, uncachedInput: 0, cacheWrite: 0, output: 0 },
+        }
+      }
+
+      /**
+       * 把一个成本投影视图（wire 值）规整成数字。
+       *
+       * 投影是**插件注册的**：没加载、被禁用、或宿主没挂 sessionProjections 时，
+       * `projectionValues.clinepassCost` 就是 undefined —— 那时整段成本不显示，
+       * 胶囊退回原来的「只看 Provider」。这是降级，不是错误。
+       *
+       * @param view - `clinepassCost` 的视图，可能缺席。
+       * @returns 成本对象（含 `pricing`），没有时为 null。
+       */
+      function costOfValue(view) {
+        if (!view || typeof view !== 'object') return null
+        var number = function (raw) {
+          return typeof raw === 'number' && isFinite(raw) ? raw : 0
+        }
+        var tokens = view.tokens && typeof view.tokens === 'object' ? view.tokens : {}
+        var cost = emptyCost()
+        cost.cny = number(view.cny)
+        cost.cnyPeak = number(view.cnyPeak)
+        cost.peakCny = number(view.peakCny)
+        cost.offCny = number(view.offCny)
+        cost.requests = number(view.requests)
+        cost.peakRequests = number(view.peakRequests)
+        cost.tokens = {
+          cacheRead: number(tokens.cacheRead),
+          uncachedInput: number(tokens.uncachedInput),
+          cacheWrite: number(tokens.cacheWrite),
+          output: number(tokens.output),
+        }
+        cost.pricing = typeof view.pricing === 'string' ? view.pricing : null
+        return cost
+      }
+
+      /** 把 `part` 累加进 `total`（就地改 `total`，调用方负责只传自己的副本）。 */
+      function addCostInto(total, part) {
+        total.cny += part.cny
+        total.cnyPeak += part.cnyPeak
+        total.peakCny += part.peakCny
+        total.offCny += part.offCny
+        total.requests += part.requests
+        total.peakRequests += part.peakRequests
+        total.tokens.cacheRead += part.tokens.cacheRead
+        total.tokens.uncachedInput += part.tokens.uncachedInput
+        total.tokens.cacheWrite += part.tokens.cacheWrite
+        total.tokens.output += part.tokens.output
+        return total
+      }
+
+      /**
+       * 从一个会话行里取成本投影的视图。
+       *
+       * @param summary - sessions 列表的一行。
+       * @returns 成本对象，没有时为 null。
+       */
+      function costOfSession(summary) {
+        if (!summary || !summary.projectionValues) return null
+        return costOfValue(summary.projectionValues.clinepassCost)
+      }
+
+      /**
+       * 这个会话是不是当前对话的子代理（任意深度）。
+       *
+       * 规则与上游 `dsh-client-ui-chat` 的 `isSubagentOf` 一致：沿 `parentId` 向上走，
+       * 每一步父会话的 `origin` 都必须是 `subagent`，中途遇到非子代理祖先就停 ——
+       * 所以 fork 自己派出的子代理算在 fork 头上，不会重复算回 fork 的来源会话。
+       *
+       * @param byId - sessions 列表 store。
+       * @param summary - 待判定的会话行。
+       * @param sessionId - 当前打开的会话。
+       */
+      function isSubagentOf(byId, summary, sessionId) {
+        var seen = new Set([summary.id])
+        var parentId = summary.parentId
+        while (parentId !== undefined && !seen.has(parentId)) {
+          if (parentId === sessionId) return true
+          seen.add(parentId)
+          var parent = byId[parentId]
+          if (parent === undefined || parent.origin !== 'subagent') return false
+          parentId = parent.parentId
+        }
+        return false
+      }
+
+      /**
+       * 当前对话下所有子代理会话的成本合计（含每个子代理的明细，展开面板用）。
+       *
+       * 每个子代理行带的是**它自己**的成本（投影跳过 seeded 继承前缀），所以这里直接
+       * 相加不会把父会话的历史算第二遍。
+       *
+       * @param byId - sessions 列表 store。
+       * @param sessionId - 当前会话。
+       * @returns 合计对象（额外带 `count`），没有子代理时 undefined。
+       */
+      function subagentCostOf(byId, sessionId) {
+        if (sessionId === undefined || byId === undefined) return undefined
+        var total
+        var subagentCount = 0
+        var ids = Object.keys(byId)
+        for (var index = 0; index < ids.length; index += 1) {
+          var summary = byId[ids[index]]
+          if (!summary || summary.origin !== 'subagent') continue
+          var cost = costOfSession(summary)
+          if (cost === null || !isSubagentOf(byId, summary, sessionId)) continue
+          if (total === undefined) total = emptyCost()
+          addCostInto(total, cost)
+          subagentCount += 1
+        }
+        // 刚 spawn / 还没结算的子代理成本是 0：当成「没有子代理」，别渲染「含 0 个子代理」。
+        if (total === undefined || (total.cny === 0 && total.requests === 0)) return undefined
+        total.count = subagentCount
+        return total
+      }
+
+      /** `useSessions` 的兜底：dock 契约总会给，这里保证缺了也不炸（返回空 store）。 */
+      var EMPTY_SESSION_LIST = { byId: {} }
+      function selectEmptySessions(selector) {
+        return selector(EMPTY_SESSION_LIST)
+      }
+
+      /**
+       * 成本合计的相等判断：**面板渲染的每个字段**都要比。
+       *
+       * 只比 4 个字段时，peakCny / offCny / tokens 变了而它们没变，`useSyncExternalStore`
+       * 会保留旧选中值 —— 面板停在旧数字上（要求碰巧相等，概率低，但相等函数写错就是错）。
+       */
+      function sameCostView(left, right) {
+        if (left === right) return true
+        if (!left || !right) return false
+        if (left.cny !== right.cny || left.cnyPeak !== right.cnyPeak) return false
+        if (left.peakCny !== right.peakCny || left.offCny !== right.offCny) return false
+        if (left.requests !== right.requests || left.peakRequests !== right.peakRequests) return false
+        if (left.count !== right.count) return false
+        if (left.selfCny !== right.selfCny || left.subagentCny !== right.subagentCny) return false
+        var a = left.tokens
+        var b = right.tokens
+        if (a === undefined || b === undefined) return a === b
+        return a.cacheRead === b.cacheRead && a.uncachedInput === b.uncachedInput && a.cacheWrite === b.cacheWrite && a.output === b.output
+      }
+
       /**
        * 底部状态栏（conversation.composer.dock）的 Provider 胶囊。
        * 随 API 响应动态更新，仅对 Clinepass 的模型生效显示。
@@ -713,6 +1122,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         var useProjection = props.useProjection
         var sessionId = props.sessionId
         var useSession = props.useSession
+        var useSessions = props.useSessions
         var ctx = props.ctx
 
         var modelSelection = useProjection ? useProjection('modelSelection') : null
@@ -722,6 +1132,17 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           if (sel.provider === PROVIDER) isClinepass = true
           if (typeof sel.model === 'string' && sel.model.indexOf(PROVIDER + '/') === 0) isClinepass = true
         }
+
+        // 成本（DeepSeek 官方峰谷价）。两个订阅同样在早退之前无条件调用：
+        // - 本会话：插件注册的 `clinepassCost` 投影（宿主按每条请求的时刻计价）；
+        // - 子代理会话：sessions 列表里每一行自带的同名投影值，按上游的
+        //   `isSubagentOf` 规则聚合 —— 子代理的投影跳过 seeded 继承前缀，直接相加
+        //   不会把父会话的历史算第二遍。
+        var costView = useProjection ? useProjection('clinepassCost') : undefined
+        var subscribeSessions = typeof useSessions === 'function' ? useSessions : selectEmptySessions
+        var subagentCost = subscribeSessions(function (state) {
+          return subagentCostOf(state ? state.byId : undefined, sessionId)
+        }, sameCostView)
 
         var currentModel = sel && typeof sel.model === 'string' ? sel.model : ''
         var lang = useLanguage(ctx)
@@ -789,14 +1210,87 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
 
         var isAnonymized = status.anonymized === true
         var providerName = status.provider
+
+        // 成本合计 = 本会话 + 所有子代理会话。投影缺席时整段不显示（降级）。
+        var ownCost = costOfValue(costView)
+        var costSummary = null
+        if (ownCost !== null || subagentCost !== undefined) {
+          costSummary = emptyCost()
+          if (ownCost !== null) addCostInto(costSummary, ownCost)
+          if (subagentCost !== undefined) addCostInto(costSummary, subagentCost)
+          costSummary.pricing = ownCost === null ? null : ownCost.pricing
+          costSummary.selfCny = ownCost === null ? 0 : ownCost.cny
+          costSummary.subagentCny = subagentCost === undefined ? 0 : subagentCost.cny
+          costSummary.subagentCount = subagentCost === undefined ? 0 : subagentCost.count
+        }
+        var costText = costSummary === null ? null : formatCny(costSummary.cny)
+
         var displayText = providerName ? ('Provider: ' + providerName) : 'Provider: --'
+        if (costText !== null) displayText += ' · ' + costText
         var tooltip = providerName
           ? (isAnonymized ? (providerName + ' — ' + t.providerAnonymizedTooltip) : ('网关返回提供方: ' + providerName))
           : t.providerAwaiting
+        if (costText !== null) {
+          var costLines = [t.costTitle, fill(t.costActual, { cost: costText })]
+          if (costSummary.subagentCount > 0) costLines.push(fill(t.costSubagents, { count: costSummary.subagentCount }))
+          tooltip += '\n—\n' + costLines.join('\n')
+        }
 
         var hoverPair = React.useState(false)
         var hovered = hoverPair[0]
         var setHovered = hoverPair[1]
+
+        // 展开面板：开着的时候胶囊就是它的开合开关。
+        var openPair = React.useState(false)
+        var open = openPair[0]
+        var setOpen = openPair[1]
+        var posPair = React.useState(null)
+        var pos = posPair[0]
+        var setPos = posPair[1]
+        var rootRef = React.useRef(null)
+        var panelRef = React.useRef(null)
+
+        /**
+         * 打开/收起明细。
+         *
+         * 位置在**点击那一刻**按锚点算一次（fixed + bottom）：面板在 dock 上方展开，
+         * 内容再长也只会向上长。dock 贴着窗口底边，所以不需要跟随滚动。
+         */
+        var toggleOpen = React.useCallback(function () {
+          if (open) {
+            setOpen(false)
+            return
+          }
+          var rect = rootRef.current ? rootRef.current.getBoundingClientRect() : null
+          var viewportWidth = typeof window === 'undefined' ? 360 : window.innerWidth
+          var width = Math.min(340, viewportWidth - 16)
+          var left = rect === null ? 8 : Math.max(8, Math.min(rect.left, viewportWidth - width - 8))
+          var bottom = rect === null ? 8 : Math.max(8, window.innerHeight - rect.top + 6)
+          setPos({ left: left, bottom: bottom, width: width })
+          setOpen(true)
+          // 点开时顺手重读一次上游，和点胶囊原来的行为一致。
+          refresh()
+        }, [open, refresh])
+
+        // 点外面 / Esc 收起。监听挂在 document 上，effect 只在打开期间存在。
+        React.useEffect(function () {
+          if (!open) return undefined
+          var onDown = function (event) {
+            var target = event.target
+            if (rootRef.current !== null && rootRef.current.contains(target)) return
+            if (panelRef.current !== null && panelRef.current.contains(target)) return
+            setOpen(false)
+          }
+          var onKey = function (event) {
+            if (event.key === 'Escape') setOpen(false)
+          }
+          document.addEventListener('mousedown', onDown)
+          document.addEventListener('keydown', onKey)
+          return function () {
+            document.removeEventListener('mousedown', onDown)
+            document.removeEventListener('keydown', onKey)
+          }
+        }, [open])
 
         // 全部 hook 到此为止；下面才是「非本路由的卡片原样放过」。
         if (!isClinepass) return null
@@ -805,32 +1299,134 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           ? React.createElement(WarningIcon, null)
           : React.createElement(ServerIcon, null)
 
-        return React.createElement('span', {
-          className: 'bOPqQW_anchor',
-          'data-composer-stat': 'clinepass-provider',
-          style: {
-            minWidth: 0,
-            fontSize: 'calc(var(--dsh-content-font-size-secondary, 13px) - 1px)',
-            lineHeight: 'calc(20px + var(--dsh-content-font-delta-secondary, 0px))',
-            display: 'inline-flex',
-            alignItems: 'center',
-          },
-        }, React.createElement('button', {
+        /** 明细里的一行：左标签右数值。 */
+        var groupRow = function (label, value, key) {
+          return React.createElement('div', {
+            key: key,
+            style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12 },
+          }, [
+            React.createElement('span', { key: 'label', style: { color: LABEL_SECONDARY } }, label),
+            value === '' || value === undefined
+              ? null
+              : React.createElement('span', {
+                  key: 'value',
+                  style: { fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' },
+                }, value),
+          ])
+        }
+
+        /** 一条细分隔线。 */
+        var separator = function (key) {
+          return React.createElement('div', {
+            key: key,
+            style: { height: 1, background: BORDER, margin: '8px 0', opacity: 0.8 },
+          })
+        }
+
+        /**
+         * 明细里的金额：≥ ¥0.01 固定两位（¥0.20 比 ¥0.200 稳），更小的才给四位
+         * （子代理常常只花几厘钱，两位会全变成 ¥0.00）。0 也显示，不留空。
+         */
+        var money = function (value) {
+          if (typeof value !== 'number' || !isFinite(value) || value <= 0) return '¥0.00'
+          return '¥' + value.toFixed(value < 0.01 ? 4 : 2)
+        }
+
+        var panelChildren = null
+        if (open && costSummary !== null && pos !== null) {
+          var rows = []
+          rows.push(React.createElement('div', {
+            key: 'head',
+            style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12 },
+          }, [
+            React.createElement('span', { key: 'label', style: { color: LABEL_SECONDARY } }, t.panelTitle),
+            React.createElement('span', {
+              key: 'value',
+              style: { fontSize: 18, fontWeight: 600, fontVariantNumeric: 'tabular-nums' },
+            }, money(costSummary.cny)),
+          ]))
+          rows.push(separator('sep-1'))
+
+          if (costSummary.requests === 0) {
+            rows.push(React.createElement('div', { key: 'empty', style: { color: LABEL_SECONDARY } }, t.panelEmpty))
+          } else {
+            rows.push(groupRow(t.panelSelf, money(costSummary.selfCny), 'self'))
+            if (costSummary.subagentCount > 0) {
+              rows.push(groupRow(fill(t.panelSubagents, { count: costSummary.subagentCount }), money(costSummary.subagentCny), 'subs'))
+            }
+            rows.push(separator('sep-2'))
+            // 一次都没有的时段不写：0 次的那行只会挤占版面，不携带信息。
+            var offPeakCount = costSummary.requests - costSummary.peakRequests
+            if (costSummary.peakRequests > 0) {
+              rows.push(groupRow(fill(t.panelPeak, { cost: money(costSummary.peakCny) }), '', 'peak'))
+            }
+            if (offPeakCount > 0) {
+              rows.push(groupRow(fill(t.panelOff, { cost: money(costSummary.offCny) }), '', 'off'))
+            }
+            // ClinePass 的额度记账恒按高峰价（与请求时刻无关），所以它等于「全部 token
+            // 按峰价」；低峰期它比官方实付价高，这正是两个数字要并排的原因。
+            rows.push(separator('sep-3'))
+            rows.push(groupRow(t.panelClinepass, money(costSummary.cnyPeak), 'clinepass'))
+            rows.push(separator('sep-4'))
+
+            var tokens = costSummary.tokens
+            rows.push(groupRow(t.panelInput, formatCompact(tokens.uncachedInput), 't-in'))
+            if (tokens.cacheWrite > 0) rows.push(groupRow(t.panelCacheWrite, formatCompact(tokens.cacheWrite), 't-cw'))
+            rows.push(groupRow(t.panelCacheRead, formatCompact(tokens.cacheRead), 't-cr'))
+            rows.push(groupRow(t.panelOutput, formatCompact(tokens.output), 't-out'))
+            var hit = cacheHitPercent(tokens)
+            if (hit !== null) {
+              rows.push(React.createElement('div', {
+                key: 't-hit',
+                style: { color: LABEL_TERTIARY, fontSize: 11, marginTop: 2 },
+              }, fill(t.panelCacheHit, { percent: hit.toFixed(2) })))
+            }
+          }
+
+
+          panelChildren = React.createElement('div', {
+            ref: panelRef,
+            role: 'dialog',
+            'aria-label': t.panelTitle,
+            'data-clinepass-panel': '',
+            style: {
+              position: 'fixed',
+              left: pos.left + 'px',
+              bottom: pos.bottom + 'px',
+              width: pos.width + 'px',
+              zIndex: 2147483000,
+              boxSizing: 'border-box',
+              padding: '12px 14px',
+              borderRadius: '12px',
+              border: '1px solid ' + BORDER,
+              background: 'var(--dsw-alias-bg-layer-1, #ffffff)',
+              boxShadow: '0 12px 32px rgba(0, 0, 0, 0.18)',
+              color: LABEL_PRIMARY,
+              fontSize: '12px',
+              lineHeight: '20px',
+              textAlign: 'left',
+            },
+          }, rows)
+        }
+
+        var pillButton = React.createElement('button', {
           type: 'button',
           className: 'bOPqQW_pill',
-          title: tooltip,
-          onClick: refresh,
+          title: open ? undefined : tooltip,
+          'aria-haspopup': panelChildren === null ? undefined : 'dialog',
+          'aria-expanded': open,
+          onClick: toggleOpen,
           onMouseEnter: function () { setHovered(true) },
           onMouseLeave: function () { setHovered(false) },
           style: {
             boxSizing: 'border-box',
             maxWidth: '100%',
-            color: hovered ? LABEL_PRIMARY : isAnonymized ? WARN : LABEL_TERTIARY,
+            color: hovered || open ? LABEL_PRIMARY : isAnonymized ? WARN : LABEL_TERTIARY,
             font: 'inherit',
             fontVariantNumeric: 'tabular-nums',
             lineHeight: 'inherit',
             whiteSpace: 'nowrap',
-            background: hovered ? 'var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.05))' : 'transparent',
+            background: hovered || open ? 'var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.05))' : 'transparent',
             border: 'none',
             borderRadius: '999px',
             alignItems: 'center',
@@ -851,7 +1447,28 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
               overflow: 'hidden',
             },
           }, displayText),
-        ]))
+        ])
+
+        // 面板挂 portal 到 body：dock 的祖先链随时可能出现 overflow/transform，
+        // 绝对定位会被裁掉；portal 也让 fixed 坐标不受祖先影响。portal 只是
+        // **元素树**上的一个孩子（真实 DOM 落点是 body），胶囊自身仍是根节点。
+        var anchorChildren = [pillButton]
+        if (panelChildren !== null) anchorChildren.push(ReactDOM.createPortal(panelChildren, document.body))
+
+        return React.createElement('span', {
+          ref: rootRef,
+          className: 'bOPqQW_anchor',
+          'data-composer-stat': 'clinepass-provider',
+          // 给冒烟测试/排查留一个可读的出口：成本就是胶囊上那个数字。
+          'data-clinepass-cost': costText === null ? undefined : costText,
+          style: {
+            minWidth: 0,
+            fontSize: 'calc(var(--dsh-content-font-size-secondary, 13px) - 1px)',
+            lineHeight: 'calc(20px + var(--dsh-content-font-delta-secondary, 0px))',
+            display: 'inline-flex',
+            alignItems: 'center',
+          },
+        }, anchorChildren)
       }
 
       // ═══════════════════════════ 插件本体 ═══════════════════════════

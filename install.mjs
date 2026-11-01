@@ -84,7 +84,7 @@ const stamp = new Date().toISOString().replace(/[:.]/g, '-')
 // `cordis.patch.yml` is here because the copied `package.json` references it —
 // `dsh.bundle.patch` and `exports["./cordis.patch.yml"]` — so leaving it out
 // ships a manifest that points at a file the directory does not contain.
-const files = ['index.js', 'client.js', 'package.json', 'cordis.patch.yml', 'test-fetch.mjs', 'test-settings.mjs', 'test-usage.mjs', 'smoke-test.mjs']
+const files = ['index.js', 'cost.js', 'spend.js', 'client.js', 'package.json', 'cordis.patch.yml', 'test-fetch.mjs', 'test-settings.mjs', 'test-usage.mjs', 'test-cost.mjs', 'test-spend.mjs', 'smoke-test.mjs']
 
 /** The loader row: the observer runs in-process, so nothing listens. */
 const FETCH_BLOCK = `# ── dsh-clinepass ─────────────────────────────────────────────────────────

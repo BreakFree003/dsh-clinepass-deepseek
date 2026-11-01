@@ -28,7 +28,7 @@
 ## 2. 跑测试
 
 ```sh
-npm test    # test-package / test-fetch / test-settings / test-usage / test-install，五个都不需要外网
+npm test    # test-package / test-fetch / test-settings / test-usage / test-spend / test-cost / test-install，都不需要外网
 ```
 
 要报断言条数就**从输出里数**，不要凭记忆写：

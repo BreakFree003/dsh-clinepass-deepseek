@@ -45,6 +45,9 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
+import { COST_PROJECTION_KEY, makeCostProjection } from './cost.js'
+import { createSpendHandler, SPEND_ROUTE } from './spend.js'
+
 /** Stable plugin id used by loader diagnostics. */
 export const name = 'clinepass'
 
@@ -620,6 +623,22 @@ export function installUsageRoute(routeCtx, cfg, logger = console, options = {})
       error instanceof Error ? error.message : String(error),
     )
     return 'failed'
+  }
+  // 设置页的「官方定价累计」：读投影缓存求和，POST 重置基线。单独注册、单独失败 ——
+  // 它挂了不该把额度卡一起带走。
+  try {
+    registry.register({
+      path: SPEND_ROUTE,
+      methods: ['GET', 'POST'],
+      requestBody: 'buffered',
+      fetch: createSpendHandler({ logger }),
+    })
+  } catch (error) {
+    logger.warn?.(
+      '[clinepass] could not register the spend route %s: %s',
+      SPEND_ROUTE,
+      error instanceof Error ? error.message : String(error),
+    )
   }
   logger.info?.('[clinepass] usage for Settings → Models is served at %s (a path on dsh\'s own server, no listener of ours)', cfg.usageRoute)
   return 'installed'
@@ -1849,6 +1868,135 @@ export function installPromptDisplay(ctx, cfg) {
 }
 
 /**
+ * 注册「按官方峰谷价」的成本投影。
+ *
+ * 这个投影只读会话事件（`request/header`、`assistant/message` 的 usage、`event.time`），
+ * 不改请求、不联网、不写盘 —— 它存在的唯一理由是：成本必须逐请求按发生时刻计价，
+ * 而 dsh 自带的 `tokenUsage` 投影只留四桶总和、把时间丢了。
+ *
+ * **zod 是动态加载的**，两个原因：仓库里跑单测时没有 node_modules（静态 import 会让
+ * 每个 test-*.mjs 在 import 阶段就挂掉）；而运行时 zod 由宿主 profile 提供，不是本包
+ * 声明的依赖。加载失败/注册表缺席都只是**降级**（胶囊只显示 Provider，不显示钱），
+ * 绝不能把宿主带走。
+ *
+ * @param ctx - host plugin context.
+ * @param logger - 插件日志。
+ */
+async function installCostProjection(ctx, logger) {
+  let zod
+  try {
+    const module = await import('zod')
+    zod = module.default ?? module
+    if (typeof zod?.object !== 'function') throw new TypeError('zod 没有 object()')
+  } catch (error) {
+    logger.warn?.(
+      '[clinepass] 无法加载 zod，成本投影未注册；对话下方的官方价不会显示（其它功能不受影响）：%s',
+      error instanceof Error ? error.message : String(error),
+    )
+    return
+  }
+
+  const definition = makeCostProjection(zod)
+
+  // 注册前自检：用**自己的** viewSchema 解析一次空会话视图。形状对不上时注册表会
+  // 把投影整个丢掉，界面上只是「没有数字」，日志里也没有任何线索 —— 2026-11-02
+  // 真踩过一次（viewSchema 的 tokens 复用了带 requests 的桶 schema）。这里把它
+  // 变成一条明确的 error。
+  try {
+    const empty = definition.init({}, 0)
+    // state 对不上的后果比 view 更重：restore/cold-read 会抛，整条会话读不出来。
+    definition.stateSchema.parse(empty)
+    definition.wire.viewSchema.parse(definition.wire.view(empty))
+    // 再折一条真实形状的样本：空态过得了、有样本过不了，是「字段只在非空时出现」那类 drift。
+    // 先落一条 request/header，路由才建立 —— 否则下面的样本会被 route===null 跳过，
+    // 折叠形状根本没被验到（只有空视图过了一次 schema）。
+    const at = Date.UTC(2026, 10, 2, 2, 0, 0)
+    const header = {
+      type: 'request/header',
+      seq: 1,
+      time: at,
+      data: { header: { config: { provider: 'cline-pass', model: 'cline-pass/self-check' } } },
+    }
+    const sample = {
+      type: 'assistant/message',
+      seq: 2,
+      time: at,
+      data: {
+        turn: 1,
+        step: 1,
+        message: {},
+        usage: { inputTokens: 1000, outputTokens: 10, cacheReadTokens: 4000, totalTokens: 5010 },
+        stream: [],
+      },
+    }
+    const routed = definition.apply(empty, header)
+    const folded = definition.apply(routed, sample)
+    definition.stateSchema.parse(folded)
+    definition.wire.viewSchema.parse(definition.wire.view(folded))
+  } catch (error) {
+    logger.error?.(
+      '[clinepass] 成本投影自检失败（viewSchema 与 view 形状不一致），本次不注册；对话下方不会显示官方价：%s',
+      error instanceof Error ? error.message : String(error),
+    )
+    return
+  }
+
+  /**
+   * 把投影挂在本插件的 fiber 上：插件热重载/卸载时 key 一起消失，读方随即退回
+   * 「只显示 Provider」。同 key 已被注册说明上一次卸载没清干净 —— 那时本次定义
+   * 会被静默忽略（看起来还是旧数字），所以喊出来。
+   *
+   * @returns 是否已经注册（或已有人在用、本次不再注册）。
+   */
+  const register = (registry) => {
+    if (registry === null || registry === undefined || typeof registry.register !== 'function') return false
+    // 交给注册表去重（它按 key 引用计数，并在 stateVersion / summary 不一致时抛错）。
+    // 自己先 peek `registry.registrations` 再跳过，会让「旧 fiber 还没释放」的热重载
+    // 场景下成本一直消失到下次重启 —— 那正是这个 `if` 原来的行为。
+    const attach = () => {
+      const dispose = registry.register(definition)
+      logger.info?.('[clinepass] 已注册投影 "%s"（DeepSeek 官方峰谷价，人民币）', COST_PROJECTION_KEY)
+      return () => dispose()
+    }
+    // 没有 ctx.effect 就没有卸载钩子：注册仍要发生（否则热重载后永远没有数字），
+    // 只是这份定义会活到进程结束 —— 比「静默什么都没发生」好。
+    //
+    // 注册本身也会抛（同 key 不同 stateVersion、definition 非法）：那不能冒到 `apply()`，
+    // 否则整个插件装不上，Provider 胶囊和用量路由一起消失。这里只降级。
+    try {
+      if (typeof ctx.effect === 'function') ctx.effect(attach)
+      else attach()
+    } catch (error) {
+      logger.warn?.(
+        '[clinepass] could not register the cost projection %s: %s',
+        COST_PROJECTION_KEY,
+        error instanceof Error ? error.message : String(error),
+      )
+      return false
+    }
+    return true
+  }
+
+  // 直接读 `ctx.sessionProjections` 会抛「without inject」—— 这里只做可选访问，
+  // 拿不到就交给 ctx.inject 等它注册（本插件的主 inject 不能加它：缺席时整个插件
+  // 连 Provider 胶囊都不该停）。
+  let existing
+  try {
+    existing = ctx.get?.('sessionProjections')
+  } catch {
+    existing = undefined
+  }
+  if (register(existing)) return
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['sessionProjections'], (scoped) => {
+      register(scoped.sessionProjections)
+    })
+    return
+  }
+  logger.warn?.('[clinepass] 这个宿主没有 sessionProjections 服务，成本投影未注册；对话下方的官方价不会显示')
+}
+
+/**
  * Install the in-process observer and provision the provider profile.
  *
  * The settings seam is required: provisioning must finish before the first turn
@@ -1887,6 +2035,9 @@ export async function apply(ctx, config) {
       '[clinepass] could not hook the global fetch, so the real provider cannot be observed. Something replaced globalThis.fetch before this plugin loaded.',
     )
   }
+
+  // 成本投影与观察器互不依赖：注册失败只丢「对话下方显示官方价」，不影响 Provider 胶囊。
+  await installCostProjection(ctx, logger)
 
   // 登记结果先落一个 `pending`：状态文件里「还没跑」和「跑失败了」从此长得不一样。
   let provision = 'pending'
@@ -1967,7 +2118,15 @@ export async function apply(ctx, config) {
   // removes it. The event fires only where a web server renders a page, which is
   // also why `webServer` is not injected: a headless composition is unaffected.
   ctx.on?.('webserver/index-inject', (table) => {
-    table.push({ kind: 'global', name: USAGE_BOOT_GLOBAL, value: { usageRoute: mounted === 'installed' ? cfg.usageRoute : null, enabled: mounted === 'installed' } })
+    table.push({
+      kind: 'global',
+      name: USAGE_BOOT_GLOBAL,
+      value: {
+        usageRoute: mounted === 'installed' ? cfg.usageRoute : null,
+        spendRoute: mounted === 'installed' ? SPEND_ROUTE : null,
+        enabled: mounted === 'installed',
+      },
+    })
   })
 
   // The usage card is a web-only extra: it needs the route registry (where the

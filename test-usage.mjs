@@ -14,6 +14,7 @@
  */
 import fs from 'node:fs'
 import { createUsageHandler, fetchUsage, installUsageRoute, normalizeUsage, USAGE_BOOT_GLOBAL, USAGE_PATH, USAGE_ROUTE, USAGE_WINDOWS, withDefaults } from './index.js'
+import { applyCostEvent, costViewOf, initCostState } from './cost.js'
 
 const failures = []
 const check = (label, ok, detail) => {
@@ -311,7 +312,7 @@ console.log('\n── 4. installUsageRoute ────────────�
   }
   const outcome = installUsageRoute(routeCtx, cfg, quiet)
   check('registration reports success', outcome === 'installed', outcome)
-  check('exactly one route is registered', registered.length === 1, String(registered.length))
+  check('registers both routes (usage + spend)', registered.length === 2 && registered.some((r) => r.path === USAGE_ROUTE) && registered.some((r) => r.path === '/api/clinepass.spend'), JSON.stringify(registered.map((r) => r.path)))
   check('…at the configured path', registered[0].path === USAGE_ROUTE, registered[0].path)
   check('…for GET only', registered[0].methods.join(',') === 'GET', registered[0].methods.join(','))
   check('…with a buffered body mode', registered[0].requestBody === 'buffered', registered[0].requestBody)
@@ -388,8 +389,14 @@ console.log('\n── 5. apply wiring ──────────────
 
   const on = hostCtx()
   await apply(on.ctx, { provision: false })
-  check('apply asks for the services the card needs', on.injected.length === 1 && on.injected[0].join(',') === 'connection,credentials', JSON.stringify(on.injected))
-  check('…registers the usage route', on.routes.length === 1 && on.routes[0].path === USAGE_ROUTE, JSON.stringify(on.routes.map((r) => r.path)))
+  // `sessionProjections` 是可选的：拿得到（安装副本里 zod 解析得到）就顺带注入，拿不到就只有
+  // 额度卡这一组。两种环境都要过，所以这里断言的是「必需的那组在里面、没有别的意外」。
+  check(
+    'apply asks for the services the card needs',
+    on.injected.some((tuple) => tuple.join(',') === 'connection,credentials') && on.injected.every((tuple) => tuple.join(',') === 'connection,credentials' || tuple.join(',') === 'sessionProjections'),
+    JSON.stringify(on.injected),
+  )
+  check('…registers the usage route', on.routes.some((r) => r.path === USAGE_ROUTE), JSON.stringify(on.routes.map((r) => r.path)))
   const onGlobals = on.emit()
   check(
     '…and announces the route to the browser half',
@@ -407,7 +414,11 @@ console.log('\n── 5. apply wiring ──────────────
   // purpose ("the card is not mounted at all") is a lie. The host must say so.
   const off = hostCtx()
   await apply(off.ctx, { provision: false, usage: false })
-  check('usage: false mounts no route', off.injected.length === 0 && off.routes.length === 0, JSON.stringify({ injected: off.injected, routes: off.routes.length }))
+  check(
+    'usage: false mounts no route',
+    off.routes.length === 0 && off.injected.every((tuple) => tuple.join(',') === 'sessionProjections'),
+    JSON.stringify({ injected: off.injected, routes: off.routes.length }),
+  )
   check('…but still announces, so the card can hide itself', off.listeners.length === 1, `listeners=${off.listeners.length}`)
   const offGlobals = off.emit()
   check('…saying it is disabled', offGlobals.length === 1 && offGlobals[0].value.enabled === false, JSON.stringify(offGlobals))
@@ -525,6 +536,9 @@ console.log('\n── 8. client render ─────────────�
   }
 
   /** A minimal React runtime: components as plain functions, hooks as slots. */
+  /** 卡片现在还会读一次累计值路由；额度相关的断言只看 usage 那几条。 */
+  const usageCalls = (mount) => mount.calls.filter((call) => !String(call.url).includes('/clinepass.spend'))
+
   function reactRuntime() {
     const hooks = []
     let cursor = 0
@@ -668,6 +682,14 @@ console.log('\n── 8. client render ─────────────�
     return { ...node, children: (node.children ?? []).map(expand) }
   }
 
+  /** How many elements in the tree carry this prop key (value doesn't matter). */
+  function countProp(tree, key) {
+    if (tree === null || typeof tree !== 'object' || Array.isArray(tree)) return 0
+    let count = tree.props?.[key] !== undefined ? 1 : 0
+    for (const child of tree.children ?? []) count += countProp(child, key)
+    return count
+  }
+
   /** How many elements in the tree carry this `role`. */
   function countRole(tree, role) {
     if (tree === null || typeof tree !== 'object' || Array.isArray(tree)) return 0
@@ -677,7 +699,13 @@ console.log('\n── 8. client render ─────────────�
   }
 
   const realWindow = globalThis.window
+  const realDocument = globalThis.document
   const registration = { value: null }
+  /**
+   * 展开面板会 `document.addEventListener` + `createPortal(…, document.body)`。
+   * 这里给一个最小替身：**只在打开时**才会被碰到，所以收起态的行为一点没变。
+   */
+  globalThis.document = { body: {}, addEventListener() {}, removeEventListener() {} }
 
   globalThis.window = {
     __ModuleLoader__: {
@@ -692,7 +720,8 @@ console.log('\n── 8. client render ─────────────�
     location: { origin: 'http://127.0.0.1:3080' },
     fetch: (url, init) => {
       globalThis.window.__CALLS__.push({ url, init })
-      const answer = globalThis.window.__ANSWER__
+      const isSpend = String(url).includes('/clinepass.spend')
+      const answer = isSpend && globalThis.window.__SPEND_ANSWER__ !== undefined ? globalThis.window.__SPEND_ANSWER__ : globalThis.window.__ANSWER__
       const status = globalThis.window.__STATUS__ ?? 200
       return Promise.resolve({
         ok: status >= 200 && status < 300,
@@ -734,6 +763,9 @@ console.log('\n── 8. client render ─────────────�
       globalThis.window.__TIMERS__ = { started: 0, cleared: 0, ids: new Set() }
       const bundle = registration.value.factory((id) => {
         if (id === 'react') return stub.runtime
+        // 明细面板用 portal 挂到 body（dock 的祖先链会被 overflow/transform 裁掉）。
+        // 替身把 portal 当成普通孩子，元素树里照样能断言。
+        if (id === 'react-dom') return { createPortal: (node) => node }
         throw new Error(`the browser half asked for an unexpected module: ${id}`)
       })
       const registered = []
@@ -831,7 +863,7 @@ console.log('\n── 8. client render ─────────────�
     const text = textOf(tree).join(' | ')
     check('the card renders', tree !== null, JSON.stringify(tree)?.slice(0, 200))
     check('…with the title', text.includes('ClinePass 剩余用量') || text.includes('ClinePass remaining usage'), text.slice(0, 160))
-    check('…fetching the route the host announced', ours.calls.length === 1 && ours.calls[0].url === '/api/custom.usage', JSON.stringify(ours.calls.map((c) => c.url)))
+    check('…fetching the route the host announced', usageCalls(ours).length === 1 && usageCalls(ours)[0].url === '/api/custom.usage', JSON.stringify(ours.calls.map((c) => c.url)))
     check('…same-origin and credentialed', ours.calls[0].init.credentials === 'same-origin', JSON.stringify(ours.calls[0].init))
     check('…naming all three windows', ['5-hour', 'Weekly', 'Monthly'].every((label) => text.includes(label)), text)
 
@@ -984,9 +1016,9 @@ console.log('\n── 8. client render ─────────────�
     const keyMount = mount()
     globalThis.window.__ANSWER__ = { ok: true, limits: [] }
     await renderCard(keyMount.seat, keyMount.stub, cardProps('cline-pass', { keyConfigured: false }))
-    check('the first read is not forced (it may use the host cache)', keyMount.calls.length === 1 && keyMount.calls[0].url === '/api/clinepass.usage', JSON.stringify(keyMount.calls.map((c) => c.url)))
+    check('the first read is not forced (it may use the host cache)', usageCalls(keyMount).length === 1 && usageCalls(keyMount)[0].url === '/api/clinepass.usage', JSON.stringify(keyMount.calls.map((c) => c.url)))
     await renderCard(keyMount.seat, keyMount.stub, cardProps('cline-pass', { keyConfigured: true }))
-    check('saving a key forces a re-read', keyMount.calls.length === 2 && keyMount.calls[1].url === '/api/clinepass.usage?refresh=1', JSON.stringify(keyMount.calls.map((c) => c.url)))
+    check('saving a key forces a re-read', usageCalls(keyMount).length === 2 && usageCalls(keyMount)[1].url === '/api/clinepass.usage?refresh=1', JSON.stringify(keyMount.calls.map((c) => c.url)))
 
     // Timers: one ticker for our card, none for anyone else's, cleared on unmount.
     const foreignTimer = mount()
@@ -1001,6 +1033,43 @@ console.log('\n── 8. client render ─────────────�
     check('our card starts exactly one ticker', ownTimer.stub.intervalCount() === 1, String(ownTimer.stub.intervalCount()))
     ownTimer.stub.unmount()
     check('…and unmounting clears it', globalThis.window.__TIMERS__.cleared === 1, JSON.stringify(globalThis.window.__TIMERS__))
+
+    // ── 8b. 设置页的「官方定价累计」 ──
+    globalThis.window.__SPEND_ANSWER__ = { ok: true, cny: 12.34, total: 120.34, baseline: 108, since: '2026-11-02T02:00:00.000Z', sessions: 7 }
+    const spendMount = mount()
+    let spendTree = await renderCard(spendMount.seat, spendMount.stub, cardProps('cline-pass'))
+    let spendText = textOf(spendTree).join(' | ')
+    check('累计块出现', spendText.includes('List-price total'), spendText)
+    check('累计金额', spendText.includes('¥12.34'), spendText)
+    check('标注统计起点', spendText.includes('since '), spendText)
+    check('累计请求走了 spend 路由', spendMount.calls.some((c) => c.url === '/api/clinepass.spend'), JSON.stringify(spendMount.calls.map((c) => c.url)))
+    const resetButton = (function find(node) {
+      if (node === null || typeof node !== 'object') return null
+      if (Array.isArray(node)) { for (const child of node) { const hit = find(child); if (hit !== null) return hit } return null }
+      if (node.props && node.props['data-clinepass-spend-reset'] !== undefined) return node
+      return find(node.children ?? [])
+    })(spendTree)
+    check('有重置按钮', resetButton !== null)
+    // 第一次点：进入确认态，不发请求。
+    resetButton.props.onClick()
+    spendTree = await renderCard(spendMount.seat, spendMount.stub, cardProps('cline-pass'))
+    spendText = textOf(spendTree).join(' | ')
+    check('第一次点只进确认态', spendText.includes('Confirm reset?'), spendText)
+    check('…且没有发 POST', spendMount.calls.filter((c) => c.init?.method === 'POST').length === 0)
+    // 第二次点：POST 重置。
+    const armed = (function find(node) {
+      if (node === null || typeof node !== 'object') return null
+      if (Array.isArray(node)) { for (const child of node) { const hit = find(child); if (hit !== null) return hit } return null }
+      if (node.props && node.props['data-clinepass-spend-reset'] !== undefined) return node
+      return find(node.children ?? [])
+    })(spendTree)
+    globalThis.window.__SPEND_ANSWER__ = { ok: true, cny: 0, total: 120.34, baseline: 120.34, since: '2026-11-02T03:00:00.000Z', sessions: 7, reset: true }
+    armed.props.onClick()
+    spendTree = await renderCard(spendMount.seat, spendMount.stub, cardProps('cline-pass'))
+    spendText = textOf(spendTree).join(' | ')
+    check('第二次点发出 POST', spendMount.calls.some((c) => String(c.init?.method).toUpperCase() === 'POST'), JSON.stringify(spendMount.calls.map((c) => c.init?.method ?? 'GET')))
+    check('重置后显示 0', spendText.includes('¥0.00'), spendText)
+    delete globalThis.window.__SPEND_ANSWER__
 
     // ── 9. conversation.composer.dock: provider pill ──
     //
@@ -1039,6 +1108,7 @@ console.log('\n── 8. client render ─────────────�
     check('clinepass model dock pill renders', clinepassDock != null && clinepassDock.props['data-composer-stat'] === 'clinepass-provider')
     check('…queries the status route with status=1', dockMount.calls.some((c) => c.url.includes('status=1') && c.url.includes('sessionId=sess-1')), JSON.stringify(dockMount.calls.map((c) => c.url)))
     check('…and shows the provider the host reported', textOf(clinepassDock).join(' ').includes('Provider: openai-compatible-private'), textOf(clinepassDock).join(' | '))
+    check('…投影缺席时不显示金额', !textOf(clinepassDock).join(' ').includes('¥'), textOf(clinepassDock).join(' | '))
     check('…credentialed like the usage card', dockMount.calls.every((c) => c.init?.credentials === 'same-origin'), JSON.stringify(dockMount.calls.map((c) => c.init)))
 
     // 一个真实会话里的顺序：首次渲染时投影还是空的（新会话，没有任何 request/header）
@@ -1075,6 +1145,94 @@ console.log('\n── 8. client render ─────────────�
     check('…and explained in the tooltip', typeof anonDock?.children?.[0]?.props?.title === 'string' && anonDock.children[0].props.title.includes('openai-compatible-private'), JSON.stringify(anonDock?.children?.[0]?.props?.title ?? null))
     check('…without a gating badge', !textOf(anonDock).join(' ').includes('⚠️'), textOf(anonDock).join(' | '))
 
+    // ── 展开明细面板 ──
+    // 投影缺席时没有面板（上面几条已经覆盖）；这里给一份完整视图，点一下展开。
+    // fixture 由 cost.js 的真投影折出来，不手写：wire 字段改名/改形状时这里会跟着变，
+    // 否则 client 在 costOfValue 里静默落 0，测试还是全绿（三处字段必须一致）。
+    const costView = (() => {
+      const peak = Date.UTC(2026, 10, 2, 2, 0, 0) // 2026-11-02 10:00 +08（周一，峰）
+      const off = Date.UTC(2026, 10, 2, 12, 0, 0) // 2026-11-02 20:00 +08（谷）
+      const usage = { inputTokens: 2000, outputTokens: 5000, cacheReadTokens: 1_500_000 }
+      let state = initCostState({}, 0)
+      state = applyCostEvent(state, { type: 'request/header', seq: 1, time: peak, data: { header: { config: { provider: 'cline-pass', model: 'cline-pass/x' } } } })
+      state = applyCostEvent(state, { type: 'assistant/message', seq: 2, time: peak, data: { turn: 1, step: 1, message: {}, usage } })
+      state = applyCostEvent(state, { type: 'assistant/message', seq: 3, time: off, data: { turn: 1, step: 2, message: {}, usage } })
+      return costViewOf(state)
+    })()
+    const costSelection = { lastUsed: { provider: 'cline-pass', model: 'cline-pass/deepseek-v4.1-flash' }, next: null }
+    const costProps = (extra = {}) => ({
+      useProjection: (key) => (key === 'modelSelection' ? costSelection : costView),
+      useSession: (select) => select({ running: false }),
+      sessionId: 'sess-cost',
+      ...extra,
+    })
+    const costMount = mount()
+    globalThis.window.__ANSWER__ = { ok: true, provider: 'deepseek', anonymized: false }
+    let costDock = await renderChecked(costMount.dockSeat, costMount.stub, costProps(), 'the cost pill renders')
+    check('成本显示在胶囊上', textOf(costDock).join(' ').includes('· ¥0.156'), textOf(costDock).join(' | '))
+    check('收起时没有面板', countProp(costDock, 'data-clinepass-panel') === 0)
+    costDock.children[0].props.onClick()
+    costDock = await renderChecked(costMount.dockSeat, costMount.stub, costProps(), 'the expanded panel renders')
+    check('点一下展开面板', countProp(costDock, 'data-clinepass-panel') === 1)
+    const panelText = textOf(costDock).join(' | ')
+    check('面板有本会话小计', panelText.includes('This session'))
+    check('面板有峰谷拆分（不带次数）', panelText.includes('Peak ¥0.10') && panelText.includes('Off-peak ¥0.05') && !panelText.includes(' req'), panelText)
+    check('面板有 token 四桶', panelText.includes('3.00M') && panelText.includes('4.0k') && panelText.includes('10.0k'), panelText)
+    check('面板不再显示请求数', !panelText.includes('Requests'), panelText)
+    check('面板缓存命中率两位小数', panelText.includes('Cache hit 99.87%'), panelText)
+    check('面板有 ClinePass 计费（恒按高峰）', panelText.includes('ClinePass billing') && panelText.includes('¥0.21'), panelText)
+    check('面板不再显示峰谷规则/价表说明', !panelText.includes('Peak: Mon') && !panelText.includes('2026-11-02'), panelText)
+    costDock.children[0].props.onClick()
+    costDock = await renderChecked(costMount.dockSeat, costMount.stub, costProps(), 'closing the panel')
+    check('再点收起', countProp(costDock, 'data-clinepass-panel') === 0)
+
+    // 零次的时段不写那一行（这里峰时段 0 次）。
+    const zeroPeakView = { ...costView, peakCny: 0, peakRequests: 0, offCny: 0.5 }
+    const zeroProps = {
+      useProjection: (key) => (key === 'modelSelection' ? costSelection : zeroPeakView),
+      useSession: (select) => select({ running: false }),
+      sessionId: 'sess-cost',
+    }
+    const openPanel = async (seat, stub, props, label) => {
+      let tree = await renderChecked(seat, stub, props, `${label} (render)`)
+      if (countProp(tree, 'data-clinepass-panel') === 0) {
+        tree.children[0].props.onClick()
+        tree = await renderChecked(seat, stub, props, `${label} (open)`)
+      }
+      return tree
+    }
+    costDock = await openPanel(costMount.dockSeat, costMount.stub, zeroProps, 'zero-peak panel')
+    const zeroText = textOf(costDock).join(' | ')
+    check('零次时段不写那一行', !zeroText.includes('Peak ¥') && zeroText.includes('Off-peak ¥0.50'), zeroText)
+
+    // 子代理只显示分组行：标题与逐个金额都不再渲染。
+    const subView = {
+      cny: 0.002, cnyPeak: 0.004, peakCny: 0, offCny: 0.002,
+      requests: 2, peakRequests: 0,
+      tokens: { cacheRead: 1000, uncachedInput: 10, cacheWrite: 0, output: 20 },
+      pricing: '2026-11-02',
+    }
+    const subProps = {
+      useProjection: (key) => (key === 'modelSelection' ? costSelection : costView),
+      useSession: (select) => select({ running: false }),
+      useSessions: (selector) => selector({
+        byId: {
+          'sess-cost': { id: 'sess-cost', origin: 'root', parentId: undefined },
+          a: { id: 'a', origin: 'subagent', parentId: 'sess-cost', title: '探针一号', projectionValues: { clinepassCost: subView } },
+          b: { id: 'b', origin: 'subagent', parentId: 'a', title: '探针二号', projectionValues: { clinepassCost: subView } },
+          // 负例：用户自己开的分叉（origin=fork）、别的会话的子代理、以及挂在上面的孙代理。
+          fork1: { id: 'fork1', origin: 'fork', parentId: 'sess-cost', title: '用户分叉', projectionValues: { clinepassCost: subView } },
+          other: { id: 'other', origin: 'subagent', parentId: 'somewhere-else', title: '别人的子代理', projectionValues: { clinepassCost: subView } },
+          deep: { id: 'deep', origin: 'subagent', parentId: 'other', title: '别人的孙代理', projectionValues: { clinepassCost: subView } },
+        },
+      }),
+      sessionId: 'sess-cost',
+    }
+    costDock = await openPanel(costMount.dockSeat, costMount.stub, subProps, 'subagent panel')
+    const subText = textOf(costDock).join(' | ')
+    check('子代理只显示分组行', subText.includes('Subagents (2)') && !subText.includes('探针一号') && !subText.includes('探针二号'), subText)
+    check('用户 fork / 别人的子代理都不算', !subText.includes('用户分叉') && !subText.includes('别人的子代理'), subText)
+
     // 轮询：running 为真时挂一个 2 秒的 ticker，running 落下后清掉（useSession 是
     // 上一条用例唯一没覆盖的路径 —— 没传它时 running 恒为 false，ticker 永不出现）。
     const runningMount = mount()
@@ -1091,6 +1249,8 @@ console.log('\n── 8. client render ─────────────�
   } finally {
     if (realWindow === undefined) delete globalThis.window
     else globalThis.window = realWindow
+    if (realDocument === undefined) delete globalThis.document
+    else globalThis.document = realDocument
   }
 }
 
