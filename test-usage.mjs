@@ -71,12 +71,14 @@ const countUrl = (g, suffix) => g.calls.filter((call) => String(call.url).endsWi
 const PLAN_PAYLOAD = {
   success: true,
   data: {
-    entitlements: {
-      cline_pass: {
-        inferenceCapThreshold: {
-          last5HoursUsageCostUSDPerUser: 1e9,
-          last7daysUsageCostUSDPerUser: 2.5e9,
-          last30daysUsageCostUSDPerUser: 5e9,
+    plan: {
+      entitlements: {
+        cline_pass: {
+          inferenceCapThreshold: {
+            last5HoursUsageCostUSDPerUser: 1e9,
+            last7daysUsageCostUSDPerUser: 2.5e9,
+            last30daysUsageCostUSDPerUser: 5e9,
+          },
         },
       },
     },
@@ -141,6 +143,7 @@ console.log('\n── 2. normalizeCaps ─────────────�
 {
   const caps = normalizeCaps(PLAN_PAYLOAD)
   check('the plan payload yields the three caps in USD', caps !== null && caps.fiveHourUsd === 10 && caps.weeklyUsd === 25 && caps.monthlyUsd === 50, JSON.stringify(caps))
+  check('the older flat shape is accepted too', normalizeCaps({ success: true, data: { entitlements: { cline_pass: { inferenceCapThreshold: { last30daysUsageCostUSDPerUser: 5e9 } } } } })?.monthlyUsd === 50)
   check('a missing entitlements block is null', normalizeCaps({ success: true, data: {} }) === null)
   check('a missing monthly threshold is null (no half-filled caps)', normalizeCaps({ data: { entitlements: { cline_pass: { inferenceCapThreshold: { last5HoursUsageCostUSDPerUser: 1e9 } } } } }) === null)
   check('a string threshold is refused, not coerced', normalizeCaps({ data: { entitlements: { cline_pass: { inferenceCapThreshold: { last30daysUsageCostUSDPerUser: '5000000000' } } } } }) === null)
@@ -1126,19 +1129,19 @@ console.log('\n── 8. client render ─────────────�
 
     // 月额度消耗行：百分比来自 usage 读数，金额 = 百分比 × 阈值（caps 来自 /users/me/plan）。
     globalThis.window.__ANSWER__ = { ...live, caps: { fiveHourUsd: 10, weeklyUsd: 25, monthlyUsd: 50 } }
-    globalThis.window.__SPEND_ANSWER__ = { ok: true, cny: 12.34, since: '2026-11-02T02:00:00.000Z', sessions: 7 }
+    globalThis.window.__SPEND_ANSWER__ = { ok: true, cny: 12.34, cnyPeak: 2.4, since: '2026-11-02T02:00:00.000Z', sessions: 7 }
     const quotaMount = mount()
     let quotaTree = await renderCard(quotaMount.seat, quotaMount.stub, cardProps('cline-pass'))
     let quotaText = textOf(quotaTree).join(' | ')
-    check('累计块附带月额度金额与百分比', quotaText.includes('Monthly quota ≈$45.50 of $50 (91%)'), quotaText)
-    check('…金额按美元显示，不折人民币', !quotaText.includes('¥45.5'), quotaText)
+    check('累计块附带 ClinePass 计费与月额度百分比', quotaText.includes('ClinePass billing ¥2.40 (≈$0.36) · monthly quota 0.72%'), quotaText)
+    check('…百分比是自重置起的配额口径，不是网关的 30 天读数', !quotaText.includes('91%') && !quotaText.includes('$45.50'), quotaText)
 
-    // 阈值读不到时只显示百分比 —— 不编造一个金额。
+    // 阈值读不到时只显示金额 —— 不编造百分比。
     globalThis.window.__ANSWER__ = { ...live, caps: null }
     const pctMount = mount()
     const pctTree = await renderCard(pctMount.seat, pctMount.stub, cardProps('cline-pass'))
     const pctText = textOf(pctTree).join(' | ')
-    check('没有 caps 时只显示月额度百分比', pctText.includes('Monthly quota 91% used') && !pctText.includes('of $50'), pctText)
+    check('没有 caps 时只显示 ClinePass 计费', pctText.includes('ClinePass billing ¥2.40 (≈$0.36)') && !pctText.includes('monthly quota'), pctText)
     delete globalThis.window.__SPEND_ANSWER__
 
     // ── 9. conversation.composer.dock: provider pill ──

@@ -414,7 +414,10 @@ export function normalizeUsage(payload) {
 export function normalizeCaps(payload) {
   if (!isPlainObject(payload)) return null
   const data = isPlainObject(payload.data) ? payload.data : payload
-  const entitlements = isPlainObject(data.entitlements) ? data.entitlements : null
+  // The live answer nests the plan history under `data.plan`; older captures had
+  // the entitlements directly on `data`. Accept both rather than guess.
+  const owner = isPlainObject(data.plan) ? data.plan : data
+  const entitlements = isPlainObject(owner.entitlements) ? owner.entitlements : null
   const pass = entitlements !== null && isPlainObject(entitlements.cline_pass) ? entitlements.cline_pass : null
   const threshold = pass !== null && isPlainObject(pass.inferenceCapThreshold) ? pass.inferenceCapThreshold : null
   if (threshold === null) return null

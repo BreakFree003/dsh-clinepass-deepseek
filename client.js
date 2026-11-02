@@ -124,9 +124,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendConfirm: '确认重置？',
           spendHint: '按 DeepSeek 官方峰谷价累计；旧会话的历史不计入',
           spendUnreachable: '读不到本地投影缓存，累计暂时不可用',
-          spendQuota: '月额度 {used} / {cap}（{pct}%）',
-          spendQuotaPct: '月额度已用 {pct}%',
-          spendQuotaHint: '网关的 30 天窗口百分比 × 额度阈值（≈ 表示由整数百分比折算）',
+          spendQuota: 'ClinePass 计费 {cny}（≈{usd}）· 月额度 {pct}%',
+          spendQuotaNoCap: 'ClinePass 计费 {cny}（≈{usd}）',
+          spendQuotaHint: '自重置起，按 ClinePass 配额口径（恒按高峰价）累计；百分比 = 折成美元后占月额度的比例',
           // ── 成本（官方峰谷价）──
           costTitle: 'DeepSeek 官方价（按每次请求发生的时刻判峰谷）',
           costActual: '实际 {cost}',
@@ -180,9 +180,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendConfirm: 'Confirm reset?',
           spendHint: 'Accumulated at the DeepSeek list price; history of older sessions is excluded',
           spendUnreachable: 'The local projection cache is unreadable; the total is unavailable',
-          spendQuota: 'Monthly quota {used} of {cap} ({pct}%)',
-          spendQuotaPct: 'Monthly quota {pct}% used',
-          spendQuotaHint: 'Gateway 30-day percentage × the quota threshold (≈ marks a value derived from an integer percentage)',
+          spendQuota: 'ClinePass billing {cny} (≈{usd}) · monthly quota {pct}%',
+          spendQuotaNoCap: 'ClinePass billing {cny} (≈{usd})',
+          spendQuotaHint: 'Since the reset, at the ClinePass quota price (always peak); the percentage is its USD value over the monthly cap',
           // ── cost (official peak/off-peak price) ──
           costTitle: 'DeepSeek list price (peak/off-peak by the time of each request)',
           costActual: 'actual {cost}',
@@ -809,21 +809,24 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                 var amount = typeof spend.cny === 'number' && isFinite(spend.cny) ? spend.cny : 0
                 // 和胶囊/面板同一套格式化：同一笔钱在三个界面上位数一致。
                 var amountText = formatCny(amount) ?? '¥0.00'
-                // 月额度消耗：百分比来自 usage 路由（网关读数），金额 = 百分比 × 阈值。
-                // 阈值来自 /users/me/plan；caps 为 null 时只显示百分比，不编造金额。
-                var monthlyUsed = byType.monthly !== undefined && typeof byType.monthly.percentUsed === 'number' && isFinite(byType.monthly.percentUsed)
-                  ? byType.monthly.percentUsed
-                  : null
+                // 配额口径的累计：ClinePass 恒按高峰价记账，`cnyPeak` 才是「吃掉多少月额度」的金额。
+                // 月额度上限来自 /users/me/plan 的 caps；读不到就只显示金额，不编造百分比。
                 var caps = body !== null && body.ok === true && body.caps !== null && typeof body.caps === 'object' ? body.caps : null
-                var quotaText = monthlyUsed === null
-                  ? null
-                  : caps !== null && typeof caps.monthlyUsd === 'number' && isFinite(caps.monthlyUsd) && caps.monthlyUsd > 0
-                    ? fill(t.spendQuota, {
-                        used: '≈' + formatUsd(monthlyUsed / 100 * caps.monthlyUsd),
-                        cap: formatUsdCap(caps.monthlyUsd),
-                        pct: String(Math.round(monthlyUsed)),
+                var peakCny = typeof spend.cnyPeak === 'number' && isFinite(spend.cnyPeak) && spend.cnyPeak > 0 ? spend.cnyPeak : null
+                var quotaText = null
+                if (peakCny !== null) {
+                  // 峰价表两列同比例（¥2 ↔ $0.3、¥0.04 ↔ $0.006、¥8 ↔ $1.2），所以 ×0.15 就是美元。
+                  var peakUsd = peakCny * 0.15
+                  var capUsd = caps !== null && typeof caps.monthlyUsd === 'number' && isFinite(caps.monthlyUsd) && caps.monthlyUsd > 0 ? caps.monthlyUsd : null
+                  var cnyText = formatCny(peakCny) ?? '¥0.00'
+                  quotaText = capUsd === null
+                    ? fill(t.spendQuotaNoCap, { cny: cnyText, usd: formatUsd(peakUsd) })
+                    : fill(t.spendQuota, {
+                        cny: cnyText,
+                        usd: formatUsd(peakUsd),
+                        pct: formatPct((peakUsd / capUsd) * 100),
                       })
-                    : fill(t.spendQuotaPct, { pct: String(Math.round(monthlyUsed)) })
+                }
                 return React.createElement(
                   'div',
                   {
@@ -980,17 +983,19 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
        * @returns `$43.00`。
        */
       function formatUsd(value) {
-        return '$' + value.toFixed(2)
+        // 自重置起的累计常常只有几美分，两位小数会把 0.004 显示成 $0.00。
+        return '$' + value.toFixed(value > 0 && value < 0.01 ? 4 : 2)
       }
 
       /**
-       * 额度上限：整数就写 `$50`，不写 `$50.00` —— 上限是策展常数，不是流水。
+       * 百分比：<1% 两位、<10% 一位、其余整数 —— 与金额同一套「别把有效位抹掉」的原则。
        *
-       * @param value - 美元金额。
-       * @returns `$50` / `$12.50`。
+       * @param value - 0…100 的百分数。
+       * @returns `0.72` / `7.1` / `12`。
        */
-      function formatUsdCap(value) {
-        return '$' + (Number.isInteger(value) ? String(value) : value.toFixed(2))
+      function formatPct(value) {
+        if (!(value > 0)) return '0'
+        return value < 1 ? value.toFixed(2) : value < 10 ? value.toFixed(1) : value.toFixed(0)
       }
 
       /**

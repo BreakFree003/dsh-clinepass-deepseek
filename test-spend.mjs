@@ -29,6 +29,15 @@ const stateOf = (cacheRead = 4000, requests = 1) => ({
   last: null,
 })
 
+/** 全谷段的状态：实际价比峰价口径便宜一半。 */
+const offStateOf = () => ({
+  inheritedEventCount: 0,
+  route: { provider: 'cline-pass', model: 'cline-pass/deepseek-v4.1-flash-1017' },
+  peak: { cacheRead: 0, uncachedInput: 0, cacheWrite: 0, output: 0, requests: 0 },
+  off: { cacheRead: 4000, uncachedInput: 1000, cacheWrite: 0, output: 100, requests: 1 },
+  last: null,
+})
+
 /** 一次请求的实际金额（写死，不用 costViewOf 现算 —— 否则求和断言是自证）。 */
 const CNY_ONE = 0.00296
 const near = (a, b) => Math.abs(a - b) < 1e-9
@@ -59,22 +68,30 @@ try {
   check('版本不匹配的行被跳过而不是硬折', sum.skipped === 1, String(sum.skipped))
   check('目录不存在时是空表而不是抛错', (await sumCachedCosts(path.join(tempRoot, 'nope'))).sessions.size === 0)
 
+  // 配额口径（恒按峰价）与实际价口径必须分开求和：谷段 token 在 `cny` 上打五折，
+  // 在 `peaks` 上不打折 —— 两个数一样就说明 `cnyPeak` 没被用上。
+  writeCache(cacheDir, 'off', offStateOf())
+  const sumOff = await sumCachedCosts(cacheDir)
+  const offView = costViewOf(offStateOf())
+  check('谷段在峰价口径上不打折', near(sumOff.peaks.get('off'), offView.cnyPeak) && near(sumOff.sessions.get('off'), offView.cny), `${sumOff.peaks.get('off')} vs ${offView.cnyPeak}`)
+  check('峰价口径约为实际价的两倍（全谷段）', sumOff.peaks.get('off') > sumOff.sessions.get('off') * 1.9, `${sumOff.peaks.get('off')} vs ${sumOff.sessions.get('off')}`)
+
   // ── 首次运行：每个会话记基线 ─────────────────────────
   let clock = 1_700_000_000_000
   const handler = createSpendHandler({ file: spendFile, dir: cacheDir, cacheMs: 0, now: () => clock, logger: { warn() {} } })
 
   const first = await (await handler({ method: 'GET' })).json()
-  check('首次运行从 0 开始', first.ok === true && first.cny === 0 && first.seen === 2, JSON.stringify({ cny: first.cny, seen: first.seen }))
+  check('首次运行从 0 开始', first.ok === true && first.cny === 0 && first.cnyPeak === 0 && first.seen === 3, JSON.stringify({ cny: first.cny, seen: first.seen }))
   check('起点 = 现在', first.since === new Date(clock).toISOString())
   const persisted = readSpend(spendFile)
-  check('每个会话都落了基线', persisted !== null && persisted.sessions.size === 2 && near(persisted.sessions.get('a'), CNY_ONE), JSON.stringify([...(persisted?.sessions ?? [])]))
+  check('每个会话都落了基线', persisted !== null && persisted.sessions.size === 3 && near(persisted.sessions.get('a'), CNY_ONE) && persisted.peaks !== undefined, JSON.stringify([...(persisted?.sessions ?? [])]))
 
   // ── 旧会话后来才出现：不跳 ───────────────────────────
   writeCache(cacheDir, 'old', stateOf(8000, 5)) // 一段"升级前"的历史
   clock += 1000
   const afterOld = await (await handler({ method: 'GET' })).json()
   check('新出现的旧会话不倒灌历史', afterOld.cny === 0, JSON.stringify(afterOld))
-  check('…但它的基线被记住了', afterOld.seen === 3 && readSpend(spendFile).sessions.has('old'))
+  check('…但它的基线被记住了', afterOld.seen === 4 && readSpend(spendFile).sessions.has('old'))
 
   // ── 已有会话继续花：只计增量 ─────────────────────────
   writeCache(cacheDir, 'a', stateOf(8000, 2)) // 从 ¥0.00296 涨到 ¥0.00608
@@ -83,6 +100,7 @@ try {
   const grownDelta = costViewOf(stateOf(8000, 2)).cny - CNY_ONE
   check('会话增长只计增量', near(grown.cny, grownDelta), `${grown.cny} vs ${grownDelta}`)
   check('计数的会话数', grown.sessions === 1, String(grown.sessions))
+  check('峰价口径同样只计增量', near(grown.cnyPeak, costViewOf(stateOf(8000, 2)).cnyPeak - CNY_ONE), `${grown.cnyPeak}`)
 
   // ── 重置 ─────────────────────────────────────────────
   clock += 1000
@@ -92,6 +110,8 @@ try {
   check('重置后起点更新', reset.since === new Date(clock).toISOString())
   const afterResetFile = readSpend(spendFile)
   check('重置把每个会话的当前花费拍成基线', near(afterResetFile.sessions.get('a'), costViewOf(stateOf(8000, 2)).cny))
+  check('重置也把峰价口径拍成基线', afterResetFile.peaks.has('a') && near(afterResetFile.peaks.get('a'), costViewOf(stateOf(8000, 2)).cnyPeak))
+  check('重置后峰价累计归零', reset.cnyPeak === 0, JSON.stringify(reset.cnyPeak))
 
   // ── 重置后继续累计 ───────────────────────────────────
   writeCache(cacheDir, 'a', stateOf(12000, 3))
@@ -124,13 +144,31 @@ try {
   const brokenRead = await (await broken({ method: 'GET' })).json()
   check('写失败时 GET 仍可读（只是没有基线）', brokenRead.ok === true && brokenRead.cny === 0)
 
+  // ── v1 基线迁移 ─────────────────────────────────────
+  //
+  // v1 文件只有实际价基线。升级后必须按该会话「当前峰价 / 当前实际价」的比例补出峰价基线，
+  // 而不是把旧基线当成峰价（那会把升级前的谷段折扣算进「已用配额」）。
+  const legacyDir = path.join(tempRoot, 'legacy-sessions')
+  fs.mkdirSync(legacyDir)
+  writeCache(legacyDir, 'L', stateOf(8000, 2))
+  const legacyFile = path.join(tempRoot, 'legacy.json')
+  const half = costViewOf(stateOf(8000, 2))
+  fs.writeFileSync(legacyFile, JSON.stringify({ version: 1, since: '2026-01-01T00:00:00.000Z', sessions: { L: half.cny / 2 } }))
+  const legacy = createSpendHandler({ file: legacyFile, dir: legacyDir, cacheMs: 0, now: () => clock, logger: { warn() {} } })
+  const legacyBody = await (await legacy({ method: 'GET' })).json()
+  const migrated = readSpend(legacyFile)
+  check('v1 基线补出峰价那一列', migrated !== null && migrated.peaks.has('L') && near(migrated.peaks.get('L'), half.cnyPeak / 2), JSON.stringify([...(migrated?.peaks ?? [])]))
+  check('…起点不变', legacyBody.since === '2026-01-01T00:00:00.000Z', legacyBody.since)
+  check('…峰价增量按补出的基线算', near(legacyBody.cnyPeak, half.cnyPeak - half.cny / 2), `${legacyBody.cnyPeak} vs ${half.cnyPeak - half.cny / 2}`)
+  check('…写回时升级成 v2', JSON.parse(fs.readFileSync(legacyFile, 'utf8')).version === 2)
+
   // ── 常量与往返 ───────────────────────────────────────
   check('路由常量', SPEND_ROUTE === '/api/clinepass.spend')
   check('writeSpend/readSpend 往返', (() => {
     const file = path.join(tempRoot, 'roundtrip.json')
-    writeSpend(file, { since: '2026-11-02T00:00:00.000Z', sessions: new Map([['x', 1.5], ['y', 0]]) })
+    writeSpend(file, { since: '2026-11-02T00:00:00.000Z', sessions: new Map([['x', 1.5], ['y', 0]]), peaks: new Map([['x', 2.5], ['y', 0]]) })
     const back = readSpend(file)
-    return back.since === '2026-11-02T00:00:00.000Z' && near(back.sessions.get('x'), 1.5) && back.sessions.get('y') === 0
+    return back.since === '2026-11-02T00:00:00.000Z' && near(back.sessions.get('x'), 1.5) && back.sessions.get('y') === 0 && near(back.peaks.get('x'), 2.5)
   })())
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

@@ -30,8 +30,10 @@
  * ## 状态文件
  *
  * `$DSH_HOME/dsh-clinepass-spend.json`：
- * `{ "version": 1, "since": <ISO>, "sessions": { "<sessionId>": <baselineCny> } }`。
- * 首次运行或重置时建立，之后只在「出现新会话」或重置时写。
+ * `{ "version": 2, "since": <ISO>, "sessions": { "<sessionId>": <baselineCny> },
+ *    "peaks": { "<sessionId>": <baselinePeakCny> } }`。
+ * 首次运行或重置时建立，之后只在「出现新会话」或重置时写。v1 文件（只有 `sessions`）
+ * 读入后按当前「峰价 / 实际价」比例补出 `peaks`，下一次写入即升级为 v2。
  *
  * @module dsh-clinepass/spend
  */
@@ -86,7 +88,16 @@ export function readSpend(file) {
     for (const [id, value] of Object.entries(source)) {
       if (typeof value === 'number' && Number.isFinite(value) && value >= 0) sessions.set(id, value)
     }
-    return { since, sessions }
+    // v2 adds a peak-price baseline per session. A v1 file has none; the caller
+    // fills them in from the current peak/actual ratio (see `snapshot`).
+    const peaks = new Map()
+    const peakSource = parsed.peaks
+    if (peakSource !== null && typeof peakSource === 'object' && !Array.isArray(peakSource)) {
+      for (const [id, value] of Object.entries(peakSource)) {
+        if (typeof value === 'number' && Number.isFinite(value) && value >= 0) peaks.set(id, value)
+      }
+    }
+    return { since, sessions, peaks }
   } catch {
     return null
   }
@@ -98,8 +109,10 @@ export function writeSpend(file, value) {
   fs.mkdirSync(dir, { recursive: true })
   const sessions = {}
   for (const [id, cny] of value.sessions) sessions[id] = round(cny)
+  const peaks = {}
+  for (const [id, cny] of value.peaks ?? []) peaks[id] = round(cny)
   const temp = `${file}.tmp-${process.pid}`
-  fs.writeFileSync(temp, JSON.stringify({ version: 1, since: value.since, sessions }, null, 2))
+  fs.writeFileSync(temp, JSON.stringify({ version: 2, since: value.since, sessions, peaks }, null, 2))
   fs.renameSync(temp, file)
 }
 
@@ -117,12 +130,13 @@ export function writeSpend(file, value) {
  */
 export async function sumCachedCosts(dir) {
   const sessions = new Map()
+  const peaks = new Map()
   let names
   try {
     names = await fs.promises.readdir(dir)
   } catch {
     // 目录读不到要能和「真的没有花费」区分：调用方把 `reachable: false` 一路带到界面上。
-    return { sessions, scanned: 0, errors: 1, skipped: 0, reachable: false }
+    return { sessions, peaks, scanned: 0, errors: 1, skipped: 0, reachable: false }
   }
   let scanned = 0
   let errors = 0
@@ -158,6 +172,9 @@ export async function sumCachedCosts(dir) {
     if (!(view.cny > 0)) return
     const id = typeof record?.identity?.id === 'string' && record.identity.id.length > 0 ? record.identity.id : name.slice(0, -5)
     sessions.set(id, (sessions.get(id) ?? 0) + view.cny)
+    // 配额口径：ClinePass always bills the peak price, so this is the money that
+    // actually counts against the monthly quota (see audit §二十七).
+    peaks.set(id, (peaks.get(id) ?? 0) + view.cnyPeak)
   }
   // 控制并发：900 个文件一次性打开会撞 fd 上限。
   const limit = 32
@@ -171,7 +188,7 @@ export async function sumCachedCosts(dir) {
       }
     }),
   )
-  return { sessions, scanned, errors, skipped, reachable: true }
+  return { sessions, peaks, scanned, errors, skipped, reachable: true }
 }
 
 /**
@@ -216,16 +233,29 @@ export function createSpendHandler(options = {}) {
         let dirty = false
         if (spend === null) {
           // 第一次运行：每个会话的当前花费都是它的基线，显示的累计从 0 开始涨。
-          spend = { since: new Date(at).toISOString(), sessions: new Map() }
-          for (const [id, cny] of scanned.sessions) spend.sessions.set(id, cny)
+          spend = { since: new Date(at).toISOString(), sessions: new Map(), peaks: new Map() }
+          for (const [id, cny] of scanned.sessions) {
+            spend.sessions.set(id, cny)
+            spend.peaks.set(id, scanned.peaks.get(id) ?? cny)
+          }
           dirty = true
         } else {
           // 新出现的会话：把「第一次被看见时」的花费记成它的基线，历史不计、也不会跳。
           for (const [id, cny] of scanned.sessions) {
             if (!spend.sessions.has(id)) {
               spend.sessions.set(id, cny)
+              spend.peaks.set(id, scanned.peaks.get(id) ?? cny)
               dirty = true
             }
+          }
+          // v1 文件没有峰价基线：按该会话「当前峰价 / 当前实际价」的比例折算一次。
+          // 比例而不是「全按峰价」，是因为旧基线里的花费本来就有峰有谷。
+          for (const [id, cny] of spend.sessions) {
+            if (spend.peaks.has(id)) continue
+            const current = scanned.sessions.get(id)
+            const currentPeak = scanned.peaks.get(id)
+            spend.peaks.set(id, current !== undefined && current > 0 && typeof currentPeak === 'number' ? cny * (currentPeak / current) : cny)
+            dirty = true
           }
         }
         if (dirty) {
@@ -236,6 +266,7 @@ export function createSpendHandler(options = {}) {
           }
         }
         let cny = 0
+        let cnyPeak = 0
         let counted = 0
         for (const [id, current] of scanned.sessions) {
           const baseline = spend.sessions.get(id) ?? current
@@ -244,10 +275,15 @@ export function createSpendHandler(options = {}) {
             cny += delta
             counted += 1
           }
+          const peakNow = scanned.peaks.get(id) ?? 0
+          const peakBaseline = spend.peaks.get(id) ?? peakNow
+          const peakDelta = peakNow - peakBaseline
+          if (peakDelta > 0) cnyPeak += peakDelta
         }
         const body = {
           ok: true,
           cny: round(cny),
+          cnyPeak: round(cnyPeak),
           since: spend.since,
           sessions: counted,
           seen: scanned.sessions.size,
@@ -273,8 +309,12 @@ export function createSpendHandler(options = {}) {
       // 重置 = 把「现在每个会话的花费」整体拍成新基线。逐会话记，旧会话以后被打开也不会倒灌。
       const scanned = await sumCachedCosts(dir)
       const sessions = new Map()
-      for (const [id, cny] of scanned.sessions) sessions.set(id, cny)
-      const next = { since: new Date(now()).toISOString(), sessions }
+      const peaks = new Map()
+      for (const [id, cny] of scanned.sessions) {
+        sessions.set(id, cny)
+        peaks.set(id, scanned.peaks.get(id) ?? cny)
+      }
+      const next = { since: new Date(now()).toISOString(), sessions, peaks }
       try {
         writeSpend(file, next)
       } catch (error) {
