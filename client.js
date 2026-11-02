@@ -137,14 +137,11 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           panelTitle: '官方价明细',
           panelSelf: '本会话',
           panelSubagents: '子代理（{count} 个）',
-          panelPeak: '峰时段 {cost}',
-          panelOff: '谷时段 {cost}',
           panelInput: '输入（未命中）',
           panelCacheRead: '缓存命中读取',
           panelCacheWrite: '缓存写入',
           panelOutput: '输出',
           panelCacheHit: '缓存命中 {percent}%',
-          panelPeakAll: '全部按高峰价',
           panelEmpty: '这个对话还没有计费请求',
         },
         en: {
@@ -194,14 +191,11 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           panelTitle: 'List-price breakdown',
           panelSelf: 'This session',
           panelSubagents: 'Subagents ({count})',
-          panelPeak: 'Peak {cost}',
-          panelOff: 'Off-peak {cost}',
           panelInput: 'Input (uncached)',
           panelCacheRead: 'Cache reads',
           panelCacheWrite: 'Cache writes',
           panelOutput: 'Output',
           panelCacheHit: 'Cache hit {percent}%',
-          panelPeakAll: 'All at peak price',
           panelEmpty: 'No billable requests in this conversation yet',
         },
       }
@@ -1486,20 +1480,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
               rows.push(groupRow(fill(t.panelSubagents, { count: costSummary.subagentCount }), money(costSummary.subagentCny), 'subs'))
             }
             rows.push(separator('sep-2'))
-            // 一次都没有的时段不写：0 次的那行只会挤占版面，不携带信息。
-            var offPeakCount = costSummary.requests - costSummary.peakRequests
-            if (costSummary.peakRequests > 0) {
-              rows.push(groupRow(fill(t.panelPeak, { cost: money(costSummary.peakCny) }), '', 'peak'))
-            }
-            if (offPeakCount > 0) {
-              rows.push(groupRow(fill(t.panelOff, { cost: money(costSummary.offCny) }), '', 'off'))
-            }
-            // 这一行是「同样的 token 若全按高峰价」的官方价，用官方人民币价目表直接算，
-            // 不做任何汇率/倍率换算。它不是 ClinePass 账单 —— 后者只在设置页那张卡里，
-            // 读网关账本的 USD。
-            rows.push(separator('sep-3'))
-            rows.push(groupRow(t.panelPeakAll, money(costSummary.cnyPeak), 'peak-all'))
-            rows.push(separator('sep-4'))
+            // 峰/谷拆分与「全部按高峰价」不再画：官方价的总额已经够了，而 ClinePass 的
+            // 美元金额只能按账号窗口取（账本的 session_id 全账号恒定，切不出单条对话）。
 
             var tokens = costSummary.tokens
             rows.push(groupRow(t.panelInput, formatCompact(tokens.uncachedInput), 't-in'))
