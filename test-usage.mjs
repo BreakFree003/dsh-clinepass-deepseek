@@ -1190,17 +1190,31 @@ console.log('\n── 8. client render ─────────────�
     delete globalThis.window.__SPEND_ANSWER__
 
     // 月额度消耗行：百分比来自 usage 读数，金额 = 百分比 × 阈值（caps 来自 /users/me/plan）。
-    globalThis.window.__ANSWER__ = { ...live, ledger: { ok: true, usd: 0.85, rows: 351, pages: 2, complete: true } }
+    globalThis.window.__ANSWER__ = { ...live, caps: { monthlyUsd: 50 }, ledger: { ok: true, usd: 0.85, rows: 351, pages: 2, complete: true } }
     globalThis.window.__SPEND_ANSWER__ = { ok: true, cny: 12.34, cnyPeak: 2.4, since: '2026-11-02T02:00:00.000Z', sessions: 7 }
     const quotaMount = mount()
     let quotaTree = await renderCard(quotaMount.seat, quotaMount.stub, cardProps('cline-pass'))
     let quotaText = textOf(quotaTree).join(' | ')
-    check('累计块显示账本金额与 /usage 的月额度百分比', quotaText.includes('ClinePass billing $0.85 · monthly quota 91%'), quotaText)
-    check('…金额不是本地推算值（$0.36）', !quotaText.includes('$0.36') || quotaText.indexOf('$0.85') < quotaText.indexOf('$0.36'), quotaText)
-    check('…两者相差过大时打交叉验证标记', quotaText.includes('⚠'), quotaText)
+    // 百分比自重置起：$0.85 / $50 = 1.70%，不是网关那个 30 天的 91%。
+    check('累计块显示账本金额与自重置起的月额度百分比', quotaText.includes('ClinePass billing $0.85 · monthly quota 1.7%'), quotaText)
+    check('…不用网关的 30 天读数当百分比', !quotaText.includes('monthly quota 91%'), quotaText)
+    check('…本地推算差得多时打交叉验证标记', quotaText.includes('⚠'), quotaText)
 
-    // 账本读不到时不画这一行（不拿本地推算顶替）。
-    globalThis.window.__ANSWER__ = { ...live, ledger: null }
+    // 刚重置完：账本金额为 0 → 百分比也从 0 起。
+    globalThis.window.__ANSWER__ = { ...live, caps: { monthlyUsd: 50 }, ledger: { ok: true, usd: 0, rows: 0, pages: 1, complete: true } }
+    const zeroQuotaMount = mount()
+    const zeroQuotaTree = await renderCard(zeroQuotaMount.seat, zeroQuotaMount.stub, cardProps('cline-pass'))
+    const zeroQuotaText = textOf(zeroQuotaTree).join(' | ')
+    check('重置后从 0 开始：$0.00 · 0%', zeroQuotaText.includes('ClinePass billing $0.00 · monthly quota 0%'), zeroQuotaText)
+
+    // 月额度上限读不到时只显示金额；账本读不到时整行缺席（不拿本地推算顶替）。
+    globalThis.window.__ANSWER__ = { ...live, caps: null, ledger: { ok: true, usd: 0.85, rows: 351, pages: 2, complete: true } }
+    const noCapMount = mount()
+    const noCapTree = await renderCard(noCapMount.seat, noCapMount.stub, cardProps('cline-pass'))
+    const noCapText = textOf(noCapTree).join(' | ')
+    check('没有上限时只显示金额', noCapText.includes('ClinePass billing $0.85') && !noCapText.includes('monthly quota'), noCapText)
+
+    globalThis.window.__ANSWER__ = { ...live, caps: { monthlyUsd: 50 }, ledger: null }
     const pctMount = mount()
     const pctTree = await renderCard(pctMount.seat, pctMount.stub, cardProps('cline-pass'))
     const pctText = textOf(pctTree).join(' | ')

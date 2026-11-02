@@ -126,7 +126,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendUnreachable: '读不到本地投影缓存，累计暂时不可用',
           spendQuota: 'ClinePass 计费 {usd} · 月额度 {pct}%',
           spendQuotaOnlyUsd: 'ClinePass 计费 {usd}',
-          spendQuotaHint: '金额 = 网关账本 costUsd 合计（自重置起）；百分比 = /usage-limits 的 monthly.percentUsed（当前 30 天窗口）。两个数各来自一个 API，不做相互推算',
+          spendQuotaHint: '自重置起：金额 = 网关账本 costUsd 合计；百分比 = 金额 ÷ 月额度 {cap}。网关当前的 30 天读数是 {window}（窗口不同，只作对照）',
           spendQuotaMismatch: '本地按 token 价表推算 {local}，与账本 {ledger} 相差 {diff}%（有请求没被本地投影计入）',
           // ── 成本（官方峰谷价）──
           costTitle: 'DeepSeek 官方价（按每次请求发生的时刻判峰谷）',
@@ -183,7 +183,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendUnreachable: 'The local projection cache is unreadable; the total is unavailable',
           spendQuota: 'ClinePass billing {usd} · monthly quota {pct}%',
           spendQuotaOnlyUsd: 'ClinePass billing {usd}',
-          spendQuotaHint: 'Amount = sum of the gateway ledger costUsd (since the reset); percentage = monthly.percentUsed from /usage-limits (current 30-day window). Each number comes from its own API, neither is derived from the other',
+          spendQuotaHint: 'Since the reset: amount = sum of the gateway ledger costUsd; percentage = that amount over the {cap} monthly quota. The gateway\u2019s current 30-day reading is {window} (a different window, for comparison only)',
           spendQuotaMismatch: 'The local token-price estimate is {local} vs {ledger} in the ledger ({diff}% apart — some requests are missing from the local projection)',
           // ── cost (official peak/off-peak price) ──
           costTitle: 'DeepSeek list price (peak/off-peak by the time of each request)',
@@ -821,14 +821,22 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                 // 本地按 token 价表算的那份只用来交叉验证，差超过 5% 才在 tooltip 里点破。
                 var ledger = body !== null && body.ok === true && body.ledger !== null && typeof body.ledger === 'object' && body.ledger.ok === true ? body.ledger : null
                 var ledgerUsd = ledger !== null && typeof ledger.usd === 'number' && isFinite(ledger.usd) ? ledger.usd : null
-                var monthlyPct = byType.monthly !== undefined && typeof byType.monthly.percentUsed === 'number' && isFinite(byType.monthly.percentUsed) ? byType.monthly.percentUsed : null
+                var caps = body !== null && body.ok === true && body.caps !== null && typeof body.caps === 'object' ? body.caps : null
+                var capUsd = caps !== null && typeof caps.monthlyUsd === 'number' && isFinite(caps.monthlyUsd) && caps.monthlyUsd > 0 ? caps.monthlyUsd : null
+                // 网关的 30 天读数只作对照：这张卡的对象是「自重置起」，两者窗口不同。
+                var gatewayPct = byType.monthly !== undefined && typeof byType.monthly.percentUsed === 'number' && isFinite(byType.monthly.percentUsed) ? byType.monthly.percentUsed : null
                 var localPeakCny = typeof spend.cnyPeak === 'number' && isFinite(spend.cnyPeak) && spend.cnyPeak > 0 ? spend.cnyPeak : null
                 var quotaText = null
                 var quotaHint = t.spendQuotaHint
                 if (ledgerUsd !== null) {
-                  quotaText = monthlyPct === null
+                  var sincePct = capUsd === null ? null : (ledgerUsd / capUsd) * 100
+                  quotaText = sincePct === null
                     ? fill(t.spendQuotaOnlyUsd, { usd: formatUsd(ledgerUsd) })
-                    : fill(t.spendQuota, { usd: formatUsd(ledgerUsd), pct: formatPct(monthlyPct) })
+                    : fill(t.spendQuota, { usd: formatUsd(ledgerUsd), pct: formatPct(sincePct) })
+                  quotaHint = fill(t.spendQuotaHint, {
+                    cap: capUsd === null ? '--' : formatUsd(capUsd),
+                    window: gatewayPct === null ? '--' : formatPct(gatewayPct) + '%',
+                  })
                   // 交叉验证：峰价表两列同比例（¥2 ↔ $0.3），所以本地那份 ×0.15 就是美元。
                   var localUsd = localPeakCny === null ? null : localPeakCny * 0.15
                   if (localUsd !== null && ledgerUsd > 0) {
