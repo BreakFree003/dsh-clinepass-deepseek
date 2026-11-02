@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.18.9
+
+**Review 收尾：账本部分和不再冒充精确值，路径编码，文档与注释对齐现行口径。**
+
+- 账本翻到页数上限（12×200 行）仍未到重置起点时，金额写成 `≥$0.85`，tooltip 说明这是部分和；
+  之前这种情况会把部分和当精确值显示。
+- `ledgerPath` 对 `userId` 做 `encodeURIComponent`。
+- tooltip 不再写死 `$0.50`（额度改价时那句话会过期），改成「1% = 月额度的 1/100」。
+- `formatPct` 注释与实现对齐（整数不带小数）；`PLAN_PATH` / `readPlan` 注释不再声称用 caps 算金额。
+- 重置后的 `load(true)` 加了函数存在性守卫（`load` 在 `resetSpend` 之后定义，靠 var 提升才可见）。
+
 ## 0.18.8
 
 **修 0.18.7 的基线污染：测试用 mock 网关把假的 `monthlyPercent` 写进了真实基线文件。**

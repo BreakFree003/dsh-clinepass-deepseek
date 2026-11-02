@@ -126,8 +126,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendUnreachable: '读不到本地投影缓存，累计暂时不可用',
           spendQuota: 'ClinePass 计费 {usd} · 月额度 {pct}%',
           spendQuotaOnlyUsd: 'ClinePass 计费 {usd}',
-          spendQuotaHint: '金额 = 网关账本 costUsd 合计（自重置起）；百分比 = /usage-limits 的 monthly.percentUsed 当前 {current}% − 重置时 {baseline}%。网关按整数百分比返回（1% ≈ $0.50），所以这一行按 1% 步进',
+          spendQuotaHint: '金额 = 网关账本 costUsd 合计（自重置起）；百分比 = /usage-limits 的 monthly.percentUsed 当前 {current}% − 重置时 {baseline}%。网关按整数百分比返回（1% = 月额度的 1/100），所以这一行按 1% 步进',
           spendQuotaMismatch: '本地按 token 价表推算 {local}，与账本 {ledger} 相差 {diff}%（有请求没被本地投影计入）',
+          spendQuotaPartial: '账本翻到页数上限仍未到重置起点，显示的金额是部分和（≥）',
           // ── 成本（官方峰谷价）──
           costTitle: 'DeepSeek 官方价（按每次请求发生的时刻判峰谷）',
           costActual: '实际 {cost}',
@@ -183,8 +184,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendUnreachable: 'The local projection cache is unreadable; the total is unavailable',
           spendQuota: 'ClinePass billing {usd} · monthly quota {pct}%',
           spendQuotaOnlyUsd: 'ClinePass billing {usd}',
-          spendQuotaHint: 'Amount = sum of the gateway ledger costUsd (since the reset); percentage = monthly.percentUsed now ({current}%) minus the value recorded at reset ({baseline}%). The gateway reports whole percentages (1% ≈ $0.50), so this line steps by 1%',
+          spendQuotaHint: 'Amount = sum of the gateway ledger costUsd (since the reset); percentage = monthly.percentUsed now ({current}%) minus the value recorded at reset ({baseline}%). The gateway reports whole percentages (1% = one hundredth of the monthly quota), so this line steps by 1%',
           spendQuotaMismatch: 'The local token-price estimate is {local} vs {ledger} in the ledger ({diff}% apart — some requests are missing from the local projection)',
+          spendQuotaPartial: 'The ledger hit the page cap before reaching the reset point, so the amount shown is a partial sum (≥)',
           // ── cost (official peak/off-peak price) ──
           costTitle: 'DeepSeek list price (peak/off-peak by the time of each request)',
           costActual: 'actual {cost}',
@@ -592,7 +594,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
               if (body !== null && typeof body === 'object' && body.ok === true) {
                 setSpendState({ status: 'ready', body: body })
                 // 重置挪动了账本的起点：usage 缓存里那份 ledger 是旧窗口，强制重读一次。
-                load(true)
+                if (typeof load === 'function') load(true)
               }
               // 写失败（500）要把话说出来：之前这里静默吞掉，用户点了两次「确认」什么都没发生。
               else setSpendState(function (previous) {
@@ -822,7 +824,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                 var amountText = formatCny(amount) ?? '¥0.00'
                 // 两个数各取各的 API，不互相推算：
                 //   金额 —— 网关账本 costUsd 合计（`/users/<uid>/usages`，按重置起点截断）；
-                //   百分比 —— `/usage-limits` 的 monthly.percentUsed。
+                //   百分比 —— `/usage-limits` 的 monthly.percentUsed 当前值减重置基线。
                 // 本地按 token 价表算的那份只用来交叉验证，差超过 5% 才在 tooltip 里点破。
                 var ledger = body !== null && body.ok === true && body.ledger !== null && typeof body.ledger === 'object' && body.ledger.ok === true ? body.ledger : null
                 var ledgerUsd = ledger !== null && typeof ledger.usd === 'number' && isFinite(ledger.usd) ? ledger.usd : null
@@ -837,9 +839,18 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                 var quotaText = null
                 var quotaHint = t.spendQuotaHint
                 if (ledgerUsd !== null) {
-                  quotaText = quotaPct === null
-                    ? fill(t.spendQuotaOnlyUsd, { usd: formatUsd(ledgerUsd) })
-                    : fill(t.spendQuota, { usd: formatUsd(ledgerUsd), pct: formatPct(quotaPct) })
+                  // 账本没翻到重置起点时（页数上限）金额只是部分和：写 ≥，别当成精确值。
+                  var usdText = formatUsd(ledgerUsd)
+                  if (ledger.complete !== true) {
+                    quotaText = quotaPct === null
+                      ? fill(t.spendQuotaOnlyUsd, { usd: '≥' + usdText })
+                      : fill(t.spendQuota, { usd: '≥' + usdText, pct: formatPct(quotaPct) })
+                    quotaHint = t.spendQuotaPartial
+                  } else {
+                    quotaText = quotaPct === null
+                      ? fill(t.spendQuotaOnlyUsd, { usd: usdText })
+                      : fill(t.spendQuota, { usd: usdText, pct: formatPct(quotaPct) })
+                  }
                   quotaHint = fill(t.spendQuotaHint, {
                     current: quotaSince !== null && typeof quotaSince.current === 'number' ? formatPct(quotaSince.current) : '--',
                     baseline: quotaSince !== null && typeof quotaSince.baseline === 'number' ? formatPct(quotaSince.baseline) : '--',
@@ -1019,10 +1030,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
       }
 
       /**
-       * 百分比：<1% 两位、<10% 一位、其余整数 —— 与金额同一套「别把有效位抹掉」的原则。
+       * 百分比：<1% 两位、整数值不带小数、其余一位 —— 不把 2% 画成 2.0%，也不把 0.72% 抹成 0.7%。
        *
        * @param value - 0…100 的百分数。
-       * @returns `0.72` / `7.1` / `12`。
+       * @returns `0.72` / `2` / `1.7`。
        */
       function formatPct(value) {
         if (!(value > 0)) return '0'

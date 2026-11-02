@@ -1218,6 +1218,13 @@ console.log('\n── 8. client render ─────────────�
     check('累计块显示账本金额与相减得到的月额度百分比', quotaText.includes('ClinePass billing $0.85 · monthly quota 2%'), quotaText)
     check('…本地推算差得多时打交叉验证标记', quotaText.includes('⚠'), quotaText)
 
+    // 账本翻到页数上限仍未到起点：金额标 ≥，别把部分和当精确值。
+    globalThis.window.__ANSWER__ = { ...live, ledger: { ok: true, usd: 0.85, rows: 2400, pages: 12, complete: false }, quotaSince: { pct: 2, baseline: 87, current: 89 } }
+    const partialMount = mount()
+    const partialTree = await renderCard(partialMount.seat, partialMount.stub, cardProps('cline-pass'))
+    const partialText = textOf(partialTree).join(' | ')
+    check('账本未翻到起点时金额标 ≥', partialText.includes('ClinePass billing ≥$0.85 · monthly quota 2%'), partialText)
+
     // 刚重置完：账本 0、百分比 0。
     globalThis.window.__ANSWER__ = { ...live, ledger: { ok: true, usd: 0, rows: 0, pages: 1, complete: true }, quotaSince: { pct: 0, baseline: 87, current: 87 } }
     const zeroQuotaMount = mount()

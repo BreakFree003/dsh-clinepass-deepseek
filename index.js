@@ -134,8 +134,10 @@ export const USAGE_PATH = '/api/v1/users/me/plan/usage-limits'
  * The plan endpoint, as a path below `upstream`.
  *
  * `entitlements.cline_pass.inferenceCapThreshold` carries the three window caps
- * in **1e-8 USD units** (`last30daysUsageCostUSDPerUser: 5e9` = $50). The spend
- * card turns the gateway's `monthly.percentUsed` into an amount with it.
+ * in **1e-8 USD units** (`last30daysUsageCostUSDPerUser: 5e9` = $50), and
+ * `data.userId` is what the ledger path needs. The caps travel to the card for
+ * display context; the quota percentage itself is `current - baseline`, not a
+ * division by a cap.
  *
  * Read best-effort and separately from the limits: the percentages are the
  * primary datum, and a plan outage must not take them down with it.
@@ -153,7 +155,7 @@ export const PLAN_PATH = '/api/v1/users/me/plan'
  * Paging is by `cursor=<data.nextToken>` (2026-11-02: `nextToken` / `pageToken`
  * are ignored by the endpoint, `cursor` works). `limit` is capped at 200.
  */
-export const ledgerPath = (userId) => `/api/v1/users/${userId}/usages`
+export const ledgerPath = (userId) => `/api/v1/users/${encodeURIComponent(userId)}/usages`
 
 /** Rows per ledger page (the endpoint's cap). */
 export const LEDGER_PAGE_SIZE = 200
@@ -624,7 +626,7 @@ export async function fetchUsage(cfg, apiKey, options = {}) {
   const plan = await readPlan(cfg, apiKey, fetchImpl, signal)
   const caps = plan?.caps ?? null
   const sinceMs = options.ledgerSinceMs
-  const ledger = plan?.userId !== null && plan?.userId !== undefined && Number.isFinite(sinceMs)
+  const ledger = typeof plan?.userId === 'string' && Number.isFinite(sinceMs)
     ? await fetchLedgerUsd(cfg, apiKey, plan.userId, sinceMs, { fetch: fetchImpl, signal })
     : null
   return { ok: true, limits: normalized.limits, caps, ledger }
