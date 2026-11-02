@@ -1216,7 +1216,7 @@ console.log('\n── 8. client render ─────────────�
     let quotaText = textOf(quotaTree).join(' | ')
     // 百分比 = 当前 89% − 重置时 87% = 2，取自 usage-limits 的两个读数，不做金额除法。
     check('累计块显示账本金额与相减得到的月额度百分比', quotaText.includes('ClinePass billing $0.85 · monthly quota 2%'), quotaText)
-    check('…本地推算差得多时打交叉验证标记', quotaText.includes('⚠'), quotaText)
+    check('…不再拿本地 token 推算做对比（别名处用这个 key 的其它客户端也算进账本）', !quotaText.includes('⚠'), quotaText)
 
     // 账本翻到页数上限仍未到起点：金额标 ≥，别把部分和当精确值。
     globalThis.window.__ANSWER__ = { ...live, ledger: { ok: true, usd: 0.85, rows: 2400, pages: 12, complete: false }, quotaSince: { pct: 2, baseline: 87, current: 89 } }

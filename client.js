@@ -127,7 +127,6 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendQuota: 'ClinePass 计费 {usd} · 月额度 {pct}%',
           spendQuotaOnlyUsd: 'ClinePass 计费 {usd}',
           spendQuotaHint: '金额 = 网关账本 costUsd 合计（自重置起）；百分比 = /usage-limits 的 monthly.percentUsed 当前 {current}% − 重置时 {baseline}%。网关按整数百分比返回（1% = 月额度的 1/100），所以这一行按 1% 步进',
-          spendQuotaMismatch: '本地按 token 价表推算 {local}，与账本 {ledger} 相差 {diff}%（有请求没被本地投影计入）',
           spendQuotaPartial: '账本翻到页数上限仍未到重置起点，显示的金额是部分和（≥）',
           // ── 成本（官方峰谷价）──
           costTitle: 'DeepSeek 官方价（按每次请求发生的时刻判峰谷）',
@@ -185,7 +184,6 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendQuota: 'ClinePass billing {usd} · monthly quota {pct}%',
           spendQuotaOnlyUsd: 'ClinePass billing {usd}',
           spendQuotaHint: 'Amount = sum of the gateway ledger costUsd (since the reset); percentage = monthly.percentUsed now ({current}%) minus the value recorded at reset ({baseline}%). The gateway reports whole percentages (1% = one hundredth of the monthly quota), so this line steps by 1%',
-          spendQuotaMismatch: 'The local token-price estimate is {local} vs {ledger} in the ledger ({diff}% apart — some requests are missing from the local projection)',
           spendQuotaPartial: 'The ledger hit the page cap before reaching the reset point, so the amount shown is a partial sum (≥)',
           // ── cost (official peak/off-peak price) ──
           costTitle: 'DeepSeek list price (peak/off-peak by the time of each request)',
@@ -835,7 +833,6 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                 if (byType.monthly !== undefined && typeof byType.monthly.percentUsed === 'number' && isFinite(byType.monthly.percentUsed)) {
                   monthlyPctRef.current = byType.monthly.percentUsed
                 }
-                var localPeakCny = typeof spend.cnyPeak === 'number' && isFinite(spend.cnyPeak) && spend.cnyPeak > 0 ? spend.cnyPeak : null
                 var quotaText = null
                 var quotaHint = t.spendQuotaHint
                 if (ledgerUsd !== null) {
@@ -855,19 +852,6 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                     current: quotaSince !== null && typeof quotaSince.current === 'number' ? formatPct(quotaSince.current) : '--',
                     baseline: quotaSince !== null && typeof quotaSince.baseline === 'number' ? formatPct(quotaSince.baseline) : '--',
                   })
-                  // 交叉验证：峰价表两列同比例（¥2 ↔ $0.3），所以本地那份 ×0.15 就是美元。
-                  var localUsd = localPeakCny === null ? null : localPeakCny * 0.15
-                  if (localUsd !== null && ledgerUsd > 0) {
-                    var gap = Math.abs(localUsd - ledgerUsd) / ledgerUsd
-                    if (gap > 0.05) {
-                      quotaText += ' ⚠'
-                      quotaHint += ' ' + fill(t.spendQuotaMismatch, {
-                        local: formatUsd(localUsd),
-                        ledger: formatUsd(ledgerUsd),
-                        diff: String(Math.round(gap * 100)),
-                      })
-                    }
-                  }
                 }
                 return React.createElement(
                   'div',
