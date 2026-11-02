@@ -144,7 +144,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           panelCacheWrite: '缓存写入',
           panelOutput: '输出',
           panelCacheHit: '缓存命中 {percent}%',
-          panelClinepass: 'ClinePass 计费',
+          panelPeakAll: '全部按高峰价',
           panelEmpty: '这个对话还没有计费请求',
         },
         en: {
@@ -201,7 +201,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           panelCacheWrite: 'Cache writes',
           panelOutput: 'Output',
           panelCacheHit: 'Cache hit {percent}%',
-          panelClinepass: 'ClinePass billing',
+          panelPeakAll: 'All at peak price',
           panelEmpty: 'No billable requests in this conversation yet',
         },
       }
@@ -1494,12 +1494,11 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
             if (offPeakCount > 0) {
               rows.push(groupRow(fill(t.panelOff, { cost: money(costSummary.offCny) }), '', 'off'))
             }
-            // ClinePass 的额度记账恒按高峰价（与请求时刻无关），所以它等于「全部 token
-            // 按峰价」；低峰期它比官方实付价高，这正是两个数字要并排的原因。
-            // 币种：ClinePass 口径一律美元（账本的 costUsd 就是美元），官方价一律人民币。
-            // 峰价表两列同比例（¥2 ↔ $0.3、¥0.04 ↔ $0.006、¥8 ↔ $1.2），所以 ×0.15 是美元。
+            // 这一行是「同样的 token 若全按高峰价」的官方价，用官方人民币价目表直接算，
+            // 不做任何汇率/倍率换算。它不是 ClinePass 账单 —— 后者只在设置页那张卡里，
+            // 读网关账本的 USD。
             rows.push(separator('sep-3'))
-            rows.push(groupRow(t.panelClinepass, formatUsd(costSummary.cnyPeak * 0.15), 'clinepass'))
+            rows.push(groupRow(t.panelPeakAll, money(costSummary.cnyPeak), 'peak-all'))
             rows.push(separator('sep-4'))
 
             var tokens = costSummary.tokens
