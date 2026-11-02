@@ -1355,7 +1355,7 @@ console.log('\n── 8. client render ─────────────�
     check('面板有 token 四桶', panelText.includes('3.00M') && panelText.includes('4.0k') && panelText.includes('10.0k'), panelText)
     check('面板不再显示请求数', !panelText.includes('Requests'), panelText)
     check('面板缓存命中率两位小数', panelText.includes('Cache hit 99.87%'), panelText)
-    check('面板不再显示「全部按高峰价」', !panelText.includes('All at peak price') && !panelText.includes('¥0.208') && !panelText.includes('$0.03'), panelText)
+    check('面板有 ClinePass 计价（全部按高峰价的人民币数）', panelText.includes('ClinePass price') && panelText.includes('¥0.208') && !panelText.includes('$0.03') && !panelText.includes('2x'), panelText)
     check('面板不再显示峰谷规则/价表说明', !panelText.includes('Peak: Mon') && !panelText.includes('2026-11-02'), panelText)
     costDock.children[0].props.onClick()
     costDock = await renderChecked(costMount.dockSeat, costMount.stub, costProps(), 'closing the panel')

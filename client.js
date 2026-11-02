@@ -136,6 +136,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           // ── 展开后的明细面板 ──
           panelTitle: '官方价明细',
           panelSelf: '本会话',
+          panelClinepass: 'ClinePass 计价',
           panelSubagents: '子代理（{count} 个）',
           panelInput: '输入（未命中）',
           panelCacheRead: '缓存命中读取',
@@ -190,6 +191,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           // ── expanded breakdown panel ──
           panelTitle: 'List-price breakdown',
           panelSelf: 'This session',
+          panelClinepass: 'ClinePass price',
           panelSubagents: 'Subagents ({count})',
           panelInput: 'Input (uncached)',
           panelCacheRead: 'Cache reads',
@@ -1480,8 +1482,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
               rows.push(groupRow(fill(t.panelSubagents, { count: costSummary.subagentCount }), money(costSummary.subagentCny), 'subs'))
             }
             rows.push(separator('sep-2'))
-            // 峰/谷拆分与「全部按高峰价」不再画：官方价的总额已经够了，而 ClinePass 的
-            // 美元金额只能按账号窗口取（账本的 session_id 全账号恒定，切不出单条对话）。
+            // ClinePass 的计价 = 同一批 token 全部按高峰价（官方人民币价目表直接算，不换算）。
+            // 峰/谷拆分不画；这条行不是网关账本金额（那个只按账号窗口取）。
+            rows.push(groupRow(t.panelClinepass, money(costSummary.cnyPeak), 'clinepass'))
+            rows.push(separator('sep-3'))
 
             var tokens = costSummary.tokens
             rows.push(groupRow(t.panelInput, formatCompact(tokens.uncachedInput), 't-in'))
