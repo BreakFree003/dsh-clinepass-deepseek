@@ -27,7 +27,7 @@ Provider 观察与用量报告搬进 pi；两边按发布版本互相同步，�
 
 ```bash
 dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseek
-# 钉某个 tag：同上，末尾加 #v0.18.15
+# 钉某个 tag：同上，末尾加 #v0.18.16
 ```
 
 包自己声明了 `dsh.bundle.patch`，所以 `dsh plugin`（pnpm 的转发器）装上它之后会把这个包追加到
@@ -134,8 +134,8 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
 
 和 Provider 胶囊同一行，显示这条对话**按官方价实际值多少钱**：`Provider: deepseek · ¥0.021`。
 
-- **只算 DeepSeek 官方价**，不看 ClinePass 额度那边的口径。额度记账恒按高峰价（低峰期两者正好
-  差 2 倍），所以这里的数字与「设置 → 模型」用量卡对不上是**预期行为**。
+- **只算 DeepSeek 官方价**：胶囊和面板的大数字都是官方人民币价。ClinePass 的额度口径是另一套数
+  （恒按高峰价，只出现在设置页累计卡的第二行），两边不互相换算。
 - **峰谷按每条请求发生的时刻判**：北京时间（UTC+8）周一至周五 09:00–12:00、14:00–18:00
   为高峰，其余（含整个周末）为半价。**只看星期几与钟点，不查日历**：法定节假日不做例外，
   落在窗口里的节假日就是峰价（既定口径）。判峰谷不用宿主/浏览器时区 ——
@@ -148,9 +148,9 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
 - **位数**：< ¥0.01 显示 4 位、< ¥1 显示 3 位、其余 2 位。一轮常常只有几分钱，固定两位会全变成
   `¥0.00`。
 - 悬停可看：合计、子代理会话数（价表版本只保留在 wire 视图里，不渲染）。
-- **点胶囊展开明细**（再点一次 / 点外面 / Esc 收起）：官方价合计、本会话与子代理分组
-  （子代理只给一个合计行，不逐个列会话）、**ClinePass 计价**、token 四桶（输入未命中 /
-  缓存命中读取 / 缓存写入 / 输出）与缓存命中率
+- **点胶囊展开明细**（再点一次 / 点外面 / Esc 收起）：标题「官方价」，合计、本会话与子代理分组
+  （**没有子代理时只有合计，不写「本会话」行**；子代理只给一个合计行，不逐个列会话）、
+  **ClinePass 计价**、token 四桶（输入未命中 / 缓存命中读取 / 缓存写入 / 输出）与缓存命中率
   （两位小数：99.87% 和 99% 对「缓存有没有真的命中」是两种结论）。
   面板用 portal 挂在 body 上（dock 的祖先链随时可能出现 overflow/transform，绝对定位会被裁掉）。
 - **面板里的「ClinePass 计价」**：同一批 token 全部按高峰价的官方人民币价（`cnyPeak`），
@@ -177,7 +177,7 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
   `Provider: …`，其它功能不受影响。
 
 实测（2026-11-02，本机一条 66 次请求、全在低峰的会话）：实际 **¥0.387132**，若全按高峰价
-**¥0.774264** —— 正好 2 倍，这就是「官方价」与「额度记账」的差。
+**¥0.774264** —— 全部落在低峰时，官方实际价正好是全峰价的一半。
 
 ## 用量卡
 
@@ -204,11 +204,17 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
   全局数字 —— 否则每打开一个旧会话，它整段历史都会汇进来，数字会跳、「自 X 起」也就不成立。
   每个会话第一次被扫到时，把它当时的花费记成它的基线，之后只计它涨出来的部分；升级前的旧会话
   因此贡献 0，不会被倒灌。
-- **起点**：第一次读到时建立基线（显示从 0 开始涨），时间写进 `$DSH_HOME/dsh-clinepass-spend.json`。
-  卡片上那行「自 … 起」就是这次基线的时间。
+- **起点**：第一次读到时建立基线（显示从 0 开始涨），时间写进 `$DSH_HOME/dsh-clinepass-spend.json`；
+  同一文件里的 `quota.monthlyPercent` 是月额度的基线。卡片上那行「自 … 起」就是这次基线的时间。
 - **重置**：按钮是两段式（先变「确认重置？」，4 秒内再点一次才生效），把当前总数记成新基线、
   起点改成现在，显示立即归零。误点不会丢数据。
-- **口径**：DeepSeek 官方峰谷价，**不含** ClinePass 额度口径；与上面三个额度条不是一个数。
+- **大数字的口径**：DeepSeek 官方峰谷价（人民币），与上面三个额度条不是一个数。
+- **第二行 `ClinePass 计费 $X · 月额度 Y%`**（两个数各来自一个 API，互不推算）：
+  - `$X` 读网关账本 `GET /users/<uid>/usages` 的 `costUsd` 合计，按重置起点截断；翻页用
+    `cursor=<nextToken>`，每页 200 行、上限 12 页，到不了起点时金额标 `≥`。
+  - `Y%` = `/usage-limits` 当前的 `monthly.percentUsed` − 重置时记录的基线；网关只给整数百分比，
+    所以这一行按 1% 步进（$50 额度上约等于每 $0.50 跳一格）。
+  - 重置按钮同时更新两套基线：官方价的 `since` 与月额度的 `quota.monthlyPercent`。
 - 缓存 30 秒；单个缓存文件读坏只计入 `errors`，不影响总数。缓存目录整个读不到时接口带
   `reachable: false`，卡片上会写明「读不到本地投影缓存」，与「真的没有花费」区分开。
 
@@ -435,7 +441,7 @@ persona 模板里的 `{{model}}` 换成裸 id：上下文里读作
 ## 验证
 
 ```bash
-npm test          # test-package → test-fetch → test-settings → test-usage → test-install，都不需要外网
+npm test          # test-package → test-fetch → test-settings → test-usage → test-spend → test-cost → test-install，都不需要外网
 node checks/dsh-clinepass-buffering-repro.mjs
 node checks/dsh-clinepass-streaming-gate-check.mjs
 node smoke-test.mjs [--negative]     # 活体：检查状态文件 + 真实网关往返
