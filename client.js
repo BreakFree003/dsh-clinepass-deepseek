@@ -1496,8 +1496,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
             }
             // ClinePass 的额度记账恒按高峰价（与请求时刻无关），所以它等于「全部 token
             // 按峰价」；低峰期它比官方实付价高，这正是两个数字要并排的原因。
+            // 币种：ClinePass 口径一律美元（账本的 costUsd 就是美元），官方价一律人民币。
+            // 峰价表两列同比例（¥2 ↔ $0.3、¥0.04 ↔ $0.006、¥8 ↔ $1.2），所以 ×0.15 是美元。
             rows.push(separator('sep-3'))
-            rows.push(groupRow(t.panelClinepass, money(costSummary.cnyPeak), 'clinepass'))
+            rows.push(groupRow(t.panelClinepass, formatUsd(costSummary.cnyPeak * 0.15), 'clinepass'))
             rows.push(separator('sep-4'))
 
             var tokens = costSummary.tokens
