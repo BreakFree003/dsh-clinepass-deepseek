@@ -667,10 +667,12 @@ export function createUsageHandler(routeCtx, cfg, logger = console, options = {}
       return { ok: false, reason: 'no-key', message: `no key is stored for ${cfg.apiKeyEnv}; enter it on Settings → Models` }
     }
     // The card's window starts at the spend baseline; the ledger sum is scoped by
-    // it, so the two numbers on the card answer the same question.
+    // it, so the two numbers on the card answer the same question. The path is
+    // injectable so a test never writes into the real `$DSH_HOME`.
+    const baselineFile = options.spendFile ?? spendFileFor()
     let ledgerSinceMs
     try {
-      const spend = readSpend(spendFileFor())
+      const spend = readSpend(baselineFile)
       if (spend !== null) ledgerSinceMs = Date.parse(spend.since)
     } catch {
       /* no baseline yet: the card shows the local total only */
@@ -682,11 +684,10 @@ export function createUsageHandler(routeCtx, cfg, logger = console, options = {}
     const monthly = result.limits.find((row) => row.type === 'monthly') ?? null
     let baseline = null
     try {
-      const file = spendFileFor()
-      const spend = readSpend(file)
+      const spend = readSpend(baselineFile)
       baseline = spend?.quota?.monthlyPercent ?? null
       if (baseline === null && spend !== null && monthly !== null && typeof monthly.percentUsed === 'number') {
-        baseline = captureQuotaBaseline(file, monthly.percentUsed)?.monthlyPercent ?? null
+        baseline = captureQuotaBaseline(baselineFile, monthly.percentUsed)?.monthlyPercent ?? null
       }
     } catch {
       /* 没有基线就只显示金额 */

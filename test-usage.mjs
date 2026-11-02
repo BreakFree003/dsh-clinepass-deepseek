@@ -18,6 +18,19 @@ import path from 'node:path'
 import { createUsageHandler, fetchLedgerUsd, fetchUsage, installUsageRoute, LEDGER_MAX_PAGES, ledgerPath, normalizeCaps, normalizeUsage, PLAN_PATH, USAGE_BOOT_GLOBAL, USAGE_PATH, USAGE_ROUTE, USAGE_WINDOWS, withDefaults } from './index.js'
 import { applyCostEvent, costViewOf, initCostState } from './cost.js'
 
+// The usage handler reads the spend baseline from `$DSH_HOME` and lazily writes a
+// quota baseline into it. Keep every test on a throwaway home: a mock gateway
+// once wrote a fake percentage into the real `~/.dsh/dsh-clinepass-spend.json`.
+const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'clinepass-usage-dshhome-'))
+process.env.DSH_HOME = TEST_HOME
+process.on('exit', () => {
+  try {
+    fs.rmSync(TEST_HOME, { recursive: true, force: true })
+  } catch {
+    /* best effort */
+  }
+})
+
 const failures = []
 const check = (label, ok, detail) => {
   console.log(`${ok ? '  ok  ' : ' FAIL '} ${label}${detail === undefined ? '' : ` — ${detail}`}`)

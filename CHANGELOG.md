@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.18.8
+
+**修 0.18.7 的基线污染：测试用 mock 网关把假的 `monthlyPercent` 写进了真实基线文件。**
+
+- 0.18.7 的 usage 处理器会读 `$DSH_HOME/dsh-clinepass-spend.json` 并在缺基线时写入当前
+  `monthly.percentUsed`。`test-usage.mjs` 的处理器用例没有隔离 `DSH_HOME`，mock 网关返回的
+  91% 被写进了真实文件 —— 于是卡上基线变成 91，而线上读数是 87，百分比被夹成 0 且要等很久才动。
+- 修法：`createUsageHandler` 接受 `options.spendFile`（测试注入临时文件）；`test-usage.mjs`
+  整体把 `DSH_HOME` 指向临时目录，退出时清理。仓库里那份真实基线已手工删掉被污染的 `quota`，
+  下一次读取会以当时的读数重新记基线。
+- 行为不变：百分比仍是「当前读数 − 基线」。
+
 ## 0.18.7
 
 **月额度百分比改成「当前读数 − 重置时读数」，不再拿金额去除上限。**
