@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.18.3
+
+**设置页「官方定价累计」下面补上本月额度消耗（金额 + 百分比）。**
+
+- 新增一行：`月额度 ≈$43.00 / $50（86%）`。百分比来自网关 `usage-limits` 的 `monthly.percentUsed`，
+  金额 = 百分比 × 阈值；阈值来自 `/users/me/plan` 的 `entitlements.cline_pass.inferenceCapThreshold.last30days…`
+  （1e-8 USD 单位，`5e9` = $50），所以不会把 $50 写死在浏览器里。
+- `caps` 是**尽力而为**：`/users/me/plan` 读失败时 usage 路由照常返回，只是 `caps: null`，
+  卡片退化成 `月额度已用 86%`，不编造金额。
+- 金额按美元显示（额度本身以美元定义），不折人民币 —— 累计那行是人民币，因为那是按价表折算的等值；
+  额度消耗折成 ¥ 会暗示一笔并不存在的扣款。
+- 宿主侧：`index.js` 新增 `PLAN_PATH` / `normalizeCaps` / `readCaps`；`fetchUsage` 成功后再读一次 plan，
+  失败不影响 limits。测试补了 caps 解析、plan 失败降级、以及渲染两态（有/无 caps）。
+
 ## 0.18.2
 
 **设置页累计卡的金额格式与胶囊/面板统一。**

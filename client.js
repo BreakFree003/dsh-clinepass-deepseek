@@ -124,6 +124,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendConfirm: '确认重置？',
           spendHint: '按 DeepSeek 官方峰谷价累计；旧会话的历史不计入',
           spendUnreachable: '读不到本地投影缓存，累计暂时不可用',
+          spendQuota: '月额度 {used} / {cap}（{pct}%）',
+          spendQuotaPct: '月额度已用 {pct}%',
+          spendQuotaHint: '网关的 30 天窗口百分比 × 额度阈值（≈ 表示由整数百分比折算）',
           // ── 成本（官方峰谷价）──
           costTitle: 'DeepSeek 官方价（按每次请求发生的时刻判峰谷）',
           costActual: '实际 {cost}',
@@ -177,6 +180,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendConfirm: 'Confirm reset?',
           spendHint: 'Accumulated at the DeepSeek list price; history of older sessions is excluded',
           spendUnreachable: 'The local projection cache is unreadable; the total is unavailable',
+          spendQuota: 'Monthly quota {used} of {cap} ({pct}%)',
+          spendQuotaPct: 'Monthly quota {pct}% used',
+          spendQuotaHint: 'Gateway 30-day percentage × the quota threshold (≈ marks a value derived from an integer percentage)',
           // ── cost (official peak/off-peak price) ──
           costTitle: 'DeepSeek list price (peak/off-peak by the time of each request)',
           costActual: 'actual {cost}',
@@ -803,6 +809,21 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                 var amount = typeof spend.cny === 'number' && isFinite(spend.cny) ? spend.cny : 0
                 // 和胶囊/面板同一套格式化：同一笔钱在三个界面上位数一致。
                 var amountText = formatCny(amount) ?? '¥0.00'
+                // 月额度消耗：百分比来自 usage 路由（网关读数），金额 = 百分比 × 阈值。
+                // 阈值来自 /users/me/plan；caps 为 null 时只显示百分比，不编造金额。
+                var monthlyUsed = byType.monthly !== undefined && typeof byType.monthly.percentUsed === 'number' && isFinite(byType.monthly.percentUsed)
+                  ? byType.monthly.percentUsed
+                  : null
+                var caps = body !== null && body.ok === true && body.caps !== null && typeof body.caps === 'object' ? body.caps : null
+                var quotaText = monthlyUsed === null
+                  ? null
+                  : caps !== null && typeof caps.monthlyUsd === 'number' && isFinite(caps.monthlyUsd) && caps.monthlyUsd > 0
+                    ? fill(t.spendQuota, {
+                        used: '≈' + formatUsd(monthlyUsed / 100 * caps.monthlyUsd),
+                        cap: formatUsdCap(caps.monthlyUsd),
+                        pct: String(Math.round(monthlyUsed)),
+                      })
+                    : fill(t.spendQuotaPct, { pct: String(Math.round(monthlyUsed)) })
                 return React.createElement(
                   'div',
                   {
@@ -846,6 +867,21 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                     { style: { fontSize: 18, fontWeight: 600, lineHeight: 1.4, fontVariantNumeric: 'tabular-nums' } },
                     amountText,
                   ),
+                    quotaText === null
+                      ? null
+                      : React.createElement(
+                          'div',
+                          {
+                            title: t.spendQuotaHint,
+                            style: {
+                              fontSize: 11,
+                              color: LABEL_SECONDARY,
+                              marginTop: 2,
+                              fontVariantNumeric: 'tabular-nums',
+                            },
+                          },
+                          quotaText,
+                        ),
                     React.createElement(
                       'div',
                       { style: { color: spend.reachable === false ? WARN : LABEL_TERTIARY, fontSize: 11 } },
@@ -935,6 +971,26 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         var text = value.toFixed(digits)
         if (Number(text) === 0) return '¥' + (1 / Math.pow(10, digits)).toFixed(digits)
         return '¥' + text
+      }
+
+      /**
+       * 美元金额：额度是按美元定义的，折成 ¥ 会暗示一笔并不存在的扣款。
+       *
+       * @param value - 美元金额。
+       * @returns `$43.00`。
+       */
+      function formatUsd(value) {
+        return '$' + value.toFixed(2)
+      }
+
+      /**
+       * 额度上限：整数就写 `$50`，不写 `$50.00` —— 上限是策展常数，不是流水。
+       *
+       * @param value - 美元金额。
+       * @returns `$50` / `$12.50`。
+       */
+      function formatUsdCap(value) {
+        return '$' + (Number.isInteger(value) ? String(value) : value.toFixed(2))
       }
 
       /**

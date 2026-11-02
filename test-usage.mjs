@@ -13,7 +13,7 @@
  * Run: node test-usage.mjs
  */
 import fs from 'node:fs'
-import { createUsageHandler, fetchUsage, installUsageRoute, normalizeUsage, USAGE_BOOT_GLOBAL, USAGE_PATH, USAGE_ROUTE, USAGE_WINDOWS, withDefaults } from './index.js'
+import { createUsageHandler, fetchUsage, installUsageRoute, normalizeCaps, normalizeUsage, PLAN_PATH, USAGE_BOOT_GLOBAL, USAGE_PATH, USAGE_ROUTE, USAGE_WINDOWS, withDefaults } from './index.js'
 import { applyCostEvent, costViewOf, initCostState } from './cost.js'
 
 const failures = []
@@ -63,6 +63,25 @@ function gateway(responder) {
 
 const jsonResponse = (body, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+
+/** Count requests whose path ends with `suffix` — one successful read is 2 calls (limits + plan). */
+const countUrl = (g, suffix) => g.calls.filter((call) => String(call.url).endsWith(suffix)).length
+
+/** The plan payload the live gateway answers with (caps in 1e-8 USD). */
+const PLAN_PAYLOAD = {
+  success: true,
+  data: {
+    entitlements: {
+      cline_pass: {
+        inferenceCapThreshold: {
+          last5HoursUsageCostUSDPerUser: 1e9,
+          last7daysUsageCostUSDPerUser: 2.5e9,
+          last30daysUsageCostUSDPerUser: 5e9,
+        },
+      },
+    },
+  },
+}
 
 /** A credential provider double; `undefined` value means "nothing stored". */
 const credentialsFor = (value) => ({
@@ -117,6 +136,16 @@ console.log('\n── 1. normalizeUsage ─────────────�
   check('no windows at all is a valid, empty answer', empty.ok === true && empty.limits.length === 0, JSON.stringify(empty))
 }
 
+// ── 1b. the plan caps ───────────────────────────────────────────────────────
+console.log('\n── 2. normalizeCaps ──────────────────────────────────────')
+{
+  const caps = normalizeCaps(PLAN_PAYLOAD)
+  check('the plan payload yields the three caps in USD', caps !== null && caps.fiveHourUsd === 10 && caps.weeklyUsd === 25 && caps.monthlyUsd === 50, JSON.stringify(caps))
+  check('a missing entitlements block is null', normalizeCaps({ success: true, data: {} }) === null)
+  check('a missing monthly threshold is null (no half-filled caps)', normalizeCaps({ data: { entitlements: { cline_pass: { inferenceCapThreshold: { last5HoursUsageCostUSDPerUser: 1e9 } } } } }) === null)
+  check('a string threshold is refused, not coerced', normalizeCaps({ data: { entitlements: { cline_pass: { inferenceCapThreshold: { last30daysUsageCostUSDPerUser: '5000000000' } } } } }) === null)
+}
+
 // ── 2. the gateway read ─────────────────────────────────────────────────────
 console.log('\n── 2. fetchUsage ─────────────────────────────────────────')
 {
@@ -124,6 +153,14 @@ console.log('\n── 2. fetchUsage ──────────────�
   const ok = gateway(() => jsonResponse(LIVE_PAYLOAD))
   const result = await fetchUsage(cfg, KEY, { fetch: ok.fetch })
   check('the live payload is read end to end', result.ok === true && result.limits.length === 3, JSON.stringify(result))
+  const okWithPlan = gateway((url) => jsonResponse(String(url).endsWith(PLAN_PATH) ? PLAN_PAYLOAD : LIVE_PAYLOAD))
+  const withPlan = await fetchUsage(cfg, KEY, { fetch: okWithPlan.fetch })
+  check('the plan caps ride along with the limits', withPlan.ok === true && withPlan.caps?.monthlyUsd === 50, JSON.stringify(withPlan.caps))
+
+  const planDown = gateway((url) => (String(url).endsWith(PLAN_PATH) ? jsonResponse({}, 500) : jsonResponse(LIVE_PAYLOAD)))
+  const noPlan = await fetchUsage(cfg, KEY, { fetch: planDown.fetch })
+  check('a failing plan read degrades to caps: null, limits intact', noPlan.ok === true && noPlan.caps === null && noPlan.limits.length === 3, JSON.stringify(noPlan))
+
   check('the URL is the endpoint CodexBar pins', ok.calls[0].url === `https://api.cline.bot${USAGE_PATH}`, ok.calls[0].url)
   check('…with GET', ok.calls[0].init.method === 'GET', String(ok.calls[0].init.method))
   check('…with a bearer authorization', ok.calls[0].authorization === `Bearer ${KEY}`, String(ok.calls[0].authorization))
@@ -203,7 +240,9 @@ console.log('\n── 3. createUsageHandler ────────────
   const body = await response.json()
   check('…carrying the limits and a fetch time', body.ok === true && body.limits.length === 3 && typeof body.fetchedAt === 'string', JSON.stringify(body))
   check('…and never the key', !JSON.stringify(body).includes(KEY))
-  check('…and the authorization header is the only place the key went', g.calls[0].authorization === `Bearer ${KEY}`)
+  check('…and the authorization header is the only place the key went', g.calls.every((call) => call.authorization === `Bearer ${KEY}`))
+  check('…with the plan read alongside the limits', g.calls.some((call) => String(call.url).endsWith(PLAN_PATH)))
+  check('…but without caps the read still answers (caps: null)', body.caps === null, JSON.stringify(body.caps))
 
   // Caching: the page re-renders the card often; the gateway must not see that.
   const cached = gateway(() => jsonResponse(LIVE_PAYLOAD))
@@ -211,19 +250,19 @@ console.log('\n── 3. createUsageHandler ────────────
   await caching(usageRequest())
   await caching(usageRequest())
   await caching(usageRequest())
-  check('a successful read is cached', cached.calls.length === 1, `calls=${cached.calls.length}`)
+  check('a successful read is cached', countUrl(cached, USAGE_PATH) === 1, `calls=${countUrl(cached, USAGE_PATH)}`)
 
   const forced = gateway(() => jsonResponse(LIVE_PAYLOAD))
   const forcing = withGateway(forced)
   await forcing(usageRequest())
   await forcing(usageRequest('?refresh=1'))
-  check('?refresh=1 bypasses the cache', forced.calls.length === 2, `calls=${forced.calls.length}`)
+  check('?refresh=1 bypasses the cache', countUrl(forced, USAGE_PATH) === 2, `calls=${countUrl(forced, USAGE_PATH)}`)
 
   const cacheOff = gateway(() => jsonResponse(LIVE_PAYLOAD))
   const uncached = withGateway(cacheOff, withDefaults({ usageCacheMs: 0 }))
   await uncached(usageRequest())
   await uncached(usageRequest())
-  check('usageCacheMs: 0 means always refetch', cacheOff.calls.length === 2, `calls=${cacheOff.calls.length}`)
+  check('usageCacheMs: 0 means always refetch', countUrl(cacheOff, USAGE_PATH) === 2, `calls=${countUrl(cacheOff, USAGE_PATH)}`)
 
   // The success window must actually *expire*, and it must be the configured
   // value: asserting only "3 calls -> 1" passes for any window whatsoever, so a
@@ -234,11 +273,11 @@ console.log('\n── 3. createUsageHandler ────────────
   const expiringHandler = withGateway(expiring, withDefaults({ usageCacheMs: 1000 }))
   await expiringHandler(usageRequest())
   await expiringHandler(usageRequest())
-  check('a success inside usageCacheMs is served from the cache', expiring.calls.length === 1, `calls=${expiring.calls.length}`)
+  check('a success inside usageCacheMs is served from the cache', countUrl(expiring, USAGE_PATH) === 1, `calls=${countUrl(expiring, USAGE_PATH)}`)
   Date.now = () => realNow() + 1500
   await expiringHandler(usageRequest())
   Date.now = realNow
-  check('…and refetched once the window has passed', expiring.calls.length === 2, `calls=${expiring.calls.length}`)
+  check('…and refetched once the window has passed', countUrl(expiring, USAGE_PATH) === 2, `calls=${countUrl(expiring, USAGE_PATH)}`)
 
   // A failure is remembered too, but only for the short negative window: that is
   // what stops a user flipping between settings panes from re-hitting a gateway
@@ -268,7 +307,7 @@ console.log('\n── 3. createUsageHandler ────────────
   const burst = Promise.all([deduped(usageRequest()), deduped(usageRequest()), deduped(usageRequest())])
   release()
   const burstBodies = await Promise.all((await burst).map((item) => item.json()))
-  check('concurrent reads are deduplicated to one gateway call', concurrent.calls.length === 1, `calls=${concurrent.calls.length}`)
+  check('concurrent reads are deduplicated to one gateway call', countUrl(concurrent, USAGE_PATH) === 1, `calls=${countUrl(concurrent, USAGE_PATH)}`)
   check('…and every caller still gets the answer', burstBodies.every((item) => item.ok === true && item.limits.length === 3))
 
   const exploding = {
@@ -1083,6 +1122,23 @@ console.log('\n── 8. client render ─────────────�
     spendText = textOf(spendTree).join(' | ')
     check('第二次点发出 POST', spendMount.calls.some((c) => String(c.init?.method).toUpperCase() === 'POST'), JSON.stringify(spendMount.calls.map((c) => c.init?.method ?? 'GET')))
     check('重置后显示 0', spendText.includes('¥0.00'), spendText)
+    delete globalThis.window.__SPEND_ANSWER__
+
+    // 月额度消耗行：百分比来自 usage 读数，金额 = 百分比 × 阈值（caps 来自 /users/me/plan）。
+    globalThis.window.__ANSWER__ = { ...live, caps: { fiveHourUsd: 10, weeklyUsd: 25, monthlyUsd: 50 } }
+    globalThis.window.__SPEND_ANSWER__ = { ok: true, cny: 12.34, since: '2026-11-02T02:00:00.000Z', sessions: 7 }
+    const quotaMount = mount()
+    let quotaTree = await renderCard(quotaMount.seat, quotaMount.stub, cardProps('cline-pass'))
+    let quotaText = textOf(quotaTree).join(' | ')
+    check('累计块附带月额度金额与百分比', quotaText.includes('Monthly quota ≈$45.50 of $50 (91%)'), quotaText)
+    check('…金额按美元显示，不折人民币', !quotaText.includes('¥45.5'), quotaText)
+
+    // 阈值读不到时只显示百分比 —— 不编造一个金额。
+    globalThis.window.__ANSWER__ = { ...live, caps: null }
+    const pctMount = mount()
+    const pctTree = await renderCard(pctMount.seat, pctMount.stub, cardProps('cline-pass'))
+    const pctText = textOf(pctTree).join(' | ')
+    check('没有 caps 时只显示月额度百分比', pctText.includes('Monthly quota 91% used') && !pctText.includes('of $50'), pctText)
     delete globalThis.window.__SPEND_ANSWER__
 
     // ── 9. conversation.composer.dock: provider pill ──

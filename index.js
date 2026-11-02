@@ -131,6 +131,18 @@ function readNamespace(settings, ns) {
 export const USAGE_PATH = '/api/v1/users/me/plan/usage-limits'
 
 /**
+ * The plan endpoint, as a path below `upstream`.
+ *
+ * `entitlements.cline_pass.inferenceCapThreshold` carries the three window caps
+ * in **1e-8 USD units** (`last30daysUsageCostUSDPerUser: 5e9` = $50). The spend
+ * card turns the gateway's `monthly.percentUsed` into an amount with it.
+ *
+ * Read best-effort and separately from the limits: the percentages are the
+ * primary datum, and a plan outage must not take them down with it.
+ */
+export const PLAN_PATH = '/api/v1/users/me/plan'
+
+/**
  * The one Fetch route the browser half reads usage through.
  *
  * Registered on dsh's **existing** `/api` channel (`ctx.connection.fetch`),
@@ -390,6 +402,58 @@ export function normalizeUsage(payload) {
 }
 
 /**
+ * Pull the three window caps out of the plan payload.
+ *
+ * The wire value is in 1e-8 USD (`5e9` = $50) — see audit §二十五. Anything
+ * unreadable is dropped: this is a *display aid* for the spend card, so a
+ * missing monthly cap means "show the percentage only", never a wrong amount.
+ *
+ * @param payload - the parsed `/users/me/plan` body.
+ * @returns `{ fiveHourUsd, weeklyUsd, monthlyUsd }`, or null when monthly is unknown.
+ */
+export function normalizeCaps(payload) {
+  if (!isPlainObject(payload)) return null
+  const data = isPlainObject(payload.data) ? payload.data : payload
+  const entitlements = isPlainObject(data.entitlements) ? data.entitlements : null
+  const pass = entitlements !== null && isPlainObject(entitlements.cline_pass) ? entitlements.cline_pass : null
+  const threshold = pass !== null && isPlainObject(pass.inferenceCapThreshold) ? pass.inferenceCapThreshold : null
+  if (threshold === null) return null
+  const usd = (units) => (typeof units === 'number' && Number.isFinite(units) && units >= 0 ? Math.round(units) / 1e8 : null)
+  const caps = {
+    fiveHourUsd: usd(threshold.last5HoursUsageCostUSDPerUser),
+    weeklyUsd: usd(threshold.last7daysUsageCostUSDPerUser),
+    monthlyUsd: usd(threshold.last30daysUsageCostUSDPerUser),
+  }
+  return caps.monthlyUsd === null ? null : caps
+}
+
+/**
+ * Read the plan caps, or null.
+ *
+ * No throw and no retry: the caller is a cached settings read, the caps are
+ * decoration on the spend card, and the next refresh is a minute away.
+ *
+ * @param cfg - the complete plugin configuration.
+ * @param apiKey - the resolved credential value.
+ * @param fetchImpl - fetch to use.
+ * @param signal - abort signal shared with the limits read.
+ * @returns the caps object, or null.
+ */
+async function readCaps(cfg, apiKey, fetchImpl, signal) {
+  try {
+    const response = await fetchImpl(`${cfg.upstream}${PLAN_PATH}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+      signal,
+    })
+    if (response.status !== 200) return null
+    return normalizeCaps(await response.json())
+  } catch {
+    return null
+  }
+}
+
+/**
  * Fetch this account's usage limits from the gateway.
  *
  * The key is used for exactly one thing — the `Authorization` header of this
@@ -454,7 +518,9 @@ export async function fetchUsage(cfg, apiKey, options = {}) {
   }
   const normalized = normalizeUsage(payload)
   if (!normalized.ok) return { ok: false, reason: 'parse', status, message: normalized.problem }
-  return { ok: true, limits: normalized.limits }
+  // Caps are decoration: `caps: null` means the card shows the percentage only.
+  const caps = await readCaps(cfg, apiKey, fetchImpl, signal)
+  return { ok: true, limits: normalized.limits, caps }
 }
 
 /**
