@@ -13,7 +13,9 @@
  * Run: node test-usage.mjs
  */
 import fs from 'node:fs'
-import { createUsageHandler, fetchUsage, installUsageRoute, normalizeCaps, normalizeUsage, PLAN_PATH, USAGE_BOOT_GLOBAL, USAGE_PATH, USAGE_ROUTE, USAGE_WINDOWS, withDefaults } from './index.js'
+import os from 'node:os'
+import path from 'node:path'
+import { createUsageHandler, fetchLedgerUsd, fetchUsage, installUsageRoute, LEDGER_MAX_PAGES, ledgerPath, normalizeCaps, normalizeUsage, PLAN_PATH, USAGE_BOOT_GLOBAL, USAGE_PATH, USAGE_ROUTE, USAGE_WINDOWS, withDefaults } from './index.js'
 import { applyCostEvent, costViewOf, initCostState } from './cost.js'
 
 const failures = []
@@ -164,6 +166,42 @@ console.log('\n── 2. fetchUsage ──────────────�
   const noPlan = await fetchUsage(cfg, KEY, { fetch: planDown.fetch })
   check('a failing plan read degrades to caps: null, limits intact', noPlan.ok === true && noPlan.caps === null && noPlan.limits.length === 3, JSON.stringify(noPlan))
 
+  // ── 账本：金额只从 costUsd 合计来，不按 token 推算 ──
+  const led = (costUsd, secondsAgo) => ({ createdAt: new Date(Date.now() - secondsAgo * 1000).toISOString(), costUsd })
+  const ledgerGateway = gateway((url) => {
+    const text = String(url)
+    if (text.endsWith(PLAN_PATH)) {
+      return jsonResponse({ success: true, data: { userId: 'usr_test', plan: { entitlements: { cline_pass: { inferenceCapThreshold: { last30daysUsageCostUSDPerUser: 5e9 } } } } } })
+    }
+    if (text.includes(ledgerPath('usr_test'))) {
+      const cursor = new URL(text).searchParams.get('cursor')
+      return jsonResponse({
+        success: true,
+        data: cursor === null
+          ? { items: [led(1_000_000, 10)], nextToken: 'c1' }
+          : { items: [led(2_000_000, 60)], nextToken: null },
+      })
+    }
+    return jsonResponse(LIVE_PAYLOAD)
+  })
+  const since = Date.now() - 3600_000
+  const withLedger = await fetchUsage(cfg, KEY, { fetch: ledgerGateway.fetch, ledgerSinceMs: since })
+  check('账本按 cursor 翻页、只累加 since 之后的行', withLedger.ledger?.ok === true && Math.abs(withLedger.ledger.usd - 0.03) < 1e-9 && withLedger.ledger.rows === 2, JSON.stringify(withLedger.ledger))
+  check('…旧于 since 的行不计数，但翻页到此为止', withLedger.ledger.complete === true, JSON.stringify(withLedger.ledger))
+
+  const stopAtOld = await fetchLedgerUsd(cfg, KEY, 'usr_test', Date.now() - 3600_000, {
+    fetch: async () => jsonResponse({ success: true, data: { items: [led(1_000_000, 10), led(9_000_000, 7200)], nextToken: 'c1' } }),
+  })
+  check('翻到比 since 更旧的行就停止，不再翻页', stopAtOld.usd === 0.01 && stopAtOld.pages === 1 && stopAtOld.complete === true, JSON.stringify(stopAtOld))
+
+  const capped = await fetchLedgerUsd(cfg, KEY, 'usr_test', 0, {
+    fetch: async () => jsonResponse({ success: true, data: { items: [led(1_000_000, 1)], nextToken: 'again' } }),
+  })
+  check('翻到页数上限时如实标记 complete:false', capped.ok === true && capped.complete === false && capped.pages === LEDGER_MAX_PAGES, JSON.stringify(capped))
+
+  const ledgerDown = await fetchLedgerUsd(cfg, KEY, 'usr_test', 0, { fetch: async () => jsonResponse({}, 500) })
+  check('账本读失败是值而不是异常', ledgerDown.ok === false && ledgerDown.reason === 'http-500', JSON.stringify(ledgerDown))
+
   check('the URL is the endpoint CodexBar pins', ok.calls[0].url === `https://api.cline.bot${USAGE_PATH}`, ok.calls[0].url)
   check('…with GET', ok.calls[0].init.method === 'GET', String(ok.calls[0].init.method))
   check('…with a bearer authorization', ok.calls[0].authorization === `Bearer ${KEY}`, String(ok.calls[0].authorization))
@@ -244,6 +282,30 @@ console.log('\n── 3. createUsageHandler ────────────
   check('…carrying the limits and a fetch time', body.ok === true && body.limits.length === 3 && typeof body.fetchedAt === 'string', JSON.stringify(body))
   check('…and never the key', !JSON.stringify(body).includes(KEY))
   check('…and the authorization header is the only place the key went', g.calls.every((call) => call.authorization === `Bearer ${KEY}`))
+
+  // 账本窗口由 spend 基线决定（$DSH_HOME/dsh-clinepass-spend.json 的 since）。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clinepass-usage-home-'))
+  const savedHome = process.env.DSH_HOME
+  try {
+    process.env.DSH_HOME = home
+    fs.writeFileSync(path.join(home, 'dsh-clinepass-spend.json'), JSON.stringify({ version: 2, since: new Date(Date.now() - 3600_000).toISOString(), sessions: {}, peaks: {} }))
+    const ledgerGateway = gateway((url) => {
+      const text = String(url)
+      if (text.endsWith(PLAN_PATH)) {
+        return jsonResponse({ success: true, data: { userId: 'usr_home', plan: { entitlements: { cline_pass: { inferenceCapThreshold: { last30daysUsageCostUSDPerUser: 5e9 } } } } } })
+      }
+      if (text.includes(ledgerPath('usr_home'))) {
+        return jsonResponse({ success: true, data: { items: [{ createdAt: new Date().toISOString(), costUsd: 5_000_000 }], nextToken: null } })
+      }
+      return jsonResponse(LIVE_PAYLOAD)
+    })
+    const withWindow = await (await withGateway(ledgerGateway)(usageRequest())).json()
+    check('账本金额按 spend 基线截断并随响应返回', withWindow.ledger?.ok === true && withWindow.ledger.usd === 0.05, JSON.stringify(withWindow.ledger))
+  } finally {
+    if (savedHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = savedHome
+    fs.rmSync(home, { recursive: true, force: true })
+  }
   check('…with the plan read alongside the limits', g.calls.some((call) => String(call.url).endsWith(PLAN_PATH)))
   check('…but without caps the read still answers (caps: null)', body.caps === null, JSON.stringify(body.caps))
 
@@ -1128,20 +1190,21 @@ console.log('\n── 8. client render ─────────────�
     delete globalThis.window.__SPEND_ANSWER__
 
     // 月额度消耗行：百分比来自 usage 读数，金额 = 百分比 × 阈值（caps 来自 /users/me/plan）。
-    globalThis.window.__ANSWER__ = { ...live, caps: { fiveHourUsd: 10, weeklyUsd: 25, monthlyUsd: 50 } }
+    globalThis.window.__ANSWER__ = { ...live, ledger: { ok: true, usd: 0.85, rows: 351, pages: 2, complete: true } }
     globalThis.window.__SPEND_ANSWER__ = { ok: true, cny: 12.34, cnyPeak: 2.4, since: '2026-11-02T02:00:00.000Z', sessions: 7 }
     const quotaMount = mount()
     let quotaTree = await renderCard(quotaMount.seat, quotaMount.stub, cardProps('cline-pass'))
     let quotaText = textOf(quotaTree).join(' | ')
-    check('累计块附带 ClinePass 计费与月额度百分比', quotaText.includes('ClinePass billing ¥2.40 (≈$0.36) · monthly quota 0.72%'), quotaText)
-    check('…百分比是自重置起的配额口径，不是网关的 30 天读数', !quotaText.includes('91%') && !quotaText.includes('$45.50'), quotaText)
+    check('累计块显示账本金额与 /usage 的月额度百分比', quotaText.includes('ClinePass billing $0.85 · monthly quota 91%'), quotaText)
+    check('…金额不是本地推算值（$0.36）', !quotaText.includes('$0.36') || quotaText.indexOf('$0.85') < quotaText.indexOf('$0.36'), quotaText)
+    check('…两者相差过大时打交叉验证标记', quotaText.includes('⚠'), quotaText)
 
-    // 阈值读不到时只显示金额 —— 不编造百分比。
-    globalThis.window.__ANSWER__ = { ...live, caps: null }
+    // 账本读不到时不画这一行（不拿本地推算顶替）。
+    globalThis.window.__ANSWER__ = { ...live, ledger: null }
     const pctMount = mount()
     const pctTree = await renderCard(pctMount.seat, pctMount.stub, cardProps('cline-pass'))
     const pctText = textOf(pctTree).join(' | ')
-    check('没有 caps 时只显示 ClinePass 计费', pctText.includes('ClinePass billing ¥2.40 (≈$0.36)') && !pctText.includes('monthly quota'), pctText)
+    check('没有账本时这一行整体缺席', !pctText.includes('ClinePass billing'), pctText)
     delete globalThis.window.__SPEND_ANSWER__
 
     // ── 9. conversation.composer.dock: provider pill ──

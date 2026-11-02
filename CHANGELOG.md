@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.18.5
+
+**累计卡那一行改成两个 API 各取一个数，互不推算。**
+
+- 金额：网关账本 `/users/<uid>/usages` 的 `costUsd` 合计（按 spend 基线 `since` 截断）。
+  这是 Cline 自己记的钱，不是按 token 价表反算的。翻页用 `cursor=<nextToken>`
+  （`nextToken` / `pageToken` 都被忽略），每页 200 行，最多 12 页；到不了 `since` 就标
+  `complete: false`，不把部分和当总数。
+- 百分比：`/usage-limits` 的 `monthly.percentUsed` 原样显示，不再用「金额 ÷ 阈值」推。
+- 交叉验证：本地按 token 价表算的那份（`cnyPeak × 0.15`）只进 tooltip；与账本差 >5% 时行尾加
+  `⚠` 并在 tooltip 写明两个数与差值。改版当下的实测：账本 $0.846832（351 行）vs 本地 $0.612829，
+  差 38% —— 本地投影只统计它看见过的会话增量，账本覆盖全部请求，所以卡上信账本。
+- 宿主侧新增 `fetchLedgerUsd`（纯函数式、注入 fetch，单测不联网）；`readPlan` 顺带取 `userId`；
+  `/api/clinepass.usage` 多了 `ledger` 字段。重置后前端强制重读一次，避免缓存里还是旧窗口。
+
 ## 0.18.4
 
 **累计卡那一行改成「自重置起的 ClinePass 计费 + 占月额度的百分比」（0.18.3 的口径作废）。**

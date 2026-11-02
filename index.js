@@ -46,7 +46,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { COST_PROJECTION_KEY, makeCostProjection } from './cost.js'
-import { createSpendHandler, SPEND_ROUTE } from './spend.js'
+import { createSpendHandler, readSpend, SPEND_ROUTE, spendFileFor } from './spend.js'
 
 /** Stable plugin id used by loader diagnostics. */
 export const name = 'clinepass'
@@ -141,6 +141,25 @@ export const USAGE_PATH = '/api/v1/users/me/plan/usage-limits'
  * primary datum, and a plan outage must not take them down with it.
  */
 export const PLAN_PATH = '/api/v1/users/me/plan'
+
+/**
+ * The per-request billing ledger, as a path below `upstream`.
+ *
+ * Cline's own dashboard reads it; each row carries `costUsd` in 1e-8 USD units —
+ * the **quota** price (peak price, off-peak billed at half only to `market_cost`).
+ * This is the authoritative money the monthly percentage is computed from, which
+ * is why the card sums it instead of re-deriving a price from token counts.
+ *
+ * Paging is by `cursor=<data.nextToken>` (2026-11-02: `nextToken` / `pageToken`
+ * are ignored by the endpoint, `cursor` works). `limit` is capped at 200.
+ */
+export const ledgerPath = (userId) => `/api/v1/users/${userId}/usages`
+
+/** Rows per ledger page (the endpoint's cap). */
+export const LEDGER_PAGE_SIZE = 200
+
+/** Hard stop so a far-away `since` cannot turn one settings refresh into 100 requests. */
+export const LEDGER_MAX_PAGES = 12
 
 /**
  * The one Fetch route the browser half reads usage through.
@@ -442,7 +461,7 @@ export function normalizeCaps(payload) {
  * @param signal - abort signal shared with the limits read.
  * @returns the caps object, or null.
  */
-async function readCaps(cfg, apiKey, fetchImpl, signal) {
+async function readPlan(cfg, apiKey, fetchImpl, signal) {
   try {
     const response = await fetchImpl(`${cfg.upstream}${PLAN_PATH}`, {
       method: 'GET',
@@ -450,10 +469,89 @@ async function readCaps(cfg, apiKey, fetchImpl, signal) {
       signal,
     })
     if (response.status !== 200) return null
-    return normalizeCaps(await response.json())
+    const payload = await response.json()
+    const data = isPlainObject(payload?.data) ? payload.data : payload
+    const userId = typeof data?.userId === 'string' && data.userId.length > 0 ? data.userId : null
+    return { caps: normalizeCaps(payload), userId }
   } catch {
     return null
   }
+}
+
+/**
+ * Sum the gateway's own billed cost from the ledger, from `sinceMs` to now.
+ *
+ * Returns the money as recorded by Cline (`costUsd`, 1e-8 USD), not a price this
+ * plugin computed from tokens: the two must be comparable, and the token-derived
+ * number is a fallback for the tooltip's cross-check.
+ *
+ * `complete` is false when the page cap was hit before reaching `sinceMs` — the
+ * card says so rather than silently showing a partial sum as the total.
+ *
+ * @param cfg - the complete plugin configuration.
+ * @param apiKey - the resolved credential value.
+ * @param userId - from the plan payload.
+ * @param sinceMs - Unix ms; rows older than this are outside the card's window.
+ * @param options - `fetch` override and an abort signal.
+ * @returns `{ ok: true, usd, rows, pages, complete }` or `{ ok: false, reason }`.
+ */
+export async function fetchLedgerUsd(cfg, apiKey, userId, sinceMs, options = {}) {
+  const fetchImpl = options.fetch ?? globalThis.fetch
+  if (typeof fetchImpl !== 'function') return { ok: false, reason: 'network' }
+  const signal = options.signal
+  let cursor = null
+  let units = 0
+  let rows = 0
+  let pages = 0
+  let complete = false
+  while (pages < LEDGER_MAX_PAGES) {
+    const query = `?limit=${LEDGER_PAGE_SIZE}${cursor === null ? '' : `&cursor=${encodeURIComponent(cursor)}`}`
+    let response
+    try {
+      response = await fetchImpl(`${cfg.upstream}${ledgerPath(userId)}${query}`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+        signal,
+      })
+    } catch {
+      return { ok: false, reason: 'network' }
+    }
+    if (response.status !== 200) return { ok: false, reason: response.status === 429 ? 'rate-limited' : `http-${response.status}` }
+    let payload
+    try {
+      payload = await response.json()
+    } catch {
+      return { ok: false, reason: 'parse' }
+    }
+    const items = Array.isArray(payload?.data?.items) ? payload.data.items : null
+    if (items === null) return { ok: false, reason: 'parse' }
+    pages += 1
+    if (items.length === 0) {
+      complete = true
+      break
+    }
+    for (const item of items) {
+      const at = typeof item?.createdAt === 'string' ? Date.parse(item.createdAt) : Number.NaN
+      if (!Number.isFinite(at)) continue
+      if (at < sinceMs) {
+        // The page is newest-first: once a row is older than the window, we are done.
+        complete = true
+        continue
+      }
+      const cost = item?.costUsd
+      if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) {
+        units += cost
+        rows += 1
+      }
+    }
+    if (complete) break
+    cursor = typeof payload?.data?.nextToken === 'string' && payload.data.nextToken.length > 0 ? payload.data.nextToken : null
+    if (cursor === null) {
+      complete = true
+      break
+    }
+  }
+  return { ok: true, usd: Math.round(units) / 1e8, rows, pages, complete }
 }
 
 /**
@@ -521,9 +619,15 @@ export async function fetchUsage(cfg, apiKey, options = {}) {
   }
   const normalized = normalizeUsage(payload)
   if (!normalized.ok) return { ok: false, reason: 'parse', status, message: normalized.problem }
-  // Caps are decoration: `caps: null` means the card shows the percentage only.
-  const caps = await readCaps(cfg, apiKey, fetchImpl, signal)
-  return { ok: true, limits: normalized.limits, caps }
+  // Caps and the ledger are decoration: any of them missing leaves the card
+  // showing what it does have (percentages / the local total) rather than failing.
+  const plan = await readPlan(cfg, apiKey, fetchImpl, signal)
+  const caps = plan?.caps ?? null
+  const sinceMs = options.ledgerSinceMs
+  const ledger = plan?.userId !== null && plan?.userId !== undefined && Number.isFinite(sinceMs)
+    ? await fetchLedgerUsd(cfg, apiKey, plan.userId, sinceMs, { fetch: fetchImpl, signal })
+    : null
+  return { ok: true, limits: normalized.limits, caps, ledger }
 }
 
 /**
@@ -562,7 +666,16 @@ export function createUsageHandler(routeCtx, cfg, logger = console, options = {}
     if (resolved === undefined || typeof resolved.value !== 'string' || resolved.value.length === 0) {
       return { ok: false, reason: 'no-key', message: `no key is stored for ${cfg.apiKeyEnv}; enter it on Settings → Models` }
     }
-    const result = await fetchUsage(cfg, resolved.value, options)
+    // The card's window starts at the spend baseline; the ledger sum is scoped by
+    // it, so the two numbers on the card answer the same question.
+    let ledgerSinceMs
+    try {
+      const spend = readSpend(spendFileFor())
+      if (spend !== null) ledgerSinceMs = Date.parse(spend.since)
+    } catch {
+      /* no baseline yet: the card shows the local total only */
+    }
+    const result = await fetchUsage(cfg, resolved.value, { ...options, ledgerSinceMs })
     return result.ok ? { ...result, fetchedAt: new Date().toISOString() } : result
   }
 

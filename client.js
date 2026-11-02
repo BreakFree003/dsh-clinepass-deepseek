@@ -124,9 +124,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendConfirm: '确认重置？',
           spendHint: '按 DeepSeek 官方峰谷价累计；旧会话的历史不计入',
           spendUnreachable: '读不到本地投影缓存，累计暂时不可用',
-          spendQuota: 'ClinePass 计费 {cny}（≈{usd}）· 月额度 {pct}%',
-          spendQuotaNoCap: 'ClinePass 计费 {cny}（≈{usd}）',
-          spendQuotaHint: '自重置起，按 ClinePass 配额口径（恒按高峰价）累计；百分比 = 折成美元后占月额度的比例',
+          spendQuota: 'ClinePass 计费 {usd} · 月额度 {pct}%',
+          spendQuotaOnlyUsd: 'ClinePass 计费 {usd}',
+          spendQuotaHint: '金额 = 网关账本 costUsd 合计（自重置起）；百分比 = /usage-limits 的 monthly.percentUsed（当前 30 天窗口）。两个数各来自一个 API，不做相互推算',
+          spendQuotaMismatch: '本地按 token 价表推算 {local}，与账本 {ledger} 相差 {diff}%（有请求没被本地投影计入）',
           // ── 成本（官方峰谷价）──
           costTitle: 'DeepSeek 官方价（按每次请求发生的时刻判峰谷）',
           costActual: '实际 {cost}',
@@ -180,9 +181,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendConfirm: 'Confirm reset?',
           spendHint: 'Accumulated at the DeepSeek list price; history of older sessions is excluded',
           spendUnreachable: 'The local projection cache is unreadable; the total is unavailable',
-          spendQuota: 'ClinePass billing {cny} (≈{usd}) · monthly quota {pct}%',
-          spendQuotaNoCap: 'ClinePass billing {cny} (≈{usd})',
-          spendQuotaHint: 'Since the reset, at the ClinePass quota price (always peak); the percentage is its USD value over the monthly cap',
+          spendQuota: 'ClinePass billing {usd} · monthly quota {pct}%',
+          spendQuotaOnlyUsd: 'ClinePass billing {usd}',
+          spendQuotaHint: 'Amount = sum of the gateway ledger costUsd (since the reset); percentage = monthly.percentUsed from /usage-limits (current 30-day window). Each number comes from its own API, neither is derived from the other',
+          spendQuotaMismatch: 'The local token-price estimate is {local} vs {ledger} in the ledger ({diff}% apart — some requests are missing from the local projection)',
           // ── cost (official peak/off-peak price) ──
           costTitle: 'DeepSeek list price (peak/off-peak by the time of each request)',
           costActual: 'actual {cost}',
@@ -582,7 +584,11 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
             .then(function (response) { return response.json() })
             .then(function (body) {
               if (spendGeneration.current !== mine) return
-              if (body !== null && typeof body === 'object' && body.ok === true) setSpendState({ status: 'ready', body: body })
+              if (body !== null && typeof body === 'object' && body.ok === true) {
+                setSpendState({ status: 'ready', body: body })
+                // 重置挪动了账本的起点：usage 缓存里那份 ledger 是旧窗口，强制重读一次。
+                load(true)
+              }
               // 写失败（500）要把话说出来：之前这里静默吞掉，用户点了两次「确认」什么都没发生。
               else setSpendState(function (previous) {
                 return { status: 'failed', body: previous.body, error: 'reset' }
@@ -809,23 +815,33 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                 var amount = typeof spend.cny === 'number' && isFinite(spend.cny) ? spend.cny : 0
                 // 和胶囊/面板同一套格式化：同一笔钱在三个界面上位数一致。
                 var amountText = formatCny(amount) ?? '¥0.00'
-                // 配额口径的累计：ClinePass 恒按高峰价记账，`cnyPeak` 才是「吃掉多少月额度」的金额。
-                // 月额度上限来自 /users/me/plan 的 caps；读不到就只显示金额，不编造百分比。
-                var caps = body !== null && body.ok === true && body.caps !== null && typeof body.caps === 'object' ? body.caps : null
-                var peakCny = typeof spend.cnyPeak === 'number' && isFinite(spend.cnyPeak) && spend.cnyPeak > 0 ? spend.cnyPeak : null
+                // 两个数各取各的 API，不互相推算：
+                //   金额 —— 网关账本 costUsd 合计（`/users/<uid>/usages`，按重置起点截断）；
+                //   百分比 —— `/usage-limits` 的 monthly.percentUsed。
+                // 本地按 token 价表算的那份只用来交叉验证，差超过 5% 才在 tooltip 里点破。
+                var ledger = body !== null && body.ok === true && body.ledger !== null && typeof body.ledger === 'object' && body.ledger.ok === true ? body.ledger : null
+                var ledgerUsd = ledger !== null && typeof ledger.usd === 'number' && isFinite(ledger.usd) ? ledger.usd : null
+                var monthlyPct = byType.monthly !== undefined && typeof byType.monthly.percentUsed === 'number' && isFinite(byType.monthly.percentUsed) ? byType.monthly.percentUsed : null
+                var localPeakCny = typeof spend.cnyPeak === 'number' && isFinite(spend.cnyPeak) && spend.cnyPeak > 0 ? spend.cnyPeak : null
                 var quotaText = null
-                if (peakCny !== null) {
-                  // 峰价表两列同比例（¥2 ↔ $0.3、¥0.04 ↔ $0.006、¥8 ↔ $1.2），所以 ×0.15 就是美元。
-                  var peakUsd = peakCny * 0.15
-                  var capUsd = caps !== null && typeof caps.monthlyUsd === 'number' && isFinite(caps.monthlyUsd) && caps.monthlyUsd > 0 ? caps.monthlyUsd : null
-                  var cnyText = formatCny(peakCny) ?? '¥0.00'
-                  quotaText = capUsd === null
-                    ? fill(t.spendQuotaNoCap, { cny: cnyText, usd: formatUsd(peakUsd) })
-                    : fill(t.spendQuota, {
-                        cny: cnyText,
-                        usd: formatUsd(peakUsd),
-                        pct: formatPct((peakUsd / capUsd) * 100),
+                var quotaHint = t.spendQuotaHint
+                if (ledgerUsd !== null) {
+                  quotaText = monthlyPct === null
+                    ? fill(t.spendQuotaOnlyUsd, { usd: formatUsd(ledgerUsd) })
+                    : fill(t.spendQuota, { usd: formatUsd(ledgerUsd), pct: formatPct(monthlyPct) })
+                  // 交叉验证：峰价表两列同比例（¥2 ↔ $0.3），所以本地那份 ×0.15 就是美元。
+                  var localUsd = localPeakCny === null ? null : localPeakCny * 0.15
+                  if (localUsd !== null && ledgerUsd > 0) {
+                    var gap = Math.abs(localUsd - ledgerUsd) / ledgerUsd
+                    if (gap > 0.05) {
+                      quotaText += ' ⚠'
+                      quotaHint += ' ' + fill(t.spendQuotaMismatch, {
+                        local: formatUsd(localUsd),
+                        ledger: formatUsd(ledgerUsd),
+                        diff: String(Math.round(gap * 100)),
                       })
+                    }
+                  }
                 }
                 return React.createElement(
                   'div',
@@ -875,7 +891,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                       : React.createElement(
                           'div',
                           {
-                            title: t.spendQuotaHint,
+                            title: quotaHint,
                             style: {
                               fontSize: 11,
                               color: LABEL_SECONDARY,
