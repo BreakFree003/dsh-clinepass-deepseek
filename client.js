@@ -134,7 +134,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           costPeak: '若全按高峰价 {cost}',
           costSubagents: '含 {count} 个子代理会话',
           // ── 展开后的明细面板 ──
-          panelTitle: '官方价明细',
+          panelTitle: '官方价',
           panelSelf: '本会话',
           panelClinepass: 'ClinePass 计价',
           panelSubagents: '子代理（{count} 个）',
@@ -189,7 +189,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           costPeak: 'all-peak {cost}',
           costSubagents: 'incl. {count} subagent sessions',
           // ── expanded breakdown panel ──
-          panelTitle: 'List-price breakdown',
+          panelTitle: 'Official price',
           panelSelf: 'This session',
           panelClinepass: 'ClinePass price',
           panelSubagents: 'Subagents ({count})',
@@ -1477,8 +1477,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           if (costSummary.requests === 0) {
             rows.push(React.createElement('div', { key: 'empty', style: { color: LABEL_SECONDARY } }, t.panelEmpty))
           } else {
-            rows.push(groupRow(t.panelSelf, money(costSummary.selfCny), 'self'))
+            // 没有子代理时「本会话」就等于上面的合计，不重复写；有子代理才拆成两行。
             if (costSummary.subagentCount > 0) {
+              rows.push(groupRow(t.panelSelf, money(costSummary.selfCny), 'self'))
               rows.push(groupRow(fill(t.panelSubagents, { count: costSummary.subagentCount }), money(costSummary.subagentCny), 'subs'))
             }
             rows.push(separator('sep-2'))

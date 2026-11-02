@@ -27,7 +27,7 @@ Provider 观察与用量报告搬进 pi；两边按发布版本互相同步，�
 
 ```bash
 dsh plugin --profile web add github:BreakFree003/dsh-clinepass-deepseek
-# 钉某个 tag：同上，末尾加 #v0.18.2
+# 钉某个 tag：同上，末尾加 #v0.18.15
 ```
 
 包自己声明了 `dsh.bundle.patch`，所以 `dsh plugin`（pnpm 的转发器）装上它之后会把这个包追加到
@@ -159,6 +159,11 @@ loader 行（`name: './plugins/dsh-clinepass/index.js'`），并追加 `llm-pi-a
   账本 `/users/<uid>/usages` 的 `metadata.session_id` 在全账号范围内恒定，切不出单条对话，
   所以它只出现在设置页累计卡（按账号 + 时间窗口）。逐对话的 ClinePass 金额若要显示，得先把
   每次响应里的 `usage.cost` 记下来，目前没做。
+- **口径核对（2026-11-02 实测）**：同一时间窗里，面板的「ClinePass 计价」（全按高峰价的人民币数）
+  与设置页账本的美元金额严格同源 —— `¥ × (0.30/2.00) = $`，两套官方价目表的比值；
+  而官方实际价在**全部落到谷段**时正好是全按高峰价的一半（`cny / cnyPeak = 0.500000`）。
+  这个对照成立的前提是窗口里只有本机 dsh 的流量：账本是全账号的，混进别的客户端就会偏大。
+
 - **数据来源**：插件注册的会话投影 `clinepassCost`。它只读会话事件（`request/header` 的
   provider/model、`assistant/message` 的 usage、`event.time`），不联网、不改请求、不写盘；`apply`
   是同步纯函数，宿主重启后从日志重放得到同样的数字。

@@ -1350,7 +1350,7 @@ console.log('\n── 8. client render ─────────────�
     costDock = await renderChecked(costMount.dockSeat, costMount.stub, costProps(), 'the expanded panel renders')
     check('点一下展开面板', countProp(costDock, 'data-clinepass-panel') === 1)
     const panelText = textOf(costDock).join(' | ')
-    check('面板有本会话小计', panelText.includes('This session'))
+    check('没有子代理时不写「本会话」行', !panelText.includes('This session'), panelText)
     check('面板不再显示峰/谷拆分', !panelText.includes('Peak ¥') && !panelText.includes('Off-peak ¥') && !panelText.includes(' req'), panelText)
     check('面板有 token 四桶', panelText.includes('3.00M') && panelText.includes('4.0k') && panelText.includes('10.0k'), panelText)
     check('面板不再显示请求数', !panelText.includes('Requests'), panelText)
@@ -1415,7 +1415,7 @@ console.log('\n── 8. client render ─────────────�
     }
     costDock = await openPanel(costMount.dockSeat, costMount.stub, subProps, 'subagent panel')
     const subText = textOf(costDock).join(' | ')
-    check('子代理只显示分组行', subText.includes('Subagents (2)') && !subText.includes('探针一号') && !subText.includes('探针二号'), subText)
+    check('子代理只显示分组行', subText.includes('This session') && subText.includes('Subagents (2)') && !subText.includes('探针一号') && !subText.includes('探针二号'), subText)
     check('用户 fork / 别人的子代理都不算', !subText.includes('用户分叉') && !subText.includes('别人的子代理'), subText)
 
     // 轮询：running 为真时挂一个 2 秒的 ticker，running 落下后清掉（useSession 是
