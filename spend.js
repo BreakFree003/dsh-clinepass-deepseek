@@ -97,7 +97,18 @@ export function readSpend(file) {
         if (typeof value === 'number' && Number.isFinite(value) && value >= 0) peaks.set(id, value)
       }
     }
-    return { since, sessions, peaks }
+    // v3 adds the gateway's monthly percentage captured at reset time. The card
+    // shows `current - baseline`, so both numbers stay API values.
+    const rawQuota = parsed.quota
+    let quota = null
+    if (rawQuota !== null && typeof rawQuota === 'object' && !Array.isArray(rawQuota)) {
+      const value = rawQuota.monthlyPercent
+      quota = {
+        monthlyPercent: typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100 ? value : null,
+        at: typeof rawQuota.at === 'string' ? rawQuota.at : null,
+      }
+    }
+    return { since, sessions, peaks, quota }
   } catch {
     return null
   }
@@ -111,9 +122,33 @@ export function writeSpend(file, value) {
   for (const [id, cny] of value.sessions) sessions[id] = round(cny)
   const peaks = {}
   for (const [id, cny] of value.peaks ?? []) peaks[id] = round(cny)
+  const quota = value.quota === undefined || value.quota === null ? undefined : { monthlyPercent: value.quota.monthlyPercent ?? null, at: value.quota.at ?? null }
   const temp = `${file}.tmp-${process.pid}`
-  fs.writeFileSync(temp, JSON.stringify({ version: 2, since: value.since, sessions, peaks }, null, 2))
+  fs.writeFileSync(temp, JSON.stringify({ version: 3, since: value.since, sessions, peaks, ...(quota === undefined ? {} : { quota }) }, null, 2))
   fs.renameSync(temp, file)
+}
+
+/**
+ * Record the gateway's monthly percentage as the reset-time baseline.
+ *
+ * Called from the usage read when a reset arrived without one (the browser did
+ * not have a fresh reading). Returns the stored baseline, or null when there is
+ * no baseline file to attach it to.
+ *
+ * @param file - baseline file path.
+ * @param monthlyPercent - the gateway's `monthly.percentUsed` right now.
+ * @returns `{ monthlyPercent, at }`, or null.
+ */
+export function captureQuotaBaseline(file, monthlyPercent) {
+  const spend = readSpend(file)
+  if (spend === null) return null
+  const quota = { monthlyPercent, at: new Date().toISOString() }
+  try {
+    writeSpend(file, { ...spend, quota })
+  } catch {
+    return null
+  }
+  return quota
 }
 
 /**
@@ -305,6 +340,18 @@ export function createSpendHandler(options = {}) {
   return async (request) => {
     const method = typeof request?.method === 'string' ? request.method.toUpperCase() : 'GET'
     if (method === 'POST') {
+      // 浏览器在重置时把当时的 `monthly.percentUsed` 一并送来；body 可选（测试与旧客户端都没有）。
+      let monthlyPercent = null
+      try {
+        const raw = typeof request?.text === 'function' ? await request.text() : ''
+        if (typeof raw === 'string' && raw.trim().length > 0) {
+          const parsed = JSON.parse(raw)
+          const value = parsed?.monthlyPercent
+          if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100) monthlyPercent = value
+        }
+      } catch {
+        /* 没有 body 就等下一次 usage 读取补基线 */
+      }
       const before = await snapshot(true)
       // 重置 = 把「现在每个会话的花费」整体拍成新基线。逐会话记，旧会话以后被打开也不会倒灌。
       const scanned = await sumCachedCosts(dir)
@@ -314,7 +361,7 @@ export function createSpendHandler(options = {}) {
         sessions.set(id, cny)
         peaks.set(id, scanned.peaks.get(id) ?? cny)
       }
-      const next = { since: new Date(now()).toISOString(), sessions, peaks }
+      const next = { since: new Date(now()).toISOString(), sessions, peaks, quota: { monthlyPercent, at: new Date(now()).toISOString() } }
       try {
         writeSpend(file, next)
       } catch (error) {

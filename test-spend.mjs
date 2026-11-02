@@ -7,7 +7,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { createSpendHandler, readSpend, SPEND_ROUTE, spendFileFor, sumCachedCosts, writeSpend } from './spend.js'
+import { captureQuotaBaseline, createSpendHandler, readSpend, SPEND_ROUTE, spendFileFor, sumCachedCosts, writeSpend } from './spend.js'
 import { COST_STATE_VERSION, costViewOf } from './cost.js'
 
 let failures = 0
@@ -160,15 +160,26 @@ try {
   check('v1 基线补出峰价那一列', migrated !== null && migrated.peaks.has('L') && near(migrated.peaks.get('L'), half.cnyPeak / 2), JSON.stringify([...(migrated?.peaks ?? [])]))
   check('…起点不变', legacyBody.since === '2026-01-01T00:00:00.000Z', legacyBody.since)
   check('…峰价增量按补出的基线算', near(legacyBody.cnyPeak, half.cnyPeak - half.cny / 2), `${legacyBody.cnyPeak} vs ${half.cnyPeak - half.cny / 2}`)
-  check('…写回时升级成 v2', JSON.parse(fs.readFileSync(legacyFile, 'utf8')).version === 2)
+  check('…写回时升级成 v3', JSON.parse(fs.readFileSync(legacyFile, 'utf8')).version === 3)
+
+  // ── 月额度基线：重置时把网关的 monthly.percentUsed 记下来 ──
+  //
+  // 卡上的百分比 = 当前读数 − 这个基线，两个数都是 API 值，不做金额除法。
+  const quotaHandler = createSpendHandler({ file: spendFile, dir: cacheDir, cacheMs: 0, now: () => clock + 5000, logger: { warn() {} } })
+  const quotaReset = await (await quotaHandler({ method: 'POST', text: async () => JSON.stringify({ monthlyPercent: 87 }) })).json()
+  const quotaFile = readSpend(spendFile)
+  check('重置接受 body 里的 monthlyPercent', quotaReset.ok === true && quotaFile?.quota?.monthlyPercent === 87, JSON.stringify(quotaFile?.quota))
+  check('没有 body 时基线为空、不编造', (await (await quotaHandler({ method: 'POST' })).json()).ok === true && readSpend(spendFile).quota.monthlyPercent === null)
+  const captured = captureQuotaBaseline(spendFile, 62.5)
+  check('lazily captured baseline is stored', captured?.monthlyPercent === 62.5 && readSpend(spendFile).quota.monthlyPercent === 62.5, JSON.stringify(captured))
 
   // ── 常量与往返 ───────────────────────────────────────
   check('路由常量', SPEND_ROUTE === '/api/clinepass.spend')
   check('writeSpend/readSpend 往返', (() => {
     const file = path.join(tempRoot, 'roundtrip.json')
-    writeSpend(file, { since: '2026-11-02T00:00:00.000Z', sessions: new Map([['x', 1.5], ['y', 0]]), peaks: new Map([['x', 2.5], ['y', 0]]) })
+    writeSpend(file, { since: '2026-11-02T00:00:00.000Z', sessions: new Map([['x', 1.5], ['y', 0]]), peaks: new Map([['x', 2.5], ['y', 0]]), quota: { monthlyPercent: 87, at: '2026-11-02T00:00:00.000Z' } })
     const back = readSpend(file)
-    return back.since === '2026-11-02T00:00:00.000Z' && near(back.sessions.get('x'), 1.5) && back.sessions.get('y') === 0 && near(back.peaks.get('x'), 2.5)
+    return back.since === '2026-11-02T00:00:00.000Z' && near(back.sessions.get('x'), 1.5) && back.sessions.get('y') === 0 && near(back.peaks.get('x'), 2.5) && back.quota.monthlyPercent === 87
   })())
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

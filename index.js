@@ -46,7 +46,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { COST_PROJECTION_KEY, makeCostProjection } from './cost.js'
-import { createSpendHandler, readSpend, SPEND_ROUTE, spendFileFor } from './spend.js'
+import { captureQuotaBaseline, createSpendHandler, readSpend, SPEND_ROUTE, spendFileFor } from './spend.js'
 
 /** Stable plugin id used by loader diagnostics. */
 export const name = 'clinepass'
@@ -676,7 +676,30 @@ export function createUsageHandler(routeCtx, cfg, logger = console, options = {}
       /* no baseline yet: the card shows the local total only */
     }
     const result = await fetchUsage(cfg, resolved.value, { ...options, ledgerSinceMs })
-    return result.ok ? { ...result, fetchedAt: new Date().toISOString() } : result
+    if (!result.ok) return result
+    // 月额度百分比 = 网关**当前读数 − 重置时记录值**：两个数都来自 usage-limits，
+    // 不做「金额 ÷ 阈值」那种推算。重置时没带基线（旧客户端 / 测试）就在这次读取里补上。
+    const monthly = result.limits.find((row) => row.type === 'monthly') ?? null
+    let baseline = null
+    try {
+      const file = spendFileFor()
+      const spend = readSpend(file)
+      baseline = spend?.quota?.monthlyPercent ?? null
+      if (baseline === null && spend !== null && monthly !== null && typeof monthly.percentUsed === 'number') {
+        baseline = captureQuotaBaseline(file, monthly.percentUsed)?.monthlyPercent ?? null
+      }
+    } catch {
+      /* 没有基线就只显示金额 */
+    }
+    const quotaPct =
+      baseline !== null && monthly !== null && typeof monthly.percentUsed === 'number'
+        ? Math.max(0, Math.round((monthly.percentUsed - baseline) * 100) / 100)
+        : null
+    return {
+      ...result,
+      fetchedAt: new Date().toISOString(),
+      quotaSince: { pct: quotaPct, baseline, current: monthly?.percentUsed ?? null },
+    }
   }
 
   /**

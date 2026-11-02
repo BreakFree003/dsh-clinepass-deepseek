@@ -126,7 +126,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendUnreachable: '读不到本地投影缓存，累计暂时不可用',
           spendQuota: 'ClinePass 计费 {usd} · 月额度 {pct}%',
           spendQuotaOnlyUsd: 'ClinePass 计费 {usd}',
-          spendQuotaHint: '自重置起：金额 = 网关账本 costUsd 合计；百分比 = 金额 ÷ 月额度 {cap}。网关当前的 30 天读数是 {window}（窗口不同，只作对照）',
+          spendQuotaHint: '金额 = 网关账本 costUsd 合计（自重置起）；百分比 = /usage-limits 的 monthly.percentUsed 当前 {current}% − 重置时 {baseline}%。网关按整数百分比返回（1% ≈ $0.50），所以这一行按 1% 步进',
           spendQuotaMismatch: '本地按 token 价表推算 {local}，与账本 {ledger} 相差 {diff}%（有请求没被本地投影计入）',
           // ── 成本（官方峰谷价）──
           costTitle: 'DeepSeek 官方价（按每次请求发生的时刻判峰谷）',
@@ -183,7 +183,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           spendUnreachable: 'The local projection cache is unreadable; the total is unavailable',
           spendQuota: 'ClinePass billing {usd} · monthly quota {pct}%',
           spendQuotaOnlyUsd: 'ClinePass billing {usd}',
-          spendQuotaHint: 'Since the reset: amount = sum of the gateway ledger costUsd; percentage = that amount over the {cap} monthly quota. The gateway\u2019s current 30-day reading is {window} (a different window, for comparison only)',
+          spendQuotaHint: 'Amount = sum of the gateway ledger costUsd (since the reset); percentage = monthly.percentUsed now ({current}%) minus the value recorded at reset ({baseline}%). The gateway reports whole percentages (1% ≈ $0.50), so this line steps by 1%',
           spendQuotaMismatch: 'The local token-price estimate is {local} vs {ledger} in the ledger ({diff}% apart — some requests are missing from the local projection)',
           // ── cost (official peak/off-peak price) ──
           costTitle: 'DeepSeek list price (peak/off-peak by the time of each request)',
@@ -538,6 +538,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
         var setResetArmed = armPair[1]
         var spendGeneration = React.useRef(0)
         var armTimer = React.useRef(null)
+        // 重置那一刻要把网关的 monthly.percentUsed 存成基线；渲染时顺手更新这个 ref，
+        // resetSpend 的依赖就能保持为空数组。
+        var monthlyPctRef = React.useRef(null)
 
         var loadSpend = React.useCallback(function () {
           var mine = spendGeneration.current + 1
@@ -578,8 +581,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
           window
             .fetch(spendUrl(), {
               method: 'POST',
-              headers: { accept: 'application/json' },
+              headers: { accept: 'application/json', 'content-type': 'application/json' },
               credentials: 'same-origin',
+              // 基线随重置一起落盘：之后卡上的百分比 = 当前读数 − 这个值。
+              body: JSON.stringify({ monthlyPercent: monthlyPctRef.current }),
             })
             .then(function (response) { return response.json() })
             .then(function (body) {
@@ -821,21 +826,23 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
                 // 本地按 token 价表算的那份只用来交叉验证，差超过 5% 才在 tooltip 里点破。
                 var ledger = body !== null && body.ok === true && body.ledger !== null && typeof body.ledger === 'object' && body.ledger.ok === true ? body.ledger : null
                 var ledgerUsd = ledger !== null && typeof ledger.usd === 'number' && isFinite(ledger.usd) ? ledger.usd : null
-                var caps = body !== null && body.ok === true && body.caps !== null && typeof body.caps === 'object' ? body.caps : null
-                var capUsd = caps !== null && typeof caps.monthlyUsd === 'number' && isFinite(caps.monthlyUsd) && caps.monthlyUsd > 0 ? caps.monthlyUsd : null
-                // 网关的 30 天读数只作对照：这张卡的对象是「自重置起」，两者窗口不同。
-                var gatewayPct = byType.monthly !== undefined && typeof byType.monthly.percentUsed === 'number' && isFinite(byType.monthly.percentUsed) ? byType.monthly.percentUsed : null
+                // 百分比：宿主算好的「当前读数 − 重置时基线」，两个数都来自 usage-limits。
+                var quotaSince = body !== null && body.ok === true && body.quotaSince !== null && typeof body.quotaSince === 'object' ? body.quotaSince : null
+                var quotaPct = quotaSince !== null && typeof quotaSince.pct === 'number' && isFinite(quotaSince.pct) ? quotaSince.pct : null
+                // 渲染时把当前月额度读数交给 ref，重置时好把它存成基线。
+                if (byType.monthly !== undefined && typeof byType.monthly.percentUsed === 'number' && isFinite(byType.monthly.percentUsed)) {
+                  monthlyPctRef.current = byType.monthly.percentUsed
+                }
                 var localPeakCny = typeof spend.cnyPeak === 'number' && isFinite(spend.cnyPeak) && spend.cnyPeak > 0 ? spend.cnyPeak : null
                 var quotaText = null
                 var quotaHint = t.spendQuotaHint
                 if (ledgerUsd !== null) {
-                  var sincePct = capUsd === null ? null : (ledgerUsd / capUsd) * 100
-                  quotaText = sincePct === null
+                  quotaText = quotaPct === null
                     ? fill(t.spendQuotaOnlyUsd, { usd: formatUsd(ledgerUsd) })
-                    : fill(t.spendQuota, { usd: formatUsd(ledgerUsd), pct: formatPct(sincePct) })
+                    : fill(t.spendQuota, { usd: formatUsd(ledgerUsd), pct: formatPct(quotaPct) })
                   quotaHint = fill(t.spendQuotaHint, {
-                    cap: capUsd === null ? '--' : formatUsd(capUsd),
-                    window: gatewayPct === null ? '--' : formatPct(gatewayPct) + '%',
+                    current: quotaSince !== null && typeof quotaSince.current === 'number' ? formatPct(quotaSince.current) : '--',
+                    baseline: quotaSince !== null && typeof quotaSince.baseline === 'number' ? formatPct(quotaSince.baseline) : '--',
                   })
                   // 交叉验证：峰价表两列同比例（¥2 ↔ $0.3），所以本地那份 ×0.15 就是美元。
                   var localUsd = localPeakCny === null ? null : localPeakCny * 0.15
@@ -1019,7 +1026,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__ !== undefined) {
        */
       function formatPct(value) {
         if (!(value > 0)) return '0'
-        return value < 1 ? value.toFixed(2) : value < 10 ? value.toFixed(1) : value.toFixed(0)
+        if (value < 1) return value.toFixed(2)
+        return Number.isInteger(value) ? String(value) : value.toFixed(1)
       }
 
       /**

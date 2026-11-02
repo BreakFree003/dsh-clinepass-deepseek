@@ -288,7 +288,7 @@ console.log('\n── 3. createUsageHandler ────────────
   const savedHome = process.env.DSH_HOME
   try {
     process.env.DSH_HOME = home
-    fs.writeFileSync(path.join(home, 'dsh-clinepass-spend.json'), JSON.stringify({ version: 2, since: new Date(Date.now() - 3600_000).toISOString(), sessions: {}, peaks: {} }))
+    fs.writeFileSync(path.join(home, 'dsh-clinepass-spend.json'), JSON.stringify({ version: 3, since: new Date(Date.now() - 3600_000).toISOString(), sessions: {}, peaks: {}, quota: { monthlyPercent: 86, at: new Date().toISOString() } }))
     const ledgerGateway = gateway((url) => {
       const text = String(url)
       if (text.endsWith(PLAN_PATH)) {
@@ -301,6 +301,12 @@ console.log('\n── 3. createUsageHandler ────────────
     })
     const withWindow = await (await withGateway(ledgerGateway)(usageRequest())).json()
     check('账本金额按 spend 基线截断并随响应返回', withWindow.ledger?.ok === true && withWindow.ledger.usd === 0.05, JSON.stringify(withWindow.ledger))
+    check('百分比 = 当前 91% − 重置时基线 86% = 5', withWindow.quotaSince?.pct === 5 && withWindow.quotaSince?.baseline === 86, JSON.stringify(withWindow.quotaSince))
+
+    // 没有基线（旧文件 / 旧客户端）时，第一次读取把它补成「当前值」，之后从 0 起算。
+    fs.writeFileSync(path.join(home, 'dsh-clinepass-spend.json'), JSON.stringify({ version: 2, since: new Date(Date.now() - 3600_000).toISOString(), sessions: {}, peaks: {} }))
+    const lazy = await (await withGateway(gateway(() => jsonResponse(LIVE_PAYLOAD)))(usageRequest())).json()
+    check('没有基线就先记成当前读数（本次差值为 0）', lazy.quotaSince?.pct === 0 && lazy.quotaSince?.baseline === 91, JSON.stringify(lazy.quotaSince))
   } finally {
     if (savedHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = savedHome
@@ -1190,31 +1196,30 @@ console.log('\n── 8. client render ─────────────�
     delete globalThis.window.__SPEND_ANSWER__
 
     // 月额度消耗行：百分比来自 usage 读数，金额 = 百分比 × 阈值（caps 来自 /users/me/plan）。
-    globalThis.window.__ANSWER__ = { ...live, caps: { monthlyUsd: 50 }, ledger: { ok: true, usd: 0.85, rows: 351, pages: 2, complete: true } }
+    globalThis.window.__ANSWER__ = { ...live, ledger: { ok: true, usd: 0.85, rows: 351, pages: 2, complete: true }, quotaSince: { pct: 2, baseline: 87, current: 89 } }
     globalThis.window.__SPEND_ANSWER__ = { ok: true, cny: 12.34, cnyPeak: 2.4, since: '2026-11-02T02:00:00.000Z', sessions: 7 }
     const quotaMount = mount()
     let quotaTree = await renderCard(quotaMount.seat, quotaMount.stub, cardProps('cline-pass'))
     let quotaText = textOf(quotaTree).join(' | ')
-    // 百分比自重置起：$0.85 / $50 = 1.70%，不是网关那个 30 天的 91%。
-    check('累计块显示账本金额与自重置起的月额度百分比', quotaText.includes('ClinePass billing $0.85 · monthly quota 1.7%'), quotaText)
-    check('…不用网关的 30 天读数当百分比', !quotaText.includes('monthly quota 91%'), quotaText)
+    // 百分比 = 当前 89% − 重置时 87% = 2，取自 usage-limits 的两个读数，不做金额除法。
+    check('累计块显示账本金额与相减得到的月额度百分比', quotaText.includes('ClinePass billing $0.85 · monthly quota 2%'), quotaText)
     check('…本地推算差得多时打交叉验证标记', quotaText.includes('⚠'), quotaText)
 
-    // 刚重置完：账本金额为 0 → 百分比也从 0 起。
-    globalThis.window.__ANSWER__ = { ...live, caps: { monthlyUsd: 50 }, ledger: { ok: true, usd: 0, rows: 0, pages: 1, complete: true } }
+    // 刚重置完：账本 0、百分比 0。
+    globalThis.window.__ANSWER__ = { ...live, ledger: { ok: true, usd: 0, rows: 0, pages: 1, complete: true }, quotaSince: { pct: 0, baseline: 87, current: 87 } }
     const zeroQuotaMount = mount()
     const zeroQuotaTree = await renderCard(zeroQuotaMount.seat, zeroQuotaMount.stub, cardProps('cline-pass'))
     const zeroQuotaText = textOf(zeroQuotaTree).join(' | ')
     check('重置后从 0 开始：$0.00 · 0%', zeroQuotaText.includes('ClinePass billing $0.00 · monthly quota 0%'), zeroQuotaText)
 
-    // 月额度上限读不到时只显示金额；账本读不到时整行缺席（不拿本地推算顶替）。
-    globalThis.window.__ANSWER__ = { ...live, caps: null, ledger: { ok: true, usd: 0.85, rows: 351, pages: 2, complete: true } }
+    // 没有基线（quotaSince 缺失）时只显示金额；账本读不到时整行缺席。
+    globalThis.window.__ANSWER__ = { ...live, ledger: { ok: true, usd: 0.85, rows: 351, pages: 2, complete: true }, quotaSince: null }
     const noCapMount = mount()
     const noCapTree = await renderCard(noCapMount.seat, noCapMount.stub, cardProps('cline-pass'))
     const noCapText = textOf(noCapTree).join(' | ')
-    check('没有上限时只显示金额', noCapText.includes('ClinePass billing $0.85') && !noCapText.includes('monthly quota'), noCapText)
+    check('没有基线时只显示金额', noCapText.includes('ClinePass billing $0.85') && !noCapText.includes('monthly quota'), noCapText)
 
-    globalThis.window.__ANSWER__ = { ...live, caps: { monthlyUsd: 50 }, ledger: null }
+    globalThis.window.__ANSWER__ = { ...live, ledger: null }
     const pctMount = mount()
     const pctTree = await renderCard(pctMount.seat, pctMount.stub, cardProps('cline-pass'))
     const pctText = textOf(pctTree).join(' | ')
