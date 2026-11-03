@@ -241,6 +241,12 @@ export function createSpendHandler(options = {}) {
   const file = options.file ?? spendFileFor()
   const dir = options.dir ?? sessionsCacheDir()
   const logger = options.logger ?? console
+  const backgroundAt = typeof options.backgroundAt === 'function'
+    ? () => {
+        const at = options.backgroundAt()
+        return typeof at === 'number' && Number.isFinite(at) ? new Date(at).toISOString() : null
+      }
+    : () => null
   const now = options.now ?? (() => Date.now())
   const cacheMs = Number.isSafeInteger(options.cacheMs) ? options.cacheMs : SPEND_CACHE_MS
   let cache = null
@@ -335,6 +341,9 @@ export function createSpendHandler(options = {}) {
           ok: true,
           cny: round(cny),
           cnyPeak: round(cnyPeak),
+          // 宿主后台同步（60s）最近一次跑完的时间：为 null 表示这条路径没跑过。
+          // 设置页用它证明「基线不再只靠打开页面才更新」。
+          backgroundAt: backgroundAt(),
           since: spend.since,
           sessions: counted,
           seen: scanned.sessions.size,

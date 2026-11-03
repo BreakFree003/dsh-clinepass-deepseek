@@ -834,8 +834,10 @@ export function installUsageRoute(routeCtx, cfg, logger = console, options = {})
   }
   // 设置页的「官方定价累计」：读投影缓存求和，POST 重置基线。单独注册、单独失败 ——
   // 它挂了不该把额度卡一起带走。
+  // 后台同步的心跳：路由把它带回给界面，用来证明定时器真的在跑（info 日志在默认级别下看不见）。
+  let lastBaselineSyncAt = null
   try {
-    const spendHandler = createSpendHandler({ logger })
+    const spendHandler = createSpendHandler({ logger, backgroundAt: () => lastBaselineSyncAt })
     registry.register({
       path: SPEND_ROUTE,
       methods: ['GET', 'POST'],
@@ -852,7 +854,11 @@ export function installUsageRoute(routeCtx, cfg, logger = console, options = {})
       logger.info?.('[clinepass] spend baselines sync every 60s (independent of the settings page)')
       const timer = setInterval(() => {
         try {
-          Promise.resolve(spendHandler(new Request(`http://dsh.local${SPEND_ROUTE}`, { method: 'GET' }))).catch(() => {})
+          Promise.resolve(spendHandler(new Request(`http://dsh.local${SPEND_ROUTE}`, { method: 'GET' })))
+            .then(() => {
+              lastBaselineSyncAt = Date.now()
+            })
+            .catch(() => {})
         } catch {
           /* 定时同步失败不影响路由本身 */
         }
