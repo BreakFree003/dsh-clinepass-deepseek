@@ -835,11 +835,26 @@ export function installUsageRoute(routeCtx, cfg, logger = console, options = {})
   // 设置页的「官方定价累计」：读投影缓存求和，POST 重置基线。单独注册、单独失败 ——
   // 它挂了不该把额度卡一起带走。
   try {
+    const spendHandler = createSpendHandler({ logger })
     registry.register({
       path: SPEND_ROUTE,
       methods: ['GET', 'POST'],
       requestBody: 'buffered',
-      fetch: createSpendHandler({ logger }),
+      fetch: spendHandler,
+    })
+    // 基线是「第一次看见某个会话时」记的。只有设置页打开才会扫描，于是两次扫描之间跑完的
+    // 会话会被整段当成基线吞掉（2026-11-02 夜里少算了 ~¥1.3）。后台每分钟同步一次，
+    // 让「第一次看见」与页面是否打开无关 —— 一分钟内的增量最多丢一分钟。
+    routeCtx.effect?.(() => {
+      const timer = setInterval(() => {
+        try {
+          Promise.resolve(spendHandler(new Request(`http://dsh.local${SPEND_ROUTE}`, { method: 'GET' }))).catch(() => {})
+        } catch {
+          /* 定时同步失败不影响路由本身 */
+        }
+      }, 60_000)
+      timer.unref?.()
+      return () => clearInterval(timer)
     })
   } catch (error) {
     logger.warn?.(
