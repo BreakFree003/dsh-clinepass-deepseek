@@ -166,12 +166,14 @@ export function captureQuotaBaseline(file, monthlyPercent) {
 export async function sumCachedCosts(dir) {
   const sessions = new Map()
   const peaks = new Map()
+  // 会话创建时间：重置之后才创建的会话，基线必须是 0 —— 它的每一分钱都在重置之后。
+  const createdAt = new Map()
   let names
   try {
     names = await fs.promises.readdir(dir)
   } catch {
     // 目录读不到要能和「真的没有花费」区分：调用方把 `reachable: false` 一路带到界面上。
-    return { sessions, peaks, scanned: 0, errors: 1, skipped: 0, reachable: false }
+    return { sessions, peaks, createdAt, scanned: 0, errors: 1, skipped: 0, reachable: false }
   }
   let scanned = 0
   let errors = 0
@@ -206,6 +208,7 @@ export async function sumCachedCosts(dir) {
     }
     if (!(view.cny > 0)) return
     const id = typeof record?.identity?.id === 'string' && record.identity.id.length > 0 ? record.identity.id : name.slice(0, -5)
+    createdAt.set(id, typeof record?.identity?.createdAt === 'number' ? record.identity.createdAt : null)
     sessions.set(id, (sessions.get(id) ?? 0) + view.cny)
     // 配额口径：ClinePass always bills the peak price, so this is the money that
     // actually counts against the monthly quota (see audit §二十七).
@@ -223,7 +226,7 @@ export async function sumCachedCosts(dir) {
       }
     }),
   )
-  return { sessions, peaks, scanned, errors, skipped, reachable: true }
+  return { sessions, peaks, createdAt, scanned, errors, skipped, reachable: true }
 }
 
 /**
@@ -276,10 +279,23 @@ export function createSpendHandler(options = {}) {
           dirty = true
         } else {
           // 新出现的会话：把「第一次被看见时」的花费记成它的基线，历史不计、也不会跳。
+          // 例外：会话在重置之后才创建（identity.createdAt >= since），它整段都发生在重置之后，
+          // 基线必须是 0 —— 否则设置页没开、两次扫描之间跑完的会话会被整段吞掉。
+          const sinceMs = Date.parse(spend.since)
+          const bornAfterReset = (id) => {
+            const born = scanned.createdAt.get(id)
+            return Number.isFinite(sinceMs) && typeof born === 'number' && born >= sinceMs
+          }
           for (const [id, cny] of scanned.sessions) {
             if (!spend.sessions.has(id)) {
-              spend.sessions.set(id, cny)
-              spend.peaks.set(id, scanned.peaks.get(id) ?? cny)
+              const fresh = bornAfterReset(id)
+              spend.sessions.set(id, fresh ? 0 : cny)
+              spend.peaks.set(id, fresh ? 0 : (scanned.peaks.get(id) ?? cny))
+              dirty = true
+            } else if (bornAfterReset(id) && (spend.sessions.get(id) ?? 0) > 0) {
+              // 旧版本按「首次看见时的花费」记过基线；这类会话应当整段计入，就地改正。
+              spend.sessions.set(id, 0)
+              spend.peaks.set(id, 0)
               dirty = true
             }
           }

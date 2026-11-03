@@ -43,10 +43,11 @@ const CNY_ONE = 0.00296
 const near = (a, b) => Math.abs(a - b) < 1e-9
 
 /** 写一个投影缓存文件（形状与宿主落盘的 `{record:{identity,rows:{key:{seq,ver,val}}}}` 一致）。 */
-const writeCache = (dir, id, value, extra = {}) => {
+const writeCache = (dir, id, value, extra = {}, createdAt) => {
   const rows = { tokenUsage: { ver: 2, seq: 1, val: {} } }
   if (value !== undefined) rows.clinepassCost = { ver: COST_STATE_VERSION, seq: 2, val: value, ...extra }
-  fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ record: { identity: { id }, rows } }))
+  const identity = typeof createdAt === 'number' ? { id, createdAt } : { id }
+  fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ record: { identity, rows } }))
 }
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'clinepass-spend-'))
@@ -131,6 +132,32 @@ try {
   const forced = await (await caching({ method: 'GET' })).json()
   const delta = costViewOf(stateOf(16000, 4)).cny - costViewOf(stateOf(12000, 3)).cny
   check('…过期后重扫', near(forced.cny, cached.cny + delta), `${forced.cny} vs ${cached.cny + delta}`)
+
+  // ── 重置之后才创建的会话：基线必须是 0 ───────────────
+  //
+  // 设置页没开的时候，扫描只发生在再次打开页面的那一刻。如果这类会话按「首次看见时的花费」
+  // 记基线，整段睡眠时间跑完的会话会被吞掉（2026-11-02 夜里就这样少算了 ~¥1.3）。
+  const bornDir = path.join(tempRoot, 'born-sessions')
+  fs.mkdirSync(bornDir)
+  const bornFile = path.join(tempRoot, 'born.json')
+  const T0 = Date.UTC(2026, 10, 2, 12, 0, 0)
+  const bornCost = costViewOf(stateOf()).cny
+  const oldCost = costViewOf(stateOf(8000, 2)).cny
+  writeCache(bornDir, 'new', stateOf(), {}, T0 + 60_000)
+  writeCache(bornDir, 'old', stateOf(8000, 2), {}, T0 - 60_000)
+  fs.writeFileSync(bornFile, JSON.stringify({ version: 3, since: new Date(T0).toISOString(), sessions: {}, peaks: {} }))
+  const bornHandler = createSpendHandler({ file: bornFile, dir: bornDir, cacheMs: 0, now: () => T0 + 3600_000, logger: { warn() {} } })
+  const bornBody = await (await bornHandler({ method: 'GET' })).json()
+  check('重置之后创建的会话整段计入', near(bornBody.cny, bornCost), `${bornBody.cny} vs ${bornCost}`)
+  const bornSaved = readSpend(bornFile)
+  check('…它的基线是 0', bornSaved.sessions.get('new') === 0, JSON.stringify([...bornSaved.sessions]))
+  check('重置之前创建的会话仍按首次看见记基线', near(bornSaved.sessions.get('old'), oldCost), JSON.stringify([...bornSaved.sessions]))
+
+  bornSaved.sessions.set('new', bornCost)
+  bornSaved.peaks.set('new', bornCost)
+  writeSpend(bornFile, bornSaved)
+  const healed = await (await bornHandler({ method: 'GET' })).json()
+  check('已被写脏的基线（>0）就地改回 0', near(healed.cny, bornCost) && readSpend(bornFile).sessions.get('new') === 0, `${healed.cny}`)
 
   // ── 损坏/旧形状的基线文件：重建 ──────────────────────
   fs.writeFileSync(spendFile, JSON.stringify({ baseline: 4.4, since: 'x' })) // 旧形状
