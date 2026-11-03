@@ -845,7 +845,11 @@ export function installUsageRoute(routeCtx, cfg, logger = console, options = {})
     // 基线是「第一次看见某个会话时」记的。只有设置页打开才会扫描，于是两次扫描之间跑完的
     // 会话会被整段当成基线吞掉（2026-11-02 夜里少算了 ~¥1.3）。后台每分钟同步一次，
     // 让「第一次看见」与页面是否打开无关 —— 一分钟内的增量最多丢一分钟。
+    if (typeof routeCtx.effect !== 'function') {
+      logger.warn?.('[clinepass] no ctx.effect on the injected context; the 60s baseline sync was not installed')
+    }
     routeCtx.effect?.(() => {
+      logger.info?.('[clinepass] spend baselines sync every 60s (independent of the settings page)')
       const timer = setInterval(() => {
         try {
           Promise.resolve(spendHandler(new Request(`http://dsh.local${SPEND_ROUTE}`, { method: 'GET' }))).catch(() => {})
